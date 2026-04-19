@@ -20,7 +20,7 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use cue_core::ScopeHash;
-use cue_core::ipc::{EventPayload, OkPayload, ResponsePayload};
+use cue_core::ipc::{EventPayload, OkPayload, ResponsePayload, ScopeInfo};
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 
 use crate::parser::resolver::ResolvedCommand;
@@ -104,6 +104,13 @@ pub enum ProcessMgrMsg {
         tail_bytes: usize,
         reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
     },
+    /// Read the stderr tail of a running job.
+    /// Returns `None` when the job is not in the live map (completed or unknown).
+    GetStderr {
+        job_id: cue_core::JobId,
+        tail_bytes: usize,
+        reply: tokio::sync::oneshot::Sender<Option<StderrSnapshot>>,
+    },
     /// Send raw input bytes to a specific running job.
     SendJobInput {
         job_id: cue_core::JobId,
@@ -133,6 +140,14 @@ pub enum ProcessMgrMsg {
     },
     /// Graceful shutdown.
     Shutdown,
+}
+
+/// Snapshot of a job's stderr, as returned by `ProcessMgrMsg::GetStderr`.
+pub struct StderrSnapshot {
+    /// True when the job used a PTY (stdout and stderr are merged).
+    pub pty_merged: bool,
+    /// Captured bytes (tail of the ring buffer, or empty).
+    pub data: Vec<u8>,
 }
 
 /// Messages handled by the ScopeStore actor.
@@ -168,6 +183,10 @@ pub enum ScopeStoreMsg {
     },
     /// Graceful shutdown.
     Shutdown,
+    /// List all known scopes, returning (head_hash, scope_infos).
+    ListScopes {
+        reply: tokio::sync::oneshot::Sender<(ScopeHash, Vec<ScopeInfo>)>,
+    },
 }
 
 /// Messages handled by the EventBus actor.

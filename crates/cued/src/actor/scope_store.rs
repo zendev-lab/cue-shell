@@ -179,6 +179,25 @@ pub fn spawn(mut rx: mpsc::Receiver<ScopeStoreMsg>, conn: Connection, sys: Actor
                     debug!("scope_store: shutting down");
                     break;
                 }
+
+                ScopeStoreMsg::ListScopes { reply } => {
+                    let mut scopes: Vec<cue_core::ipc::ScopeInfo> = cache
+                        .values()
+                        .map(|scope| {
+                            let snapshot = scope.snapshot.as_ref();
+                            cue_core::ipc::ScopeInfo {
+                                hash: scope.hash.to_string(),
+                                parent: scope.parent.map(|p| p.to_string()),
+                                cwd: snapshot
+                                    .map(|s| s.cwd.display().to_string())
+                                    .unwrap_or_default(),
+                                env_count: snapshot.map(|s| s.env.len()).unwrap_or(0),
+                            }
+                        })
+                        .collect();
+                    scopes.sort_by(|a, b| a.hash.cmp(&b.hash));
+                    let _ = reply.send((current_head, scopes));
+                }
             }
         }
 

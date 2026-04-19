@@ -15,7 +15,7 @@ use rusqlite::Connection;
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -166,6 +166,22 @@ fn migrate(conn: &Connection) -> Result<()> {
              WHERE status IS NULL OR status = '';",
         )
         .context("failed to backfill crons.status")?;
+        conn.pragma_update(None, "user_version", 6)?;
+    }
+    if current < 7 {
+        if !column_exists(conn, "jobs_history", "chain_id")? {
+            conn.execute_batch("ALTER TABLE jobs_history ADD COLUMN chain_id TEXT;")
+                .context("failed to add jobs_history.chain_id")?;
+        }
+        conn.pragma_update(None, "user_version", 7)?;
+    }
+    if current < 8 {
+        if !column_exists(conn, "jobs_history", "stderr")? {
+            conn.execute_batch(
+                "ALTER TABLE jobs_history ADD COLUMN stderr TEXT NOT NULL DEFAULT '';",
+            )
+            .context("failed to add jobs_history.stderr")?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     Ok(())
@@ -267,6 +283,9 @@ pub struct StoredJob {
     pub exit_code: Option<i32>,
     pub start_scope: Option<ScopeHash>,
     pub end_scope: Option<ScopeHash>,
+    pub chain_id: Option<String>,
+    /// Captured stderr text.  Empty string for PTY-mode jobs (streams are merged).
+    pub stderr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,10 +319,10 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
 
     conn.execute(
         "INSERT INTO jobs_history (
-             id, pipeline, status, exit_code, scope_hash, start_scope, end_scope, finished_at
+             id, pipeline, status, exit_code, scope_hash, start_scope, end_scope, chain_id, stderr, finished_at
          )
          VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, CASE WHEN ?8 THEN datetime('now') ELSE NULL END
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CASE WHEN ?10 THEN datetime('now') ELSE NULL END
          )
          ON CONFLICT(id) DO UPDATE SET
               pipeline = excluded.pipeline,
@@ -312,7 +331,9 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
               scope_hash = excluded.scope_hash,
               start_scope = excluded.start_scope,
               end_scope = excluded.end_scope,
-              finished_at = CASE WHEN ?8 THEN datetime('now') ELSE jobs_history.finished_at END",
+              chain_id = excluded.chain_id,
+              stderr = excluded.stderr,
+              finished_at = CASE WHEN ?10 THEN datetime('now') ELSE jobs_history.finished_at END",
         rusqlite::params![
             job.id,
             job.pipeline,
@@ -321,6 +342,8 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
             start_scope.clone(),
             start_scope,
             end_scope,
+            job.chain_id,
+            job.stderr,
             finished,
         ],
     )?;
@@ -329,7 +352,9 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
 
 pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
     let mut stmt = conn.prepare(
-        "SELECT id, pipeline, status, exit_code, start_scope, end_scope
+        "SELECT id, pipeline, status, exit_code, start_scope, end_scope,
+                COALESCE(chain_id, NULL) AS chain_id,
+                COALESCE(stderr, '') AS stderr
          FROM jobs_history",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -339,6 +364,8 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
         let exit_code: Option<i32> = row.get(3)?;
         let start_scope_blob: Option<Vec<u8>> = row.get(4)?;
         let end_scope_blob: Option<Vec<u8>> = row.get(5)?;
+        let chain_id: Option<String> = row.get(6)?;
+        let stderr: String = row.get(7)?;
         Ok((
             id,
             pipeline,
@@ -346,12 +373,23 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
             exit_code,
             start_scope_blob,
             end_scope_blob,
+            chain_id,
+            stderr,
         ))
     })?;
 
     let mut jobs = Vec::new();
     for row in rows {
-        let (id, pipeline, status_text, exit_code, start_scope_blob, end_scope_blob) = row?;
+        let (
+            id,
+            pipeline,
+            status_text,
+            exit_code,
+            start_scope_blob,
+            end_scope_blob,
+            chain_id,
+            stderr,
+        ) = row?;
         jobs.push(StoredJob {
             id,
             pipeline,
@@ -365,6 +403,8 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
                 .as_deref()
                 .map(blob_to_scope_hash)
                 .transpose()?,
+            chain_id,
+            stderr,
         });
     }
 
@@ -732,6 +772,8 @@ mod tests {
             exit_code: Some(130),
             start_scope: Some(start_scope),
             end_scope: Some(end_scope),
+            chain_id: None,
+            stderr: String::new(),
         };
 
         upsert_job_history(&conn, &job).unwrap();
@@ -782,5 +824,43 @@ mod tests {
         let loaded = load_agent_history(&conn).unwrap();
 
         assert_eq!(loaded, vec![agent]);
+    }
+
+    #[test]
+    fn job_stderr_persistence_roundtrip() {
+        let conn = in_memory_db();
+        let job = StoredJob {
+            id: "J3".into(),
+            pipeline: "echo oops 1>&2".into(),
+            status: cue_core::job::JobStatus::Failed,
+            exit_code: Some(1),
+            start_scope: None,
+            end_scope: None,
+            chain_id: None,
+            stderr: "error: something went wrong\n".into(),
+        };
+
+        upsert_job_history(&conn, &job).unwrap();
+        let loaded = load_job_history(&conn).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "J3");
+        assert_eq!(loaded[0].stderr, "error: something went wrong\n");
+    }
+
+    #[test]
+    fn job_stderr_defaults_to_empty_on_old_rows() {
+        // Simulate an existing row that pre-dates the stderr column (DEFAULT '').
+        let conn = in_memory_db();
+        // Insert without specifying stderr (rely on DEFAULT).
+        conn.execute(
+            "INSERT INTO jobs_history (id, pipeline, status) VALUES ('J1', 'echo hi', '\"Done\"')",
+            [],
+        )
+        .unwrap();
+
+        let loaded = load_job_history(&conn).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].stderr, "");
     }
 }

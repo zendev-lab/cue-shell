@@ -50,6 +50,8 @@ pub struct Card {
     pub status: CardStatus,
     /// Optional short ID label (e.g. "J1").
     pub label: Option<String>,
+    /// Optional chain step label (e.g. "chain:C1/1/3").
+    pub chain_label: Option<String>,
 }
 
 impl Card {
@@ -60,6 +62,7 @@ impl Card {
             output: String::new(),
             status: CardStatus::Pending,
             label: None,
+            chain_label: None,
         }
     }
 
@@ -87,6 +90,8 @@ pub enum MainViewMsg {
     SetLatestStatus(CardStatus),
     /// Set the latest card's label.
     SetLatestLabel(String),
+    /// Set a specific card's chain step label.
+    SetCardChainLabel { index: usize, label: String },
 }
 
 // ── MainView ──
@@ -136,6 +141,12 @@ impl MainView {
     pub fn set_card_label(&mut self, index: usize, label: String) {
         if let Some(card) = self.cards.get_mut(index) {
             card.label = Some(label);
+        }
+    }
+
+    pub fn set_card_chain_label(&mut self, index: usize, label: String) {
+        if let Some(card) = self.cards.get_mut(index) {
+            card.chain_label = Some(label);
         }
     }
 
@@ -229,6 +240,9 @@ impl Component for MainView {
                     card.label = Some(label);
                 }
             }
+            MainViewMsg::SetCardChainLabel { index, label } => {
+                self.set_card_chain_label(index, label);
+            }
         }
     }
 
@@ -312,6 +326,11 @@ impl Component for MainView {
     }
 }
 
+/// Format a chain step label string, e.g. `chain:C1/1/3`.
+pub fn chain_step_label(chain_id: &str, step_index: usize, total: usize) -> String {
+    format!("chain:{}/{}/{}", chain_id, step_index + 1, total)
+}
+
 /// Render a single card into the given area.
 fn render_card(frame: &mut Frame, card: &Card, area: Rect) {
     let border_color = card.status.border_color();
@@ -321,9 +340,13 @@ fn render_card(frame: &mut Frame, card: &Card, area: Rect) {
         Mode::Cron => "CRON",
     };
 
-    let title = match &card.label {
-        Some(label) => format!(" {mode} > {} [{}] ", card.input, label),
-        None => format!(" {mode} > {} ", card.input),
+    let title = match (&card.label, &card.chain_label) {
+        (Some(label), Some(chain_label)) => {
+            format!(" {mode} > {} [{}] [{}] ", card.input, label, chain_label)
+        }
+        (Some(label), None) => format!(" {mode} > {} [{}] ", card.input, label),
+        (None, Some(chain_label)) => format!(" {mode} > {} [{}] ", card.input, chain_label),
+        (None, None) => format!(" {mode} > {} ", card.input),
     };
 
     let block = Block::new()
@@ -362,5 +385,31 @@ mod tests {
         let hit = view.card_at_point(Rect::new(0, 0, 40, 8), Rect::new(2, 6, 1, 1));
 
         assert_eq!(hit, Some(second));
+    }
+
+    #[test]
+    fn chain_step_label_format() {
+        assert_eq!(chain_step_label("C1", 0, 3), "chain:C1/1/3");
+        assert_eq!(chain_step_label("C2", 2, 3), "chain:C2/3/3");
+        assert_eq!(chain_step_label("C10", 0, 1), "chain:C10/1/1");
+    }
+
+    #[test]
+    fn card_chain_label_field() {
+        let mut card = Card::new("sleep 1 -> echo done".into(), Mode::Job);
+        assert!(card.chain_label.is_none());
+        card.chain_label = Some(chain_step_label("C1", 0, 2));
+        assert_eq!(card.chain_label.as_deref(), Some("chain:C1/1/2"));
+    }
+
+    #[test]
+    fn set_card_chain_label_via_view_msg() {
+        let mut view = MainView::new();
+        let idx = view.push_card("cmd1 -> cmd2".into(), Mode::Job);
+        view.update(MainViewMsg::SetCardChainLabel {
+            index: idx,
+            label: "chain:C1/1/2".into(),
+        });
+        assert_eq!(view.cards[idx].chain_label.as_deref(), Some("chain:C1/1/2"));
     }
 }

@@ -53,6 +53,80 @@ pub fn load_target_settings() -> Result<TargetSettingsSnapshot> {
     })
 }
 
+/// Build a [`cue_client::ClientConnector`] for the named target profile by
+/// reading the on-disk configuration.
+///
+/// Only the `"unix"` transport is supported for live reconnects; attempting
+/// to build a connector for an `"ssh"` profile returns an error.
+pub fn connector_for_profile(profile_name: &str) -> anyhow::Result<cue_client::ClientConnector> {
+    let config_dir = config_dir();
+    let client_path = config_dir.join(CLIENT_CONFIG_FILE);
+    let legacy_path = config_dir.join(LEGACY_CONFIG_FILE);
+
+    let text = if let Some(t) = read_source(&client_path)? {
+        t
+    } else if let Some(t) = read_source(&legacy_path)? {
+        t
+    } else {
+        // No config file — fall back to the default local socket.
+        if profile_name == "local" {
+            return Ok(cue_client::ClientConnector::unix(default_socket_path()));
+        }
+        anyhow::bail!("no configuration file found; cannot resolve profile `{profile_name}`");
+    };
+
+    let document: Value = toml::from_str(&text).context("parse client config")?;
+
+    let profiles_table = document
+        .get("transport")
+        .and_then(Value::as_table)
+        .and_then(|t| t.get("profiles"))
+        .and_then(Value::as_table);
+
+    let profile_value = match profiles_table {
+        Some(profiles) => profiles.get(profile_name),
+        None => {
+            if profile_name == "local" {
+                return Ok(cue_client::ClientConnector::unix(default_socket_path()));
+            }
+            anyhow::bail!("no [transport.profiles] section in config");
+        }
+    };
+
+    let table = match profile_value {
+        Some(v) => v
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("profile `{profile_name}` must be a TOML table"))?,
+        None => {
+            if profile_name == "local" {
+                return Ok(cue_client::ClientConnector::unix(default_socket_path()));
+            }
+            anyhow::bail!("profile `{profile_name}` not found in config");
+        }
+    };
+
+    let transport = table
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("unix");
+
+    match transport {
+        "unix" => {
+            let socket = table
+                .get("socket")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            Ok(cue_client::ClientConnector::unix(socket))
+        }
+        "ssh" => anyhow::bail!(
+            "live reconnect for ssh transport is not yet supported; \
+             restart cue-tui to apply the profile change"
+        ),
+        other => anyhow::bail!("unknown transport `{other}` for profile `{profile_name}`"),
+    }
+}
+
 pub fn save_default_profile(
     profile_name: &str,
     known_snapshot: &TargetSettingsSnapshot,

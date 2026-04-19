@@ -1531,3 +1531,61 @@ async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
     .await
     .expect("test timed out");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_err_command_returns_output_for_pty_job() {
+    // All cued jobs run in PTY mode (stdout and stderr are merged).  `:err J<n>` should
+    // return the combined output prefixed with "[PTY: stdout and stderr are merged]".
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("err-pty");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket).await;
+
+        // Run a simple job that writes to stdout.
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: "echo hello-from-err-test".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        // :err should return output with the PTY notice.
+        let err_resp = roundtrip(
+            &mut stream,
+            10,
+            RequestPayload::Eval {
+                input: format!(":err {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match err_resp {
+            ResponsePayload::Ok(OkPayload::Output { id, data, .. }) => {
+                assert_eq!(id, job_id);
+                assert!(
+                    data.contains("[PTY:"),
+                    "expected PTY notice in :err output, got: {data:?}"
+                );
+                assert!(
+                    data.contains("hello-from-err-test"),
+                    "expected job output in :err response, got: {data:?}"
+                );
+            }
+            other => panic!("expected Output for :err, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}

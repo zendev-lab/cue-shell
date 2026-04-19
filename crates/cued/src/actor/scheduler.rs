@@ -35,7 +35,7 @@ use crate::runtime_env::effective_snapshot;
 use crate::storage;
 use crate::word_expansion::expand_command_line;
 
-use super::{ActorSystem, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg};
+use super::{ActorSystem, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg, StderrSnapshot};
 
 // ── Leaf status within a chain ──────────────────────────────────────────────
 
@@ -103,6 +103,9 @@ struct JobEntry {
     chain_id: Option<ChainId>,
     chain_index: Option<usize>,
     chain_total: Option<usize>,
+    /// Captured stderr text (empty for PTY-mode jobs where streams are merged).
+    #[allow(dead_code)]
+    stderr: String,
 }
 
 struct AgentEntry {
@@ -482,6 +485,7 @@ fn restore_jobs(db: &Arc<Mutex<Connection>>, state: &mut SchedulerState) {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                stderr: job.stderr,
             },
         );
     }
@@ -827,6 +831,8 @@ fn persist_job_entry(db: &Arc<Mutex<Connection>>, entry: &JobEntry) {
             exit_code: entry.exit_code,
             start_scope: entry.start_scope,
             end_scope: entry.end_scope,
+            chain_id: entry.chain_id.map(|id| id.to_string()),
+            stderr: String::new(),
         },
     ) {
         warn!(job = %entry.job_id, "scheduler: failed to persist job history: {e}");
@@ -3085,6 +3091,7 @@ async fn spawn_chain(
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                stderr: String::new(),
             },
         );
 
@@ -3295,6 +3302,7 @@ async fn process_chain_advance(
                 chain_id: Some(chain_id),
                 chain_index: Some(idx),
                 chain_total: Some(leaves.len()),
+                stderr: String::new(),
             },
         );
 
@@ -3926,9 +3934,7 @@ async fn handle_command(
             ResponsePayload::Ok(OkPayload::CronList(list))
         }
 
-        ResolvedCommand::Scopes => ResponsePayload::Ok(OkPayload::EvalText {
-            text: "scope listing not yet implemented".into(),
-        }),
+        ResolvedCommand::Scopes => handle_list_scopes(sys).await,
 
         ResolvedCommand::Confirm { text } => {
             ResponsePayload::Ok(OkPayload::ConfirmRequest { prompt: text })
@@ -4123,7 +4129,7 @@ async fn handle_command(
                     format!("invalid job id: {id}"),
                 );
             };
-            read_job_output(sys, job_id, &id, crate::ring_buffer::DEFAULT_CAPACITY).await
+            read_job_stderr(sys, job_id, &id, crate::ring_buffer::DEFAULT_CAPACITY).await
         }
 
         ResolvedCommand::Send { id, data } => {
@@ -4223,9 +4229,31 @@ async fn handle_command(
             "`:wait` should be handled by the scheduler loop",
         ),
 
-        _ => {
-            warn!("scheduler: unhandled command variant");
-            ResponsePayload::err(error_code::NOT_SUPPORTED, "command not yet implemented")
+        ResolvedCommand::Log { id } => {
+            let text = format_log_text(state, id.as_deref());
+            ResponsePayload::Ok(OkPayload::EvalText { text })
+        }
+
+        ResolvedCommand::Scope { subcommand } => {
+            match subcommand.as_deref().map(str::trim).unwrap_or("list") {
+                "" | "list" => handle_list_scopes(sys).await,
+                other => ResponsePayload::err(
+                    error_code::NOT_SUPPORTED,
+                    format!("`:scope {other}` is not yet implemented; supported: `:scope list`"),
+                ),
+            }
+        }
+
+        ResolvedCommand::Config { subcommand } => {
+            match subcommand.as_deref().map(str::trim).unwrap_or("show") {
+                "" | "show" => ResponsePayload::Ok(OkPayload::EvalText {
+                    text: format_config_text(config),
+                }),
+                other => ResponsePayload::err(
+                    error_code::NOT_SUPPORTED,
+                    format!("`:config {other}` is not supported; try `:config` or `:config show`"),
+                ),
+            }
         }
     }
 }
@@ -4657,6 +4685,127 @@ fn cron_help_text() -> &'static str {
     )
 }
 
+/// Send `ListScopes` to the scope store and return a `ScopeList` response.
+async fn handle_list_scopes(sys: &ActorSystem) -> ResponsePayload {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if sys
+        .scope_store
+        .send(ScopeStoreMsg::ListScopes { reply: tx })
+        .await
+        .is_err()
+    {
+        return ResponsePayload::err(error_code::INTERNAL, "scope_store unreachable");
+    }
+    match rx.await {
+        Ok((head, mut scopes)) => {
+            let head_str = head.to_string();
+            scopes.sort_by(|a, b| {
+                let a_head = a.hash == head_str;
+                let b_head = b.hash == head_str;
+                b_head.cmp(&a_head).then(a.hash.cmp(&b.hash))
+            });
+            ResponsePayload::Ok(OkPayload::ScopeList(scopes))
+        }
+        Err(_) => ResponsePayload::err(error_code::INTERNAL, "scope_store reply dropped"),
+    }
+}
+
+/// Build a human-readable log of jobs and agents.
+///
+/// If `id` is given, only log for that specific job or agent is shown.
+fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
+    if let Some(id) = id {
+        if let Some(job_id) = parse_job_id(id) {
+            return state
+                .jobs
+                .get(&job_id)
+                .map(|entry| {
+                    let scope = entry
+                        .start_scope
+                        .map(|h| h.to_string())
+                        .unwrap_or_else(|| "<none>".into());
+                    format!(
+                        "{}: [{}] {:?} (scope: {scope})",
+                        entry.job_id, entry.pipeline_text, entry.status
+                    )
+                })
+                .unwrap_or_else(|| format!("{id}: job not found"));
+        }
+        if let Some(agent_id) = parse_agent_id(id) {
+            return state
+                .agents
+                .get(&agent_id)
+                .map(|entry| {
+                    format!(
+                        "{}: backend={} role={:?} status={:?}",
+                        entry.agent_id, entry.backend, entry.role, entry.status
+                    )
+                })
+                .unwrap_or_else(|| format!("{id}: agent not found"));
+        }
+        return format!("{id}: unrecognised ID (expected J<n> or A<n>)");
+    }
+
+    let mut lines = Vec::new();
+
+    let mut jobs: Vec<&JobEntry> = state.jobs.values().collect();
+    jobs.sort_by_key(|j| j.job_id.0);
+    if jobs.is_empty() {
+        lines.push("jobs: none".into());
+    } else {
+        lines.push("=== Jobs ===".into());
+        for entry in jobs {
+            lines.push(format!(
+                "  {}: [{}] {:?}",
+                entry.job_id, entry.pipeline_text, entry.status
+            ));
+        }
+    }
+
+    let mut agents: Vec<&AgentEntry> = state.agents.values().collect();
+    agents.sort_by_key(|a| a.agent_id.0);
+    if agents.is_empty() {
+        lines.push("agents: none".into());
+    } else {
+        lines.push("=== Agents ===".into());
+        for entry in agents {
+            lines.push(format!(
+                "  {}: backend={} role={:?} [{:?}]",
+                entry.agent_id, entry.backend, entry.role, entry.status
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Format the active config as human-readable text.
+fn format_config_text(config: &Config) -> String {
+    let mut lines = vec![format!(
+        "agent.default_backend = {}",
+        config.agent.default_backend
+    )];
+    for (name, backend) in &config.agent.backends {
+        lines.push(format!("[agent.backends.{name}]"));
+        if !backend.command.is_empty() {
+            lines.push(format!("  command = {}", backend.command));
+        }
+        if !backend.args.is_empty() {
+            let args = backend
+                .args
+                .iter()
+                .map(|a| format!("{a:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("  args = [{args}]"));
+        }
+        if let Some(model) = &backend.model {
+            lines.push(format!("  model = {model}"));
+        }
+    }
+    lines.join("\n")
+}
+
 async fn read_job_output(
     sys: &ActorSystem,
     job_id: JobId,
@@ -4719,6 +4868,121 @@ async fn read_output_from_log(
             ResponsePayload::Ok(OkPayload::Output {
                 id,
                 data: text,
+                truncated,
+            })
+        }
+        Ok(Err(_)) => {
+            ResponsePayload::err(error_code::NOT_FOUND, format!("no output found for {id}"))
+        }
+        Err(_) => ResponsePayload::err(error_code::INTERNAL, "blocking task panicked"),
+    }
+}
+
+/// Return stderr for a job — real pipe-mode bytes, or merged PTY output with a notice.
+async fn read_job_stderr(
+    sys: &ActorSystem,
+    job_id: JobId,
+    display_id: &str,
+    tail_bytes: usize,
+) -> ResponsePayload {
+    let id = display_id.to_owned();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let sent = sys
+        .process_mgr
+        .send(ProcessMgrMsg::GetStderr {
+            job_id,
+            tail_bytes,
+            reply: tx,
+        })
+        .await;
+    if sent.is_err() {
+        return ResponsePayload::err(error_code::INTERNAL, "process_mgr unreachable");
+    }
+
+    match rx.await {
+        // Live pipe-mode job: return real stderr.
+        Ok(Some(StderrSnapshot {
+            pty_merged: false,
+            data,
+        })) => {
+            let truncated = data.len() >= tail_bytes;
+            let text = String::from_utf8_lossy(&data).into_owned();
+            ResponsePayload::Ok(OkPayload::Output {
+                id,
+                data: text,
+                truncated,
+            })
+        }
+        // Live PTY job: streams are merged — fall back to combined log with notice.
+        Ok(Some(StderrSnapshot {
+            pty_merged: true, ..
+        })) => prepend_pty_notice(read_job_output(sys, job_id, &id, tail_bytes).await),
+        // Job not in live map (completed) — try dedicated stderr log, then combined log.
+        Ok(None) => read_stderr_from_log(job_id, &id, tail_bytes).await,
+        Err(_) => ResponsePayload::err(error_code::INTERNAL, "process_mgr reply dropped"),
+    }
+}
+
+/// Prepend a PTY-merged notice to an `Output` response.
+fn prepend_pty_notice(mut resp: ResponsePayload) -> ResponsePayload {
+    if let ResponsePayload::Ok(OkPayload::Output { ref mut data, .. }) = resp {
+        *data = format!("[PTY: stdout and stderr are merged]\n{data}");
+    }
+    resp
+}
+
+/// Read stderr for a completed job from disk.
+///
+/// Checks `<output_dir>/J<n>.stderr` first (pipe-mode jobs), then falls back
+/// to `<output_dir>/J<n>.log` (PTY-mode combined output) with a notice.
+async fn read_stderr_from_log(
+    job_id: JobId,
+    display_id: &str,
+    tail_bytes: usize,
+) -> ResponsePayload {
+    let id = display_id.to_owned();
+
+    // Try the dedicated stderr log (pipe-mode jobs).
+    let stderr_data = tokio::task::spawn_blocking(move || {
+        let path = crate::dirs::output_dir().join(format!("{job_id}.stderr"));
+        std::fs::read(path)
+    })
+    .await;
+    if let Ok(Ok(data)) = stderr_data
+        && !data.is_empty()
+    {
+        let truncated = data.len() > tail_bytes;
+        let trimmed = if truncated {
+            &data[data.len() - tail_bytes..]
+        } else {
+            &data
+        };
+        return ResponsePayload::Ok(OkPayload::Output {
+            id,
+            data: String::from_utf8_lossy(trimmed).into_owned(),
+            truncated,
+        });
+    }
+
+    // No dedicated stderr — return combined PTY log with notice.
+    let id2 = id.clone();
+    match tokio::task::spawn_blocking(move || {
+        let path = crate::dirs::output_dir().join(format!("{job_id}.log"));
+        std::fs::read(path)
+    })
+    .await
+    {
+        Ok(Ok(data)) => {
+            let truncated = data.len() > tail_bytes;
+            let trimmed = if truncated {
+                &data[data.len() - tail_bytes..]
+            } else {
+                &data
+            };
+            let body = String::from_utf8_lossy(trimmed).into_owned();
+            ResponsePayload::Ok(OkPayload::Output {
+                id: id2,
+                data: format!("[PTY: stdout and stderr are merged]\n{body}"),
                 truncated,
             })
         }
@@ -5186,6 +5450,8 @@ done
                 exit_code: Some(0),
                 start_scope: Some(ScopeHash([3; 32])),
                 end_scope: Some(ScopeHash([3; 32])),
+                chain_id: None,
+                stderr: String::new(),
             },
         )
         .unwrap();

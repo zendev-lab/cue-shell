@@ -121,6 +121,7 @@ pub enum OkPayload {
     AgentList(Vec<AgentInfo>),
     CronList(Vec<CronInfo>),
     ScopeInfo(ScopeInfo),
+    ScopeList(Vec<ScopeInfo>),
     Output {
         id: String,
         data: String,
@@ -169,8 +170,15 @@ pub enum EventPayload {
         chain_index: Option<usize>,
         chain_total: Option<usize>,
     },
+    ChainStarted {
+        chain: ChainInfo,
+    },
     ChainProgress {
         chain: ChainInfo,
+    },
+    ChainFinished {
+        chain_id: String,
+        success: bool,
     },
     JobRemoved {
         job_id: String,

@@ -90,7 +90,8 @@ pub async fn run(
     }
 
     // Spawn event loop with the shared connector for auto-reconnect.
-    let mut rx = event::spawn_event_loop(socket_reader, client_connector)?;
+    let (mut rx, reconnect_tx) = event::spawn_event_loop(socket_reader, client_connector)?;
+    state.set_reconnect_tx(reconnect_tx);
 
     // Main loop.
     let result = loop {

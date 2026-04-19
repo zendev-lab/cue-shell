@@ -12,10 +12,14 @@ use crossterm::event::{self, Event as CtEvent};
 use tokio::sync::mpsc;
 
 use crate::app::AppMsg;
-use crate::client::{ClientConnector, ClientReader, ConnectionEvent, spawn_connection_manager};
+use crate::client::{
+    ClientConnector, ClientReader, ConnectionEvent, ReconnectCmd,
+    spawn_connection_manager_controllable,
+};
 use cue_core::ipc::Message;
 
-/// Spawn the event-producing tasks and return a receiver of [`AppMsg`].
+/// Spawn the event-producing tasks and return a receiver of [`AppMsg`] and a
+/// sender for [`ReconnectCmd`]s that control the connection manager.
 ///
 /// Three sources feed the channel:
 /// 1. **Terminal events** — crossterm key/mouse/resize (blocking thread)
@@ -24,7 +28,7 @@ use cue_core::ipc::Message;
 pub fn spawn_event_loop(
     socket_reader: Option<ClientReader>,
     connector: ClientConnector,
-) -> Result<mpsc::UnboundedReceiver<AppMsg>> {
+) -> Result<(mpsc::UnboundedReceiver<AppMsg>, mpsc::Sender<ReconnectCmd>)> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     // 1. Terminal events (blocking thread)
@@ -55,9 +59,10 @@ pub fn spawn_event_loop(
             }
         })?;
 
-    // 2. Socket connection manager (read + auto-reconnect)
+    // 2. Socket connection manager (read + auto-reconnect + controllable)
     let tx_sock = tx.clone();
-    let mut socket_events = spawn_connection_manager(socket_reader, connector);
+    let (mut socket_events, cmd_tx) =
+        spawn_connection_manager_controllable(socket_reader, connector);
     tokio::spawn(async move {
         while let Some(event) = socket_events.recv().await {
             let msg = match event {
@@ -87,5 +92,5 @@ pub fn spawn_event_loop(
         }
     });
 
-    Ok(rx)
+    Ok((rx, cmd_tx))
 }

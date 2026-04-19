@@ -25,14 +25,15 @@ use cue_core::job::JobStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
 use tui_term::vt100;
 
-use crate::client::WriterHandle;
+use crate::client::{ReconnectCmd, WriterHandle};
 use crate::component::Component;
 use crate::component::input_line::{InputLine, InputMsg};
-use crate::component::main_view::{Card, CardStatus, MainView, MainViewMsg};
+use crate::component::main_view::{Card, CardStatus, MainView, MainViewMsg, chain_step_label};
 use crate::component::sidebar::{OverviewCounts, Sidebar, SidebarItem, SidebarMsg};
 use crate::component::status_bar::{StatusBar, StatusBarMsg};
 use crate::target_config::{
-    TargetSettingsSnapshot, display_path, load_target_settings, save_default_profile,
+    TargetSettingsSnapshot, connector_for_profile, display_path, load_target_settings,
+    save_default_profile,
 };
 
 // ── Focus ──
@@ -204,6 +205,9 @@ struct TargetSettingsState {
     snapshot: TargetSettingsSnapshot,
     selected: usize,
     notice: Option<String>,
+    /// Profile name waiting for an R-key reconnect trigger.
+    /// `None` when no pending live-reconnect is available.
+    pending_reconnect_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +227,7 @@ impl TargetSettingsState {
             snapshot,
             selected,
             notice: None,
+            pending_reconnect_profile: None,
         }
     }
 
@@ -343,12 +348,19 @@ pub struct AppState {
     // Connection
     pub writer: Option<WriterHandle>,
     pub connected: bool,
+    /// Sender for live reconnect / target-switch commands.
+    reconnect_tx: Option<tokio::sync::mpsc::Sender<ReconnectCmd>>,
+    /// Profile name we are reconnecting to; set when the user triggers a live
+    /// reconnect, cleared and applied to `session_profile_name` on success.
+    pending_reconnect_profile_name: Option<String>,
 
     // Entity state mirrored into the mode-specific sidebar.
     jobs: Vec<JobRow>,
     agents: Vec<AgentRow>,
     crons: Vec<CronRow>,
     job_cards: HashMap<String, usize>,
+    /// Maps chain_id → card_index for chain cards.
+    chain_cards: HashMap<String, usize>,
     agent_sessions: HashMap<String, AgentSession>,
     fg_session: Option<FgSession>,
     display_tabs: Vec<DisplayTab>,
@@ -379,10 +391,13 @@ impl AppState {
             status_bar: StatusBar::new(),
             writer: None,
             connected: false,
+            reconnect_tx: None,
+            pending_reconnect_profile_name: None,
             jobs: Vec::new(),
             agents: Vec::new(),
             crons: Vec::new(),
             job_cards: HashMap::new(),
+            chain_cards: HashMap::new(),
             agent_sessions: HashMap::new(),
             fg_session: None,
             display_tabs: Vec::new(),
@@ -411,6 +426,12 @@ impl AppState {
 
     pub fn set_session_profile_name(&mut self, session_profile_name: Option<String>) {
         self.session_profile_name = session_profile_name;
+    }
+
+    /// Store the control channel for the connection manager so the TUI can
+    /// trigger live target switches.
+    pub fn set_reconnect_tx(&mut self, tx: tokio::sync::mpsc::Sender<ReconnectCmd>) {
+        self.reconnect_tx = Some(tx);
     }
 
     /// Whether the sidebar should be visible for the current terminal width.
@@ -493,7 +514,21 @@ impl AppState {
             }
             FocusArea::MainView => {
                 if self.targets_preview_active() {
-                    "Targets: Up/Down/Home/End select  •  Enter save default  •  Ctrl+R reload  •  Esc/Ctrl+T close  •  Ctrl+Y copy  •  Shift+Tab mode".to_string()
+                    let reconnect_hint = if self
+                        .target_settings
+                        .as_ref()
+                        .and_then(|s| s.pending_reconnect_profile.as_ref())
+                        .is_some()
+                    {
+                        "  •  R reconnect now"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "Targets: Up/Down/Home/End select  •  Enter save default  •  \
+                         Ctrl+R reload  •  Esc/Ctrl+T close  •  Ctrl+Y copy  •  \
+                         Shift+Tab mode{reconnect_hint}"
+                    )
                 } else if self.display_pane_has_target() {
                     "Display: Click tab to switch  •  × closes tab  •  Ctrl+Y copy active tab  •  Shift+Tab mode  •  Ctrl+L clears when idle".to_string()
                 } else {
@@ -1266,6 +1301,47 @@ impl AppState {
         self.refresh_target_settings_tab();
     }
 
+    /// Dispatch a live `SwitchTarget` command to the connection manager for
+    /// the profile stored in `pending_reconnect_profile`.
+    fn trigger_reconnect_now(&mut self) {
+        let profile_name = self
+            .target_settings
+            .as_ref()
+            .and_then(|s| s.pending_reconnect_profile.clone());
+        let Some(profile_name) = profile_name else {
+            return;
+        };
+
+        let connector = match connector_for_profile(&profile_name) {
+            Ok(c) => c,
+            Err(error) => {
+                if let Some(state) = self.target_settings.as_mut() {
+                    state.notice = Some(format!("reconnect failed: {error}"));
+                    state.pending_reconnect_profile = None;
+                }
+                self.refresh_target_settings_tab();
+                return;
+            }
+        };
+
+        if let Some(ref tx) = self.reconnect_tx {
+            if tx.try_send(ReconnectCmd::SwitchTarget(connector)).is_err() {
+                if let Some(state) = self.target_settings.as_mut() {
+                    state.notice = Some("reconnect command could not be sent; try again".into());
+                    state.pending_reconnect_profile = None;
+                }
+                self.refresh_target_settings_tab();
+                return;
+            }
+            self.pending_reconnect_profile_name = Some(profile_name.clone());
+            if let Some(state) = self.target_settings.as_mut() {
+                state.notice = Some(format!("reconnecting to `{profile_name}`…"));
+                state.pending_reconnect_profile = None;
+            }
+            self.refresh_target_settings_tab();
+        }
+    }
+
     fn close_job_picker(&mut self) {
         self.job_picker = None;
     }
@@ -1923,6 +1999,7 @@ impl AppState {
                     self.main_view.clear_all();
                     self.clear_display_pane();
                     self.job_cards.clear();
+                    self.chain_cards.clear();
                     self.refresh_clear_action();
                 }
             }
@@ -2037,6 +2114,15 @@ impl AppState {
                 self.request_sidebar_snapshots();
                 self.restore_display_subscriptions();
                 self.refresh_clear_action();
+                // If this reconnect was triggered by a live target switch, apply
+                // the new profile name and show confirmation.
+                if let Some(profile) = self.pending_reconnect_profile_name.take() {
+                    self.session_profile_name = Some(profile.clone());
+                    if let Some(state) = self.target_settings.as_mut() {
+                        state.notice = Some(format!("connected to `{profile}`"));
+                    }
+                    self.refresh_target_settings_tab();
+                }
             }
 
             AppMsg::Response { id: _, payload } => {
@@ -2103,17 +2189,27 @@ impl AppState {
                             }
                         }
                         OkPayload::ChainCreated {
-                            chain_id, job_ids, ..
+                            chain_id,
+                            job_ids,
+                            chain,
                         } => {
                             if let Some(pending) = pending.as_ref()
                                 && !pending.silent
                             {
-                                self.show_submission_result(
+                                let card_index = self.show_submission_result(
                                     pending,
                                     format!("{}: {}", chain_id, job_ids.join(", ")),
                                     CardStatus::Success,
-                                    Some(chain_id),
+                                    Some(chain_id.clone()),
                                 );
+                                // Register chain → card mapping and annotate the card.
+                                self.chain_cards.insert(chain_id.clone(), card_index);
+                                if chain.total_jobs > 1 {
+                                    self.main_view.update(MainViewMsg::SetCardChainLabel {
+                                        index: card_index,
+                                        label: format!("chain:{}", chain_id),
+                                    });
+                                }
                             }
                         }
                         OkPayload::AgentSpawned { agent_id } => {
@@ -2340,9 +2436,28 @@ impl AppState {
                     pipeline,
                     start_scope,
                     open_hint,
-                    ..
+                    chain_id,
+                    chain_index,
+                    chain_total,
                 } => {
-                    self.upsert_job(job_id, pipeline, JobStatus::Running, start_scope, open_hint);
+                    self.upsert_job(
+                        job_id.clone(),
+                        pipeline,
+                        JobStatus::Running,
+                        start_scope,
+                        open_hint,
+                    );
+                    // Annotate the chain card with a step label when a new chain job starts.
+                    if let (Some(cid), Some(idx), Some(total)) =
+                        (chain_id, chain_index, chain_total)
+                        && let Some(&card_index) = self.chain_cards.get(&cid)
+                        && total > 1
+                    {
+                        self.main_view.update(MainViewMsg::SetCardChainLabel {
+                            index: card_index,
+                            label: chain_step_label(&cid, idx, total),
+                        });
+                    }
                     self.sync_sidebar_items();
                 }
                 EventPayload::JobStateChanged {
@@ -2359,6 +2474,54 @@ impl AppState {
                     self.jobs.retain(|job| job.id != job_id);
                     self.job_cards.remove(&job_id);
                     self.sync_sidebar_items();
+                }
+                EventPayload::ChainStarted { chain } => {
+                    if let Some(&card_index) = self.chain_cards.get(&chain.id) {
+                        let running_step = chain
+                            .jobs
+                            .iter()
+                            .position(|j| j.status == cue_core::job::JobStatus::Running)
+                            .unwrap_or(0);
+                        if chain.total_jobs > 1 {
+                            self.main_view.update(MainViewMsg::SetCardChainLabel {
+                                index: card_index,
+                                label: chain_step_label(&chain.id, running_step, chain.total_jobs),
+                            });
+                        }
+                    }
+                }
+                EventPayload::ChainProgress { chain } => {
+                    if let Some(&card_index) = self.chain_cards.get(&chain.id) {
+                        let running_step = chain
+                            .jobs
+                            .iter()
+                            .position(|j| j.status == cue_core::job::JobStatus::Running)
+                            .or_else(|| {
+                                chain
+                                    .jobs
+                                    .iter()
+                                    .rposition(|j| j.status == cue_core::job::JobStatus::Done)
+                                    .map(|i| i + 1)
+                            })
+                            .unwrap_or(0)
+                            .min(chain.total_jobs.saturating_sub(1));
+                        if chain.total_jobs > 1 {
+                            self.main_view.update(MainViewMsg::SetCardChainLabel {
+                                index: card_index,
+                                label: chain_step_label(&chain.id, running_step, chain.total_jobs),
+                            });
+                        }
+                    }
+                }
+                EventPayload::ChainFinished { chain_id, success } => {
+                    if let Some(&card_index) = self.chain_cards.get(&chain_id) {
+                        let status = if success {
+                            CardStatus::Success
+                        } else {
+                            CardStatus::Error
+                        };
+                        self.main_view.set_card_status(card_index, status);
+                    }
                 }
                 EventPayload::AgentStateChanged {
                     agent_id,
@@ -2546,6 +2709,20 @@ impl AppState {
                         KeyCode::Enter => {
                             self.save_selected_target_profile();
                             return;
+                        }
+                        // Live reconnect: [R] when a pending reconnect profile exists.
+                        KeyCode::Char('r') | KeyCode::Char('R')
+                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            if self
+                                .target_settings
+                                .as_ref()
+                                .and_then(|s| s.pending_reconnect_profile.as_ref())
+                                .is_some()
+                            {
+                                self.trigger_reconnect_now();
+                                return;
+                            }
                         }
                         _ => {}
                     }

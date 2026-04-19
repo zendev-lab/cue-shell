@@ -19,7 +19,10 @@ use cue_core::ipc::{EventPayload, Stream as OutputStream};
 use cue_core::job::JobStatus;
 use cue_core::scope::EnvSnapshot;
 
-use super::{ActorSystem, EventBusMsg, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg};
+use super::{
+    ActorSystem, EventBusMsg, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg,
+    StderrSnapshot,
+};
 use crate::ring_buffer::RingBuffer;
 use crate::runtime_env::effective_snapshot;
 use crate::word_expansion::expand_command_line;
@@ -36,6 +39,8 @@ struct ProcessEntry {
     kill_tx: mpsc::Sender<()>,
     /// Shared ring buffer holding the latest output bytes (FIX 7).
     ring_buffer: Arc<Mutex<RingBuffer>>,
+    /// Separate stderr ring buffer.  `None` in PTY mode (streams are merged).
+    stderr_ring: Option<Arc<Mutex<RingBuffer>>>,
     /// PTY master for job input.
     input: Arc<AsyncFd<std::fs::File>>,
     /// PTY master fd used for resize ioctls.
@@ -368,6 +373,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             _reader_handle: reader_handle,
                             kill_tx,
                             ring_buffer,
+                            stderr_ring: None,
                             input,
                             resize: resize_file,
                             fg_owner,
@@ -393,6 +399,20 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     let result = children
                         .get(&job_id.0)
                         .map(|entry| entry.ring_buffer.lock().unwrap().tail(tail_bytes));
+                    let _ = reply.send(result);
+                }
+
+                ProcessMgrMsg::GetStderr { job_id, tail_bytes, reply } => {
+                    let result = children.get(&job_id.0).map(|entry| match &entry.stderr_ring {
+                        Some(ring) => StderrSnapshot {
+                            pty_merged: false,
+                            data: ring.lock().unwrap().tail(tail_bytes),
+                        },
+                        None => StderrSnapshot {
+                            pty_merged: true,
+                            data: Vec::new(),
+                        },
+                    });
                     let _ = reply.send(result);
                 }
 
