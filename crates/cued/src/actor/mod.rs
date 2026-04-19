@@ -95,6 +95,8 @@ pub enum ProcessMgrMsg {
         job_id: cue_core::JobId,
         command_line: Vec<String>,
         scope_hash: ScopeHash,
+        /// Override the scope's cwd for this specific invocation.
+        cwd_override: Option<std::path::PathBuf>,
     },
     /// Kill a running job.
     KillJob { job_id: cue_core::JobId },

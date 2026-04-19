@@ -52,4 +52,12 @@ impl ModeParams {
             _ => None,
         }
     }
+
+    /// Get explicit working directory override, if specified.
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        match self.get("cwd") {
+            Some(ParamValue::Str(s)) => Some(std::path::PathBuf::from(s)),
+            _ => None,
+        }
+    }
 }

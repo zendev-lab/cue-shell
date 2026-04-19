@@ -76,6 +76,8 @@ struct ChainState {
     leaf_status: HashMap<usize, LeafStatus>,
     scope_hash: ScopeHash,
     pipeline_text: String,
+    /// Explicit working directory override for all jobs in this chain.
+    cwd_override: Option<std::path::PathBuf>,
 }
 
 /// Flattened representation of a chain leaf for easy lookup.
@@ -149,6 +151,8 @@ struct CronEntry {
     scope_hash: ScopeHash,
     status: CronStatus,
     next_trigger: Instant,
+    /// Explicit working directory override for jobs spawned by this cron.
+    cwd_override: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -583,6 +587,7 @@ fn restore_crons(db: &Arc<Mutex<Connection>>, state: &mut SchedulerState) {
                 scope_hash,
                 status,
                 next_trigger,
+                cwd_override: None,
             },
         );
     }
@@ -3016,11 +3021,12 @@ async fn fire_due_crons(
         let scope_hash = entry.scope_hash;
         let schedule = entry.schedule.clone();
         let is_oneshot = schedule.is_oneshot();
+        let cwd_override = entry.cwd_override.clone();
 
         info!(%cron_id, "scheduler: cron triggered");
 
         // Spawn the chain just like `:run`.
-        let response = spawn_chain(chain, scope_hash, 0, 0, state, db, sys).await;
+        let response = spawn_chain(chain, scope_hash, 0, 0, cwd_override, state, db, sys).await;
         let first_job_id = match &response {
             ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => Some(job_id.clone()),
             ResponsePayload::Ok(OkPayload::ChainCreated { chain, .. }) => {
@@ -3058,11 +3064,13 @@ async fn fire_due_crons(
 // ── Spawn chain / single job ────────────────────────────────────────────────
 
 /// Spawn a chain (or a single job) from a `ChainNode`, returning the response payload.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_chain(
     chain: ChainNode,
     scope_hash: ScopeHash,
     client_id: u64,
     request_id: u32,
+    cwd_override: Option<std::path::PathBuf>,
     state: &mut SchedulerState,
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
@@ -3142,6 +3150,7 @@ async fn spawn_chain(
                         job_id: jid,
                         command_line: leaf.command.clone(),
                         scope_hash,
+                        cwd_override: cwd_override.clone(),
                     })
                     .await;
             }
@@ -3191,6 +3200,7 @@ async fn spawn_chain(
         leaf_status,
         scope_hash,
         pipeline_text: chain_text,
+        cwd_override: cwd_override.clone(),
     };
     state.chains.insert(chain_id, chain_state);
 
@@ -3203,6 +3213,7 @@ async fn spawn_chain(
             .collect(),
         &[],
         ready_indices.len(),
+        cwd_override,
         state,
         db,
         sys,
@@ -3246,18 +3257,34 @@ async fn handle_job_finished(
     )
     .await
     {
-        process_chain_advance(chain_id, ready_queue, &to_cancel, 0, state, db, sys).await;
+        let cwd_override = state
+            .chains
+            .get(&chain_id)
+            .and_then(|c| c.cwd_override.clone());
+        process_chain_advance(
+            chain_id,
+            ready_queue,
+            &to_cancel,
+            0,
+            cwd_override,
+            state,
+            db,
+            sys,
+        )
+        .await;
     }
 }
 
 /// Shared logic for processing chain advancement results (cancels + spawns + cleanup).
 ///
 /// Used by `handle_job_finished`, `:kill`, and `:cancel` handlers.
+#[allow(clippy::too_many_arguments)]
 async fn process_chain_advance(
     chain_id: ChainId,
     newly_ready: Vec<(usize, ScopeHash)>,
     to_cancel: &[usize],
     capture_first: usize,
+    cwd_override: Option<std::path::PathBuf>,
     state: &mut SchedulerState,
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
@@ -3368,6 +3395,7 @@ async fn process_chain_advance(
                         job_id: jid,
                         command_line: leaves[idx].command.clone(),
                         scope_hash: start_scope,
+                        cwd_override: cwd_override.clone(),
                     })
                     .await;
             }
@@ -3487,13 +3515,14 @@ async fn handle_command(
     sys: &ActorSystem,
 ) -> ResponsePayload {
     match cmd {
-        ResolvedCommand::Run { chain, .. } => {
+        ResolvedCommand::Run { chain, params } => {
             // Get current HEAD scope hash.
             let scope_hash = match get_head_scope(sys).await {
                 Ok(h) => h,
                 Err(resp) => return resp,
             };
-            spawn_chain(chain, scope_hash, 0, 0, state, db, sys).await
+            let cwd_override = params.cwd();
+            spawn_chain(chain, scope_hash, 0, 0, cwd_override, state, db, sys).await
         }
 
         ResolvedCommand::Ask { text, params } => {
@@ -3511,10 +3540,13 @@ async fn handle_command(
                 Ok(hash) => hash,
                 Err(response) => return response,
             };
-            let snapshot = match get_head_snapshot(sys).await {
+            let mut snapshot = match get_head_snapshot(sys).await {
                 Ok(snapshot) => snapshot,
                 Err(response) => return response,
             };
+            if let Some(cwd) = params.cwd() {
+                snapshot.cwd = cwd;
+            }
             let aid = state.alloc_agent();
             let control = match launch_agent(
                 aid,
@@ -3557,7 +3589,7 @@ async fn handle_command(
         ResolvedCommand::Cron {
             schedule_text,
             chain,
-            ..
+            params,
         } => {
             let Some(schedule) = parse_schedule(&schedule_text) else {
                 return ResponsePayload::err(
@@ -3586,6 +3618,7 @@ async fn handle_command(
                 scope_hash,
                 status: CronStatus::Scheduled,
                 next_trigger,
+                cwd_override: params.cwd(),
             };
             persist_cron_entry(db, &entry);
             state.crons.insert(cron_id, entry);
@@ -3611,10 +3644,13 @@ async fn handle_command(
                 Ok(hash) => hash,
                 Err(response) => return response,
             };
-            let snapshot = match get_head_snapshot(sys).await {
+            let mut snapshot = match get_head_snapshot(sys).await {
                 Ok(snapshot) => snapshot,
                 Err(response) => return response,
             };
+            if let Some(cwd) = params.cwd() {
+                snapshot.cwd = cwd;
+            }
             let aid = state.alloc_agent();
             let control = match launch_agent(
                 aid,
@@ -3732,11 +3768,16 @@ async fn handle_command(
                         )
                         .await
                         {
+                            let cwd_override = state
+                                .chains
+                                .get(&chain_id)
+                                .and_then(|c| c.cwd_override.clone());
                             process_chain_advance(
                                 chain_id,
                                 ready_queue,
                                 &to_cancel,
                                 0,
+                                cwd_override,
                                 state,
                                 db,
                                 sys,
@@ -3808,11 +3849,16 @@ async fn handle_command(
                         )
                         .await
                         {
+                            let cwd_override = state
+                                .chains
+                                .get(&chain_id)
+                                .and_then(|c| c.cwd_override.clone());
                             process_chain_advance(
                                 chain_id,
                                 ready_queue,
                                 &to_cancel,
                                 0,
+                                cwd_override,
                                 state,
                                 db,
                                 sys,
@@ -4213,7 +4259,7 @@ async fn handle_command(
                     );
                 }
             };
-            spawn_chain(chain, start_scope, 0, 0, state, db, sys).await
+            spawn_chain(chain, start_scope, 0, 0, None, state, db, sys).await
         }
 
         ResolvedCommand::Probe { query } => {
@@ -5204,7 +5250,17 @@ done
             right: Box::new(leaf("echo b")),
         };
 
-        let resp = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let resp = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
 
         // Should create a chain, not a single job.
         assert!(matches!(
@@ -5235,7 +5291,17 @@ done
             right: Box::new(leaf("echo b")),
         };
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(spawned.len(), 1);
         let left_jid = spawned[0];
@@ -5264,7 +5330,17 @@ done
             right: Box::new(leaf("echo b")),
         };
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         let left_jid = spawned[0];
 
@@ -5289,7 +5365,17 @@ done
             right: Box::new(leaf("cleanup")),
         };
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         let left_jid = spawned[0];
 
@@ -5314,7 +5400,17 @@ done
             right: Box::new(leaf("cargo clippy")),
         };
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(spawned.len(), 2);
     }
@@ -5403,7 +5499,17 @@ done
         let mut state = SchedulerState::new();
         let chain = leaf("ls -la");
 
-        let resp = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let resp = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         assert!(matches!(
             resp,
             ResponsePayload::Ok(OkPayload::JobCreated { .. })
@@ -5635,7 +5741,17 @@ done
         let mut state = SchedulerState::new();
         let chain = leaf("echo hello");
 
-        let resp = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let resp = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         // Single leaf → JobCreated, not ChainCreated.
         assert!(matches!(
             resp,
@@ -5660,7 +5776,17 @@ done
             right: Box::new(leaf("echo b")),
         };
 
-        let resp = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let resp = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let chain = match resp {
             ResponsePayload::Ok(OkPayload::ChainCreated { chain, .. }) => chain,
             other => panic!("expected ChainCreated, got {other:?}"),
@@ -5687,6 +5813,7 @@ done
             ScopeHash([0; 32]),
             1,
             1,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -5737,6 +5864,7 @@ done
             ScopeHash([0; 32]),
             1,
             1,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -5902,7 +6030,17 @@ done
             right: Box::new(leaf("c")),
         };
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         // Initially ready: a (idx 0) and c (idx 2).
         assert_eq!(spawned.len(), 2);
@@ -5956,7 +6094,17 @@ done
             right: Box::new(leaf("lint")),
         };
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         // Initially ready: compile (idx 0) and lint (idx 2).
         assert_eq!(spawned.len(), 2);
@@ -5994,7 +6142,17 @@ done
             right: Box::new(leaf("b")),
         };
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(spawned.len(), 1);
         let a_jid = spawned[0];
@@ -6378,7 +6536,17 @@ done
         let mut state = SchedulerState::new();
         let chain = leaf("long-running");
 
-        let _ = spawn_chain(chain, ScopeHash([0; 32]), 1, 1, &mut state, &conn, &sys).await;
+        let _ = spawn_chain(
+            chain,
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         let jid = spawned[0];
 

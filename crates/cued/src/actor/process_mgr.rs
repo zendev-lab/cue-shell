@@ -73,6 +73,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     job_id,
                     command_line,
                     scope_hash,
+                    cwd_override,
                 } => {
                     info!(%job_id, cmd = ?command_line, %scope_hash, "process_mgr: spawn");
 
@@ -128,12 +129,16 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         continue;
                     };
 
-                    if let Some(ref snap) = effective_snapshot
-                        && !snap.cwd.is_dir()
+                    // Resolve effective cwd: explicit override wins, else scope cwd.
+                    let effective_cwd = cwd_override.as_ref().or_else(|| {
+                        effective_snapshot.as_ref().map(|s| &s.cwd)
+                    });
+                    if let Some(cwd) = effective_cwd
+                        && !cwd.is_dir()
                     {
                         error!(
                             %job_id,
-                            cwd = %snap.cwd.display(),
+                            cwd = %cwd.display(),
                             "process_mgr: invalid cwd for job spawn"
                         );
                         emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
@@ -156,6 +161,10 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     }
                     if let Some(ref snap) = effective_snapshot {
                         apply_env(&mut cmd, snap);
+                    }
+                    // Apply cwd override after apply_env (which also sets cwd).
+                    if let Some(ref cwd) = cwd_override {
+                        cmd.current_dir(cwd);
                     }
 
                     let pty_pair = match crate::pty::open_pty() {
