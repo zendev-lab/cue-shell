@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+#[cfg(target_os = "macos")]
 const SERVICE_LABEL: &str = "com.cue-shell.cued";
 
 // ── Public API ──────────────────────────────────────────────────────────────

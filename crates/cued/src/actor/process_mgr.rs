@@ -260,7 +260,11 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             if libc::setsid() == -1 {
                                 return Err(std::io::Error::last_os_error());
                             }
-                            if libc::ioctl(slave_fd, libc::TIOCSCTTY.into(), 0) == -1 {
+                            #[cfg(target_os = "macos")]
+                            let tiocsctty = libc::TIOCSCTTY.into();
+                            #[cfg(not(target_os = "macos"))]
+                            let tiocsctty = libc::TIOCSCTTY;
+                            if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
                                 return Err(std::io::Error::last_os_error());
                             }
                             for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
