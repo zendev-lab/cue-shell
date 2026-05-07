@@ -76,26 +76,70 @@ fn pipeline_to_command(pipeline: &cue_core::pipeline::Pipeline) -> (String, Vec<
                 .to_vec(),
         );
     }
-    // Multi-segment: convert |> → shell |
-    let shell_cmd = pipeline
+    // Multi-segment: convert pipe operators into a shell pipeline while keeping
+    // each command argument shell-quoted so spaces/metacharacters remain data.
+    let shell_pipeline = pipeline
         .segments
         .iter()
-        .map(|s| {
-            let cmd = s.command.join(" ");
-            match s.pipe_to_next {
+        .map(|segment| {
+            let cmd = segment
+                .command
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match segment.pipe_to_next {
                 Some(cue_core::pipeline::PipeOp::Stdout) => format!("{cmd} |"),
                 Some(cue_core::pipeline::PipeOp::StdoutStderr) => {
                     format!("{{ {cmd} 2>&1; }} |")
                 }
                 Some(cue_core::pipeline::PipeOp::StderrOnly) => {
-                    format!("{{ {cmd} 2>&1 1>&2; }} |")
+                    format!("{cmd} 2>&1 1>&3 3>&- |")
                 }
                 None => cmd,
             }
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let shell_cmd = format!("{{ {shell_pipeline}; }} 3>&1");
     ("sh".to_string(), vec!["-c".to_string(), shell_cmd])
+}
+
+fn shell_quote(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_string();
+    }
+    if !input.chars().any(|ch| {
+        matches!(
+            ch,
+            ' ' | '\t'
+                | '\n'
+                | '\''
+                | '"'
+                | '\\'
+                | '$'
+                | '`'
+                | '!'
+                | ';'
+                | '&'
+                | '|'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '#'
+        )
+    }) {
+        return input.to_string();
+    }
+
+    format!("'{}'", input.replace('\'', r"'\''"))
 }
 
 /// Spawn the ProcessManager actor task.
@@ -1026,6 +1070,54 @@ mod tests {
         assert_eq!(
             expanded,
             vec!["echo", "${USER:-guest}", "${BROKEN", "$1", "$USER"]
+        );
+    }
+
+    #[test]
+    fn multi_segment_pipeline_quotes_shell_arguments() {
+        let pipeline = cue_core::pipeline::Pipeline {
+            segments: vec![
+                cue_core::pipeline::PipeSegment {
+                    command: vec!["printf".into(), "%s".into(), "hello world".into()],
+                    pipe_to_next: Some(cue_core::pipeline::PipeOp::Stdout),
+                },
+                cue_core::pipeline::PipeSegment {
+                    command: vec!["grep".into(), "hello world".into()],
+                    pipe_to_next: None,
+                },
+            ],
+        };
+
+        let (program, args) = pipeline_to_command(&pipeline);
+
+        assert_eq!(program, "sh");
+        assert_eq!(args[0], "-c");
+        assert_eq!(
+            args[1],
+            "{ printf %s 'hello world' | grep 'hello world'; } 3>&1"
+        );
+    }
+
+    #[test]
+    fn stderr_only_pipeline_keeps_stdout_out_of_pipe() {
+        let pipeline = cue_core::pipeline::Pipeline {
+            segments: vec![
+                cue_core::pipeline::PipeSegment {
+                    command: vec!["producer".into(), "semi;colon".into()],
+                    pipe_to_next: Some(cue_core::pipeline::PipeOp::StderrOnly),
+                },
+                cue_core::pipeline::PipeSegment {
+                    command: vec!["consumer".into()],
+                    pipe_to_next: None,
+                },
+            ],
+        };
+
+        let (_, args) = pipeline_to_command(&pipeline);
+
+        assert_eq!(
+            args[1],
+            "{ producer 'semi;colon' 2>&1 1>&3 3>&- | consumer; } 3>&1"
         );
     }
 }
