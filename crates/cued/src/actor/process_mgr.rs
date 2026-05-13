@@ -162,6 +162,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     pipeline,
                     scope_hash,
                     cwd_override,
+                    wrapper_enabled,
                 } => {
                     info!(%job_id, segments = pipeline.segments.len(), %scope_hash, "process_mgr: spawn");
 
@@ -220,6 +221,26 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             expanded.get(1..).unwrap_or(&[]).to_vec();
                         (prog, rest)
                     };
+
+                    // Apply wrapper prefix for single-segment commands (if enabled).
+                    let (program, args): (String, Vec<String>) = if wrapper_enabled
+                        && pipeline.segments.len() == 1
+                    {
+                        let wbin = &sys.config.wrapper.binary;
+                        if !wbin.is_empty()
+                            && sys.config.wrapper.should_wrap(&program, false, Some(true))
+                        {
+                            let mut wargs = Vec::with_capacity(1 + args.len());
+                            wargs.push(program);
+                            wargs.extend(args);
+                            (wbin.clone(), wargs)
+                        } else {
+                            (program, args)
+                        }
+                    } else {
+                        (program, args)
+                    };
+
                     let Some(program) = (!program.is_empty()).then_some(program) else {
                         error!(
                             %job_id,

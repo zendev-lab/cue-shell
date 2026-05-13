@@ -73,6 +73,8 @@ struct ChainState {
     pipeline_text: String,
     /// Explicit working directory override for all jobs in this chain.
     cwd_override: Option<std::path::PathBuf>,
+    /// Whether the wrapper binary is enabled for this chain's jobs.
+    wrapper_enabled: bool,
 }
 
 /// Flattened representation of a chain leaf for easy lookup.
@@ -154,6 +156,8 @@ struct SchedulerState {
     crons: HashMap<CronId, CronEntry>,
     /// Deferred `:wait` responses keyed by job ID.
     job_waiters: HashMap<JobId, Vec<PendingWait>>,
+    /// Runtime wrapper toggle set by `:wrap on` / `:wrap off`.
+    wrapper_enabled: Option<bool>,
 }
 
 impl SchedulerState {
@@ -167,6 +171,7 @@ impl SchedulerState {
             jobs: HashMap::new(),
             crons: HashMap::new(),
             job_waiters: HashMap::new(),
+            wrapper_enabled: None,
         }
     }
 
@@ -186,6 +191,11 @@ impl SchedulerState {
         let id = ChainId(self.next_chain);
         self.next_chain += 1;
         id
+    }
+
+    /// Resolve the effective wrapper_enabled from session override or config.
+    fn wrapper_enabled(&self, config: &Config) -> bool {
+        self.wrapper_enabled.unwrap_or(config.wrapper.enabled)
     }
 }
 
@@ -1865,7 +1875,19 @@ async fn fire_due_crons(
         info!(%cron_id, "scheduler: cron triggered");
 
         // Spawn the chain just like `:run`.
-        let response = spawn_chain(chain, scope_hash, 0, 0, cwd_override, state, db, sys).await;
+        let wrapper_enabled = state.wrapper_enabled(&sys.config);
+        let response = spawn_chain(
+            chain,
+            scope_hash,
+            0,
+            0,
+            cwd_override,
+            wrapper_enabled,
+            state,
+            db,
+            sys,
+        )
+        .await;
         let first_job_id = match &response {
             ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => Some(job_id.clone()),
             ResponsePayload::Ok(OkPayload::ChainCreated { chain, .. }) => {
@@ -1910,6 +1932,7 @@ async fn spawn_chain(
     client_id: u64,
     request_id: u32,
     cwd_override: Option<std::path::PathBuf>,
+    wrapper_enabled: bool,
     state: &mut SchedulerState,
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
@@ -1990,6 +2013,7 @@ async fn spawn_chain(
                         pipeline: leaf.pipeline.clone(),
                         scope_hash,
                         cwd_override: cwd_override.clone(),
+                        wrapper_enabled,
                     })
                     .await;
             }
@@ -2040,6 +2064,7 @@ async fn spawn_chain(
         scope_hash,
         pipeline_text: chain_text,
         cwd_override: cwd_override.clone(),
+        wrapper_enabled,
     };
     state.chains.insert(chain_id, chain_state);
 
@@ -2130,11 +2155,11 @@ async fn process_chain_advance(
 ) -> Vec<JobId> {
     cancel_chain_leaves(chain_id, to_cancel, state, db, sys).await;
 
-    let leaves = {
+    let (leaves, wrapper_enabled) = {
         let Some(chain) = state.chains.get(&chain_id) else {
             return Vec::new();
         };
-        flatten_leaves(&chain.node)
+        (flatten_leaves(&chain.node), chain.wrapper_enabled)
     };
 
     let mut queue: VecDeque<(usize, ScopeHash)> = newly_ready.into();
@@ -2235,6 +2260,7 @@ async fn process_chain_advance(
                         pipeline: leaves[idx].pipeline.clone(),
                         scope_hash: start_scope,
                         cwd_override: cwd_override.clone(),
+                        wrapper_enabled,
                     })
                     .await;
             }
@@ -2338,7 +2364,19 @@ async fn handle_command(
                 Err(resp) => return resp,
             };
             let cwd_override = params.cwd();
-            spawn_chain(chain, scope_hash, 0, 0, cwd_override, state, db, sys).await
+            let wrapper_enabled = state.wrapper_enabled(config);
+            spawn_chain(
+                chain,
+                scope_hash,
+                0,
+                0,
+                cwd_override,
+                wrapper_enabled,
+                state,
+                db,
+                sys,
+            )
+            .await
         }
 
         ResolvedCommand::Cron {
@@ -2682,10 +2720,74 @@ async fn handle_command(
 
         ResolvedCommand::Quit => ResponsePayload::ack(),
 
-        ResolvedCommand::Wrap { subcommand: _ } => ResponsePayload::err(
-            error_code::NOT_SUPPORTED,
-            "wrapper runtime not yet implemented",
-        ),
+        ResolvedCommand::Wrap { subcommand } => {
+            let sub = subcommand.as_deref().unwrap_or("status");
+            match sub {
+                "on" => {
+                    state.wrapper_enabled = Some(true);
+                    let text = if config.wrapper.enabled {
+                        "wrapper enabled (already on in config)".into()
+                    } else {
+                        "wrapper enabled for this session".into()
+                    };
+                    ResponsePayload::Ok(OkPayload::EvalText { text })
+                }
+                "off" => {
+                    state.wrapper_enabled = Some(false);
+                    let text = if config.wrapper.enabled {
+                        "wrapper disabled for this session".into()
+                    } else {
+                        "wrapper disabled (already off in config)".into()
+                    };
+                    ResponsePayload::Ok(OkPayload::EvalText { text })
+                }
+                "" | "status" => {
+                    let effective = state.wrapper_enabled.unwrap_or(config.wrapper.enabled);
+                    let binary = &config.wrapper.binary;
+                    let source = if let Some(ov) = state.wrapper_enabled {
+                        if ov {
+                            "session override: on"
+                        } else {
+                            "session override: off"
+                        }
+                    } else {
+                        "config"
+                    };
+                    let mut lines = vec![
+                        format!(
+                            "wrapper status: {}",
+                            if effective { "enabled" } else { "disabled" }
+                        ),
+                        format!(
+                            "  binary: {}",
+                            if binary.is_empty() { "(none)" } else { binary }
+                        ),
+                        format!("  source: {source}"),
+                        format!(
+                            "  interactive bypass: {}",
+                            if config.wrapper.denylist.interactive {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                        ),
+                    ];
+                    if !config.wrapper.denylist.commands.is_empty() {
+                        lines.push(format!(
+                            "  denylist: {}",
+                            config.wrapper.denylist.commands.join(", ")
+                        ));
+                    }
+                    ResponsePayload::Ok(OkPayload::EvalText {
+                        text: lines.join("\n"),
+                    })
+                }
+                other => ResponsePayload::err(
+                    error_code::INVALID_SYNTAX,
+                    format!(":wrap {other} — expected 'on', 'off', or 'status'"),
+                ),
+            }
+        }
 
         ResolvedCommand::Cd { path } => {
             let snapshot = match get_head_snapshot(sys).await {
@@ -2817,7 +2919,19 @@ async fn handle_command(
                     );
                 }
             };
-            spawn_chain(chain, start_scope, 0, 0, None, state, db, sys).await
+            let wrapper_enabled = state.wrapper_enabled(config);
+            spawn_chain(
+                chain,
+                start_scope,
+                0,
+                0,
+                None,
+                wrapper_enabled,
+                state,
+                db,
+                sys,
+            )
+            .await
         }
 
         ResolvedCommand::Wait { .. } => ResponsePayload::err(
@@ -3507,6 +3621,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3548,6 +3663,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3587,6 +3703,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3622,6 +3739,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3657,6 +3775,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3756,6 +3875,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3902,6 +4022,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3937,6 +4058,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -3969,6 +4091,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -4020,6 +4143,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -4191,6 +4315,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -4255,6 +4380,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -4303,6 +4429,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
@@ -4355,6 +4482,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             &mut state,
             &conn,
             &sys,
