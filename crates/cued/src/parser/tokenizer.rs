@@ -809,4 +809,46 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn serial_always_operator_inside_word() {
+        let toks = tokens("a~>b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::SerialAlways,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn parallel_race_operator_inside_word() {
+        let toks = tokens("a||?b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::ParallelRace,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_all_operator_inside_word() {
+        let toks = tokens("a|&>b");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("a".into()),
+                Token::PipeAll,
+                Token::Word("b".into()),
+                Token::Eof,
+            ]
+        );
+    }
 }
