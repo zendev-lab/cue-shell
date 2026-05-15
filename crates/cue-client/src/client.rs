@@ -1,14 +1,19 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use cue_core::Mode;
-use cue_core::ipc::{MAX_MESSAGE_SIZE, Message, RequestPayload, encode_message};
+use cue_core::ipc::{
+    EventPayload, MAX_MESSAGE_SIZE, Message, RequestPayload, ResponsePayload, encode_message,
+};
 
 /// Client handle for a single connection to the cued daemon.
 pub struct CuedClient {
@@ -163,9 +168,25 @@ impl WriterHandle {
         id
     }
 
+    /// Enqueue a request asynchronously, returning an error if the writer task
+    /// has already exited.
+    pub async fn send_async(&self, payload: RequestPayload) -> Result<u32, WriterSendError> {
+        let request = self.next_request(payload);
+        let id = request.id;
+        self.enqueue_request(request).await?;
+        Ok(id)
+    }
+
     fn next_request(&self, payload: RequestPayload) -> OutboundRequest {
         let id = next_atomic_request_id(&self.next_id);
         OutboundRequest { id, payload }
+    }
+
+    async fn enqueue_request(&self, request: OutboundRequest) -> Result<(), WriterSendError> {
+        self.tx
+            .send(request)
+            .await
+            .map_err(|_| WriterSendError::Closed)
     }
 }
 
@@ -187,6 +208,79 @@ pub fn spawn_writer_task(mut writer: ClientWriter) -> WriterHandle {
         tracing::debug!("writer task exiting");
     });
     WriterHandle { tx, next_id }
+}
+
+type PendingResponses = Arc<StdMutex<HashMap<u32, oneshot::Sender<Result<ResponsePayload>>>>>;
+
+/// High-level shared client that routes responses by request ID so multiple
+/// callers can safely share one IPC connection.
+pub struct MultiplexedClient {
+    writer: WriterHandle,
+    pending: PendingResponses,
+    events: Mutex<mpsc::UnboundedReceiver<EventPayload>>,
+    reader_task: JoinHandle<()>,
+}
+
+impl MultiplexedClient {
+    /// Build a concurrent request/response client from a split connection.
+    pub fn new(reader: ClientReader, writer: WriterHandle) -> Self {
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let reader_task =
+            tokio::spawn(run_multiplex_reader(reader, Arc::clone(&pending), event_tx));
+        Self {
+            writer,
+            pending,
+            events: Mutex::new(event_rx),
+            reader_task,
+        }
+    }
+
+    /// Send a request and wait for the matching response payload.
+    pub async fn call(&self, payload: RequestPayload) -> Result<ResponsePayload> {
+        let request = self.writer.next_request(payload);
+        let request_id = request.id;
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut pending = self.pending.lock().expect("lock pending response map");
+            pending.insert(request_id, tx);
+        }
+
+        if let Err(error) = self.writer.enqueue_request(request).await {
+            let mut pending = self.pending.lock().expect("lock pending response map");
+            pending.remove(&request_id);
+            return Err(anyhow::Error::new(error)).context(format!("send request {request_id}"));
+        }
+
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "response waiter for request {request_id} closed"
+            )),
+        }
+    }
+
+    /// Convenience: send an Eval request and wait for its response.
+    pub async fn eval(&self, input: &str, mode: Mode) -> Result<ResponsePayload> {
+        self.call(RequestPayload::Eval {
+            input: input.to_string(),
+            mode,
+        })
+        .await
+    }
+
+    /// Receive the next pushed event from the daemon.
+    pub async fn next_event(&self) -> Option<EventPayload> {
+        self.events.lock().await.recv().await
+    }
+}
+
+impl Drop for MultiplexedClient {
+    fn drop(&mut self) {
+        self.reader_task.abort();
+        fail_pending_responses(&self.pending, "multiplexed client dropped");
+    }
 }
 
 const APP_DIR: &str = "cue-shell";
@@ -258,6 +352,57 @@ struct OutboundRequest {
     payload: RequestPayload,
 }
 
+async fn run_multiplex_reader(
+    mut reader: ClientReader,
+    pending: PendingResponses,
+    event_tx: mpsc::UnboundedSender<EventPayload>,
+) {
+    let disconnect_reason = loop {
+        match reader.recv().await {
+            Ok(Message::Response { id, payload }) => {
+                let waiter = {
+                    let mut pending = pending.lock().expect("lock pending response map");
+                    pending.remove(&id)
+                };
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(Ok(payload));
+                } else {
+                    tracing::debug!(request_id = id, "dropping response for unknown request");
+                }
+            }
+            Ok(Message::Event { payload }) => {
+                let _ = event_tx.send(payload);
+            }
+            Ok(Message::Request { id, .. }) => {
+                tracing::warn!(
+                    request_id = id,
+                    "client received unexpected request message"
+                );
+            }
+            Err(error) => {
+                break format!("cued connection closed: {error}");
+            }
+        }
+    };
+
+    fail_pending_responses(&pending, disconnect_reason);
+}
+
+fn fail_pending_responses(pending: &PendingResponses, message: impl Into<String>) {
+    let message = message.into();
+    let waiters = {
+        let mut pending = pending.lock().expect("lock pending response map");
+        pending
+            .drain()
+            .map(|(_, waiter)| waiter)
+            .collect::<Vec<_>>()
+    };
+
+    for waiter in waiters {
+        let _ = waiter.send(Err(anyhow::anyhow!(message.clone())));
+    }
+}
+
 impl ClientWriter {
     async fn send_with_id(&mut self, id: u32, payload: RequestPayload) -> Result<u32> {
         send_request_with_id(&mut self.stream, id, payload).await?;
@@ -288,7 +433,21 @@ fn next_atomic_request_id(next_id: &AtomicU32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use cue_core::ipc::{OkPayload, encode_message};
+    use tokio::io::duplex;
+    use tokio::time::{Duration, timeout};
+
     use super::*;
+
+    async fn write_message<S>(stream: &mut S, msg: &Message)
+    where
+        S: AsyncWrite + Unpin,
+    {
+        let encoded = encode_message(msg).unwrap();
+        stream.write_all(&encoded).await.unwrap();
+    }
 
     #[test]
     fn request_ids_wrap_without_using_zero() {
@@ -304,5 +463,182 @@ mod tests {
         assert_eq!(next_id.load(Ordering::Relaxed), 1);
         assert_eq!(next_atomic_request_id(&next_id), 1);
         assert_eq!(next_id.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn writer_handle_send_async_reports_closed_writer() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let writer = WriterHandle {
+            tx,
+            next_id: Arc::new(AtomicU32::new(1)),
+        };
+
+        let error = writer
+            .send_async(RequestPayload::Ping {})
+            .await
+            .unwrap_err();
+        assert_eq!(error, WriterSendError::Closed);
+    }
+
+    #[tokio::test]
+    async fn multiplexed_client_matches_concurrent_eval_responses_by_request_id() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let client = CuedClient::from_stream(client_stream);
+        let (reader, writer) = client.into_split();
+        let client = Arc::new(MultiplexedClient::new(reader, spawn_writer_task(writer)));
+
+        let mut tasks = Vec::new();
+        for index in 0..3usize {
+            let client = Arc::clone(&client);
+            tasks.push(tokio::spawn(async move {
+                let response = client
+                    .eval(&format!("job-{index}"), Mode::Job)
+                    .await
+                    .unwrap();
+                match response {
+                    ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => {
+                        assert_eq!(job_id, format!("J{index}"));
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
+            }));
+        }
+
+        let mut request_inputs = Vec::new();
+        for _ in 0..3 {
+            let message = read_message(&mut server_stream).await.unwrap();
+            match message {
+                Message::Request {
+                    id,
+                    payload: RequestPayload::Eval { input, mode },
+                } => {
+                    assert_eq!(mode, Mode::Job);
+                    request_inputs.push((id, input));
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+
+        let unique_request_ids = request_inputs
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<HashSet<_>>();
+        assert_eq!(unique_request_ids.len(), 3);
+
+        for (request_id, input) in request_inputs.iter().rev() {
+            let job_suffix = input
+                .strip_prefix("job-")
+                .expect("test eval input should have job- prefix");
+            write_message(
+                &mut server_stream,
+                &Message::Response {
+                    id: *request_id,
+                    payload: ResponsePayload::Ok(OkPayload::JobCreated {
+                        job_id: format!("J{job_suffix}"),
+                        start_scope: None,
+                        open_hint: cue_core::ipc::JobOpenHint::Stream,
+                        chain_id: None,
+                        chain_index: None,
+                        chain_total: None,
+                    }),
+                },
+            )
+            .await;
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn multiplexed_client_reports_disconnect_to_pending_callers() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let client = CuedClient::from_stream(client_stream);
+        let (reader, writer) = client.into_split();
+        let client = Arc::new(MultiplexedClient::new(reader, spawn_writer_task(writer)));
+
+        let first = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.call(RequestPayload::Ping {}).await })
+        };
+        let second = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.call(RequestPayload::Ping {}).await })
+        };
+
+        for _ in 0..2 {
+            let message = read_message(&mut server_stream).await.unwrap();
+            match message {
+                Message::Request {
+                    payload: RequestPayload::Ping {},
+                    ..
+                } => {}
+                other => panic!("unexpected request: {other:?}"),
+            }
+        }
+        drop(server_stream);
+
+        let first_error = timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first caller timed out")
+            .unwrap()
+            .unwrap_err();
+        assert!(first_error.to_string().contains("cued connection closed"));
+
+        let second_error = timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second caller timed out")
+            .unwrap()
+            .unwrap_err();
+        assert!(second_error.to_string().contains("cued connection closed"));
+    }
+
+    #[tokio::test]
+    async fn multiplexed_client_delivers_events_without_consuming_responses() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let client = CuedClient::from_stream(client_stream);
+        let (reader, writer) = client.into_split();
+        let client = Arc::new(MultiplexedClient::new(reader, spawn_writer_task(writer)));
+
+        let response_task = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move { client.call(RequestPayload::Ping {}).await }
+        });
+
+        let request_id = match read_message(&mut server_stream).await.unwrap() {
+            Message::Request {
+                id,
+                payload: RequestPayload::Ping {},
+            } => id,
+            other => panic!("unexpected request: {other:?}"),
+        };
+
+        write_message(
+            &mut server_stream,
+            &Message::Event {
+                payload: EventPayload::DaemonReady {},
+            },
+        )
+        .await;
+        write_message(
+            &mut server_stream,
+            &Message::Response {
+                id: request_id,
+                payload: ResponsePayload::Ok(OkPayload::Pong {}),
+            },
+        )
+        .await;
+
+        match response_task.await.unwrap().unwrap() {
+            ResponsePayload::Ok(OkPayload::Pong {}) => {}
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        match client.next_event().await {
+            Some(EventPayload::DaemonReady {}) => {}
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }

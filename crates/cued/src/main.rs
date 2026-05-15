@@ -29,7 +29,6 @@ use tracing::{error, info};
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Cli {
     Start {
-        #[allow(dead_code)]
         fg: bool,
         force: bool,
         socket: Option<PathBuf>,
@@ -296,7 +295,7 @@ fn run_start_foreground(socket_override: Option<PathBuf>) -> Result<()> {
 
 async fn async_main(socket_path: PathBuf) -> Result<()> {
     // Load config.
-    let config = cued::config::Config::load().unwrap_or_default();
+    let config = cued::config::Config::load().context("load daemon config")?;
 
     // Open database.
     let db_path = cued::dirs::db_path();

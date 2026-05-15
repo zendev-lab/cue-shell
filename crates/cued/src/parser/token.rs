@@ -15,7 +15,7 @@ pub enum Token {
     ModeParenOpen,
     /// `)` in mode-params context.
     ModeParenClose,
-    /// Parameter key in mode-params, e.g. `retry`, `timeout`.
+    /// Parameter key in mode-params, e.g. `cwd`, `retry`.
     ParamKey(String),
     /// `=` in mode-params.
     ParamEq,
@@ -56,6 +56,7 @@ pub enum Token {
 
     // Whitespace (preserved for highlighting, skipped during parsing)
     Whitespace(String),
+    Newline,
 
     // Sentinel
     Eof,
@@ -129,6 +130,7 @@ impl fmt::Display for Token {
             Self::Word(s) => write!(f, "{s}"),
             Self::IdRef(k, n) => write!(f, "{k}{n}"),
             Self::Whitespace(s) => write!(f, "{s}"),
+            Self::Newline => f.write_str("\\n"),
             Self::Eof => f.write_str("<EOF>"),
         }
     }

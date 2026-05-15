@@ -9,6 +9,11 @@ use super::token::{IdKind, Span, Value};
 /// Top-level parsed input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ast {
+    /// Multiline script input containing multiple top-level statements.
+    Script {
+        items: Vec<ScriptItemAst>,
+        span: Span,
+    },
     /// Explicit builtin command (starts with `:`).
     Command {
         name: String,
@@ -18,6 +23,13 @@ pub enum Ast {
     },
     /// Bare input (no `:` prefix) — mode determines the command.
     BareInput { argument: Argument, span: Span },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScriptItemAst {
+    pub source: String,
+    pub statement: Box<Ast>,
+    pub span: Span,
 }
 
 /// Argument types — which variant is valid depends on the command.
@@ -84,8 +96,6 @@ pub enum CronScheduleAst {
     Crontab(String),
     /// `daily`, `hourly`, etc.
     Preset(String),
-    /// `<free-schedule> do <cmd...>`
-    FreeForm(String),
 }
 
 impl Pipeline {

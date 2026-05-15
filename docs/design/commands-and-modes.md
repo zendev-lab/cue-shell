@@ -105,6 +105,19 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
+`cue-shell` 现在也支持 **multiline script**：
+
+```text
+cat _typos.toml |> rg files
+|| cat Cargo.toml |> rg author
+```
+
+- JOB 模式下，多行输入默认视为一次 script 提交；显式 `:run` 也可承载同样的多行 body
+- 一个 script 会分配新的 `R<n>`，其下每个顶层 item 继续按原有语义解析成 chain / job / cron
+- 调度是 **异步提交、按 ack 排序**：item N 创建成功后，才继续发 item N+1；但已经创建的 chain/job 仍按各自异步生命周期运行
+- 输出归属不变：脚本卡片只负责展示 `R -> C -> J` 映射，真正 stdout/stderr 仍由 `J<n>` 持有
+- 顶层换行只在 **top-level** 作为 script item 分隔；如果当前 chain 明显未结束，则换行继续作为同一条 chain 的格式化空白
+
 另外，`cue-shell` 现在把两类输入当作**原生 scope-transform job** 处理，而不是交给外部 shell：
 
 - `:run cd <path>`
@@ -157,10 +170,8 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 :cron monthly ./report.sh               # 预设别名
 :cron cron */5 * * * * curl api/health   # 原生 crontab（cron 后固定 5 字段）
 
-# ── do 回退路径（复杂/动态场景 10%） ──
+# ── do 分界路径（原生 crontab） ──
 :cron */5 * * * * do curl api/health     # 原生 crontab + do 分界
-:cron every 30m 9am-5pm weekdays do ./check.sh  # 复杂调度
-:cron $MY_SCHEDULE do $MY_CMD            # 动态调度
 ```
 
 **关键字解析规则**：
@@ -173,7 +184,7 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 | `in` | 1（duration） | `in <dur> <cmd...>` |
 | `cron` | 5（cron fields） | `cron <f1> <f2> <f3> <f4> <f5> <cmd...>` |
 | `daily`/`hourly`/... | 0 | `<preset> <cmd...>` |
-| 其他 | 扫描 `do` | `<free-schedule> do <cmd...>` |
+| 其他 | 扫描 `do` | `<5-field-crontab> do <cmd...>` |
 
 > 完整的 cron 语法设计过程与备选方案对比见 [research/syntax-decisions.md](../research/syntax-decisions.md)。
 
@@ -218,6 +229,20 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 - **引用保护**：被 active/idle 子 scope 依赖的 parent 不可淘汰
 - 淘汰前先把依赖它的子 scope 的 delta 展平为全量快照
 
+### Job / Script 历史裁剪
+
+`server.toml` 增加：
+
+```toml
+[retention]
+max_job_history = 200
+max_script_runs = 100
+```
+
+- `max_job_history`：保留最近的 job 记录与其输出日志
+- `max_script_runs`：保留最近的 script 元数据（`R<n>` 与 item 映射）
+- 裁剪时优先删除最旧记录，script 只是提交层摘要，不改变 job 作为输出权威来源的设计
+
 ### 生命周期
 ```
 Active → Idle (队列空) → Persisted (TTL 到期，落盘)
@@ -234,8 +259,8 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 > v2 新增：用括号分离内建配置与被执行命令的参数，消除歧义。
 
 ```
-:run(retry=3, timeout=30s) cargo test --release
-:cron(scope=S0@a3f1) every 5m cargo clippy
+:run(cwd=/repo, retry=3, retry_delay=5s) cargo test --release
+:cron(cwd=/repo) every 5m cargo clippy
 ```
 
 - `()` 紧跟命令名 = 模式参数（执行行为配置）
@@ -247,8 +272,8 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 | 命令 | 可用参数 |
 |------|---------|
-| `:run()` | `retry`, `timeout`, `shell`, `env`, `scope` |
-| `:cron()` | `label`, `scope` |
+| `:run()` | `cwd`, `retry`, `retry_delay` |
+| `:cron()` | `cwd` |
 | `:scope new()` | `profile` |
 
 其他命令只有位置/标志参数，无 `()` 语法。
@@ -356,7 +381,7 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │   内部关键字:                              │
 │   every 5m / at 9am / on weekdays         │
 │   in 5m / daily / cron */5 * * * *        │
-│   <free> do <cmd>   (通用回退)             │
+│   */5 * * * * do <cmd>                    │
 ├── General ────────────────────────────────┤
 │ :env           查看 env                    │
 │ :env set K=V   设置 env                    │

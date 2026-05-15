@@ -7,8 +7,8 @@ mod restart;
 mod ssh_config;
 
 pub use client::{
-    ClientReader, ClientWriter, CuedClient, WriterHandle, WriterSendError, default_socket_path,
-    spawn_writer_task,
+    ClientReader, ClientWriter, CuedClient, MultiplexedClient, WriterHandle, WriterSendError,
+    default_socket_path, spawn_writer_task,
 };
 pub use config_paths::{
     client_config_path, config_dir, home_dir, legacy_config_path, read_config_source,

@@ -14,6 +14,10 @@ pub struct CronId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChainId(pub u32);
 
+/// Script submission sequence number, displayed as R1, R2, ...
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScriptId(pub u32);
+
 /// Content-addressed scope hash (blake3), displayed as S0@a3f1...
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScopeHash(pub [u8; 32]);
@@ -43,6 +47,12 @@ impl fmt::Display for CronId {
 impl fmt::Display for ChainId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CH{}", self.0)
+    }
+}
+
+impl fmt::Display for ScriptId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "R{}", self.0)
     }
 }
 
@@ -79,6 +89,7 @@ mod tests {
         assert_eq!(JobId(1).to_string(), "J1");
         assert_eq!(CronId(3).to_string(), "C3");
         assert_eq!(ChainId(7).to_string(), "CH7");
+        assert_eq!(ScriptId(9).to_string(), "R9");
     }
 
     #[test]

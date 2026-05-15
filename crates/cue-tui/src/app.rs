@@ -18,7 +18,7 @@ use cue_core::Mode;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
-    Stream,
+    ScriptItemInfo, ScriptItemResult, ScriptSubmitError, Stream,
 };
 use cue_core::job::JobStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -1999,6 +1999,73 @@ impl AppState {
                                 );
                             }
                         }
+                        OkPayload::ScriptCreated {
+                            script_id,
+                            items,
+                            submit_error,
+                        } => {
+                            let mut sidebar_dirty = false;
+                            for item in &items {
+                                match &item.result {
+                                    ScriptItemResult::Job {
+                                        job_id,
+                                        start_scope,
+                                        open_hint,
+                                    } => {
+                                        self.upsert_job(
+                                            job_id.clone(),
+                                            summarize_script_source(&item.source),
+                                            JobStatus::Running,
+                                            start_scope.clone(),
+                                            *open_hint,
+                                        );
+                                        sidebar_dirty = true;
+                                    }
+                                    ScriptItemResult::Chain { chain, .. } => {
+                                        for job in &chain.jobs {
+                                            if let (Some(job_id), Some(open_hint)) =
+                                                (&job.job_id, &job.open_hint)
+                                            {
+                                                self.upsert_job(
+                                                    job_id.clone(),
+                                                    summarize_script_source(&job.pipeline),
+                                                    job.status.clone(),
+                                                    job.start_scope.clone(),
+                                                    *open_hint,
+                                                );
+                                                sidebar_dirty = true;
+                                            }
+                                        }
+                                    }
+                                    ScriptItemResult::Cron { cron_id } => {
+                                        self.upsert_cron(
+                                            cron_id.clone(),
+                                            summarize_script_source(&item.source),
+                                            CronStatus::Scheduled,
+                                        );
+                                        sidebar_dirty = true;
+                                    }
+                                    ScriptItemResult::Message { .. } => {}
+                                }
+                            }
+                            if sidebar_dirty {
+                                self.sync_sidebar_items();
+                            }
+                            if let Some(pending) = pending.as_ref()
+                                && !pending.silent
+                            {
+                                self.show_submission_result(
+                                    pending,
+                                    format_script_submission(&items, submit_error.as_ref()),
+                                    if submit_error.is_some() {
+                                        CardStatus::Error
+                                    } else {
+                                        CardStatus::Success
+                                    },
+                                    Some(script_id),
+                                );
+                            }
+                        }
                         OkPayload::JobCreated {
                             job_id,
                             start_scope,
@@ -2662,6 +2729,64 @@ fn normalize_command_label(input: &str) -> String {
         }
     }
     trimmed.to_string()
+}
+
+fn summarize_script_source(source: &str) -> String {
+    let compact = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_display_text(&compact, 96)
+}
+
+fn truncate_display_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn format_script_submission(
+    items: &[ScriptItemInfo],
+    submit_error: Option<&ScriptSubmitError>,
+) -> String {
+    let mut lines = vec![format!("submitted {} item(s)", items.len())];
+    for item in items {
+        lines.push(format!(
+            "{}. {} -> {}",
+            item.index + 1,
+            summarize_script_source(&item.source),
+            format_script_item_result(&item.result),
+        ));
+    }
+    if let Some(error) = submit_error {
+        lines.push(String::new());
+        lines.push(format!(
+            "submit stopped at {}. {} [{}]: {}",
+            error.index + 1,
+            summarize_script_source(&error.source),
+            error.code,
+            error.message,
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_script_item_result(result: &ScriptItemResult) -> String {
+    match result {
+        ScriptItemResult::Job { job_id, .. } => job_id.clone(),
+        ScriptItemResult::Chain {
+            chain_id, job_ids, ..
+        } => {
+            if job_ids.is_empty() {
+                chain_id.clone()
+            } else {
+                format!("{chain_id} [{}]", job_ids.join(", "))
+            }
+        }
+        ScriptItemResult::Cron { cron_id } => cron_id.clone(),
+        ScriptItemResult::Message { text } => summarize_script_source(text),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

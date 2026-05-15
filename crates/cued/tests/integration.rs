@@ -92,19 +92,40 @@ impl Drop for TestEnv {
 }
 
 /// Wait (with retries) until the socket file appears and is connectable.
-async fn wait_for_socket(socket: &Path) -> UnixStream {
+async fn wait_for_socket(socket: &Path, child: &mut Child) -> UnixStream {
     for _ in 0..80 {
         if socket.exists()
             && let Ok(stream) = UnixStream::connect(socket).await
         {
             return stream;
         }
+        if let Some(status) = child.try_wait().expect("poll cued startup") {
+            let stderr = read_child_stderr(child).await;
+            panic!(
+                "daemon exited before creating socket {} with status {status}; stderr:\n{stderr}",
+                socket.display()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let stderr = read_child_stderr(child).await;
     panic!(
-        "daemon did not create socket within 8 s: {}",
-        socket.display()
+        "daemon did not create socket within 8 s: {}; stderr:\n{stderr}",
+        socket.display(),
     );
+}
+
+async fn read_child_stderr(child: &mut Child) -> String {
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut buf = String::new();
+    match timeout(Duration::from_millis(200), stderr.read_to_string(&mut buf)).await {
+        Ok(Ok(_)) => buf,
+        Ok(Err(error)) => format!("<failed to read stderr: {error}>"),
+        Err(_) if buf.is_empty() => "<stderr still open>".into(),
+        Err(_) => buf,
+    }
 }
 
 struct SplitStream<R, W> {
@@ -340,7 +361,7 @@ async fn test_daemon_lifecycle() {
         let mut child = env.spawn_daemon();
 
         // Connect and ping.
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
         let resp = roundtrip(&mut stream, 1, RequestPayload::Ping {}).await;
         assert!(
             matches!(resp, ResponsePayload::Ok(OkPayload::Pong {})),
@@ -378,7 +399,7 @@ async fn test_foreground_sigint_exits_promptly() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("sigint-exit");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let pid = child.id().expect("child pid");
         unsafe {
@@ -402,7 +423,7 @@ async fn test_simple_job_execution() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("simplejob");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         // Subscribe to job events.
         subscribe(&mut stream, 1, vec!["jobs"]).await;
@@ -479,7 +500,7 @@ async fn test_restart_restores_jobs_and_scope_head() {
         std::fs::create_dir_all(&persisted_cwd).expect("create persisted cwd");
 
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let first = roundtrip(
             &mut stream,
@@ -517,7 +538,7 @@ async fn test_restart_restores_jobs_and_scope_head() {
         shutdown_daemon(&mut stream, &mut child).await;
 
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let jobs_resp = roundtrip(
             &mut stream,
@@ -602,11 +623,11 @@ async fn test_restart_jobs_merge_ambient_path_into_restored_scope() {
         let live_path = format!("{}:{stale_path}", live_bin.display());
 
         let mut child = env.spawn_daemon_with_env([("PATH", stale_path.clone())]);
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
         shutdown_daemon(&mut stream, &mut child).await;
 
         let mut child = env.spawn_daemon_with_env([("PATH", live_path)]);
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -652,7 +673,7 @@ async fn test_env_set_prints_deduped_scope_side_effects() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("env-set-effects");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -700,7 +721,7 @@ async fn test_cd_rejects_missing_directory() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("badcd");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let missing = env.root.join("definitely-missing");
         let resp = roundtrip(
@@ -736,7 +757,7 @@ async fn test_spawn_failure_does_not_reuse_stale_output_log() {
         std::fs::write(stale_output.join("J1.log"), "stale output\n").expect("write stale log");
 
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -784,7 +805,7 @@ async fn test_chain_execution() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("chain");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         // Subscribe to job events.
         subscribe(&mut stream, 1, vec!["jobs"]).await;
@@ -852,7 +873,7 @@ async fn test_job_kill() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("kill");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         // Subscribe to events.
         subscribe(&mut stream, 1, vec!["jobs"]).await;
@@ -925,7 +946,7 @@ async fn test_fg_attach_input_and_detach() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("fg");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let job_resp = roundtrip(
             &mut stream,
@@ -1053,7 +1074,7 @@ async fn test_jobs_run_in_tty() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("tty");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -1119,7 +1140,7 @@ async fn test_job_command_expands_tilde_and_env_vars() {
         fs::set_permissions(&script_path, permissions).expect("chmod test script");
 
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -1171,7 +1192,7 @@ async fn test_cron_add_and_list() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("cron");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -1227,7 +1248,7 @@ async fn test_cron_mode_bare_input_adds_cron() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("cron-mode");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -1280,7 +1301,7 @@ async fn test_bare_question_returns_current_mode_help() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("mode-help");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         for (request_id, mode, expected) in
             [(1, Mode::Job, "JOB mode"), (2, Mode::Cron, "CRON mode")]
@@ -1323,7 +1344,7 @@ async fn test_gateway_stdio_bridge_shares_state_and_keeps_output_subscriptions_p
         );
 
         let mut child = env.spawn_daemon();
-        let mut local = wait_for_socket(&env.socket).await;
+        let mut local = wait_for_socket(&env.socket, &mut child).await;
         let (mut remote, remote_relay) = connect_bridge(&env.socket).await;
 
         let create_resp = roundtrip(
@@ -1422,7 +1443,7 @@ async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("bridge-fg-release");
         let mut child = env.spawn_daemon();
-        let mut local = wait_for_socket(&env.socket).await;
+        let mut local = wait_for_socket(&env.socket, &mut child).await;
         let (mut remote, remote_relay) = connect_bridge(&env.socket).await;
 
         let job_resp = roundtrip(
@@ -1532,12 +1553,12 @@ async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_err_command_returns_output_for_pty_job() {
-    // All cued jobs run in PTY mode (stdout and stderr are merged).  `:err J<n>` should
-    // return the combined output prefixed with "[PTY: stdout and stderr are merged]".
+    // Single-process jobs still run in PTY mode (stdout and stderr are merged).
+    // `:err J<n>` should return the combined output prefixed with the PTY notice.
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("err-pty");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         // Run a simple job that writes to stdout.
         let resp = roundtrip(
@@ -1589,11 +1610,189 @@ async fn test_err_command_returns_output_for_pty_job() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_stdout_pipeline_preserves_arguments_and_real_stderr() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("pipe-stdout");
+        let producer = env.root.join("producer.sh");
+        let consumer = env.root.join("consumer.sh");
+        write_executable_script(
+            &producer,
+            "#!/bin/sh\nprintf 'out:%s\\n' \"$1\"\nprintf 'err:%s\\n' \"$1\" >&2\n",
+        );
+        write_executable_script(
+            &consumer,
+            "#!/bin/sh\nwhile IFS= read -r line; do printf 'pipe:%s\\n' \"$line\"; done\n",
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+        let input = format!(
+            "{} 'hello world;semi' |> {}",
+            producer.display(),
+            consumer.display()
+        );
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input,
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        let out_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match out_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                assert!(
+                    data.contains("pipe:out:hello world;semi"),
+                    "expected piped stdout with literal arg, got {data:?}"
+                );
+                assert!(
+                    !data.contains("[PTY:"),
+                    "native pipeline stdout should not fall back to PTY output, got {data:?}"
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        let err_resp = roundtrip(
+            &mut stream,
+            4,
+            RequestPayload::Eval {
+                input: format!(":err {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match err_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                assert!(
+                    data.contains("err:hello world;semi"),
+                    "expected real stderr output, got {data:?}"
+                );
+                assert!(
+                    !data.contains("[PTY:"),
+                    "native pipeline stderr should not include PTY notice, got {data:?}"
+                );
+            }
+            other => panic!("expected stderr Output, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_native_stderr_only_pipeline_keeps_stdout_outside_pipe() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("pipe-stderr-only");
+        let producer = env.root.join("producer.sh");
+        let consumer = env.root.join("consumer.sh");
+        write_executable_script(
+            &producer,
+            "#!/bin/sh\nprintf 'out:%s\\n' \"$1\"\nprintf 'err:%s\\n' \"$1\" >&2\n",
+        );
+        write_executable_script(
+            &consumer,
+            "#!/bin/sh\nwhile IFS= read -r line; do printf 'pipe:%s\\n' \"$line\"; done\n",
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+        let input = format!(
+            "{} 'semi;colon' |!> {}",
+            producer.display(),
+            consumer.display()
+        );
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input,
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        let out_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match out_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                assert!(
+                    data.contains("out:semi;colon"),
+                    "expected producer stdout outside the pipe, got {data:?}"
+                );
+                assert!(
+                    data.contains("pipe:err:semi;colon"),
+                    "expected only stderr to reach the consumer, got {data:?}"
+                );
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        let err_resp = roundtrip(
+            &mut stream,
+            4,
+            RequestPayload::Eval {
+                input: format!(":err {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match err_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                assert!(
+                    data.is_empty(),
+                    "stderr-only pipeline should not leak stderr after piping, got {data:?}"
+                );
+            }
+            other => panic!("expected stderr Output, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_scopes_returns_scope_list() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("scopes-list");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,
@@ -1643,7 +1842,7 @@ async fn test_config_show_returns_weft_info() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("config-show");
         let mut child = env.spawn_daemon();
-        let mut stream = wait_for_socket(&env.socket).await;
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
 
         let resp = roundtrip(
             &mut stream,

@@ -78,7 +78,7 @@ pub enum ProcessMgrMsg {
     SpawnJob {
         job_id: cue_core::JobId,
         /// Full pipeline.  Single-segment → spawn one process via PTY.
-        /// Multi-segment → spawn via sh -c with shell pipes.
+        /// Multi-segment → spawn natively with OS pipes between children.
         pipeline: cue_core::pipeline::Pipeline,
         scope_hash: ScopeHash,
         /// Override the scope's cwd for this specific invocation.

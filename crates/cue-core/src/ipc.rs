@@ -81,6 +81,11 @@ pub enum ResponsePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OkPayload {
     Ack {},
+    ScriptCreated {
+        script_id: String,
+        items: Vec<ScriptItemInfo>,
+        submit_error: Option<ScriptSubmitError>,
+    },
     JobCreated {
         job_id: String,
         start_scope: Option<String>,
@@ -284,6 +289,42 @@ pub struct ChainJobInfo {
     pub open_hint: Option<JobOpenHint>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptItemInfo {
+    pub index: usize,
+    pub source: String,
+    pub result: ScriptItemResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScriptItemResult {
+    Job {
+        job_id: String,
+        start_scope: Option<String>,
+        open_hint: JobOpenHint,
+    },
+    Chain {
+        chain_id: String,
+        job_ids: Vec<String>,
+        chain: ChainInfo,
+    },
+    Cron {
+        cron_id: String,
+    },
+    Message {
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptSubmitError {
+    pub index: usize,
+    pub source: String,
+    pub code: String,
+    pub message: String,
+}
+
 // ── Editor services ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +381,7 @@ pub mod error_code {
     pub const ALREADY_EXISTS: &str = "ALREADY_EXISTS";
     pub const NOT_SUPPORTED: &str = "NOT_SUPPORTED";
     pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
+    pub const BLOCKED: &str = "BLOCKED";
     pub const INTERNAL: &str = "INTERNAL";
 }
 

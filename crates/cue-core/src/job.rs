@@ -41,7 +41,7 @@ pub enum CancelReason {
     User,
     /// Preceding step in a chain failed (with `->` operator).
     ChainAborted,
-    /// Exceeded `:run(timeout=...)` limit.
+    /// Reserved for future timeout enforcement.
     Timeout,
 }
 

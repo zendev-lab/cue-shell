@@ -3,6 +3,9 @@
 > Architecture reference for cue-shell: a durable process substrate with TUI
 > frontends. Agent runtime concerns now live outside cue-shell.
 
+For a concise **formal-ish** read of job/scope invariants, composition, and why
+the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.md).
+
 ## Architecture
 
 ```
@@ -68,8 +71,8 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ## Mode Params
 
 ```
-:run(retry=3, timeout=30s) cargo test
-:cron(scope=S0@a3f1) every 5m cargo clippy
+:run(cwd=/repo, retry=3, retry_delay=5s) cargo test
+:cron(cwd=/repo) every 5m cargo clippy
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
@@ -109,6 +112,7 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 
 | Document | Contents |
 |---|---|
+| [conceptual-model.md](conceptual-model.md) | Formal-ish model: jobs, scopes, indexing, composition, tool atoms |
 | [commands-and-modes.md](commands-and-modes.md) | Complete command reference, modes, cron syntax |
 | [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Cron, Pipeline, Chain |
 | [tui.md](tui.md) | TUI architecture, layout, interaction design |

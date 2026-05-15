@@ -12,7 +12,11 @@ const LEGACY_CONFIG_FILE: &str = "config.toml";
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub block: BlockConfig,
+    #[serde(default)]
     pub aliases: AliasConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
     #[serde(default)]
     pub weft: WeftConfig,
     #[serde(default)]
@@ -50,31 +54,124 @@ impl<'de> Deserialize<'de> for AliasConfig {
 }
 
 impl AliasConfig {
-    /// Apply the longest-matching alias to `input` and return the substituted string.
-    ///
-    /// Alias matching compares against the first N whitespace-separated tokens of
-    /// `input`. Longer patterns take priority over shorter ones. Input that begins
-    /// with `:` (an explicit colon-command such as `:run`) is intentionally **not**
-    /// aliased — the caller is already using the explicit command syntax.
     pub fn apply(&self, input: &str) -> String {
         if self.entries.is_empty() || input.starts_with(':') {
             return input.to_string();
         }
-        let input_tokens: Vec<&str> = input.split_whitespace().collect();
+        let input_tokens = token_spans(input);
         for entry in &self.entries {
             let from_tokens: Vec<&str> = entry.from.split_whitespace().collect();
             let n = from_tokens.len();
-            if input_tokens.len() >= n && input_tokens[..n] == from_tokens[..] {
-                let rest = &input_tokens[n..];
-                return if rest.is_empty() {
+            if input_tokens.len() < n {
+                continue;
+            }
+            let matches = input_tokens[..n]
+                .iter()
+                .map(|(start, end)| &input[*start..*end])
+                .eq(from_tokens.iter().copied());
+            if matches {
+                let suffix_start = input_tokens[n - 1].1;
+                let suffix = &input[suffix_start..];
+                return if suffix.is_empty() {
                     entry.to.clone()
                 } else {
-                    format!("{} {}", entry.to, rest.join(" "))
+                    format!("{}{}", entry.to, suffix)
                 };
             }
         }
         input.to_string()
     }
+}
+
+fn token_spans(input: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut iter = input.char_indices().peekable();
+    while let Some((start, ch)) = iter.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        let mut end = start + ch.len_utf8();
+        while let Some(&(idx, next)) = iter.peek() {
+            if next.is_whitespace() {
+                break;
+            }
+            end = idx + next.len_utf8();
+            iter.next();
+        }
+        spans.push((start, end));
+    }
+    spans
+}
+
+/// Forbidden argument patterns for specific commands.
+///
+/// Configured in `server.toml`:
+///
+/// ```toml
+/// [block.commands]
+/// git = ["--no-verify", "--force"]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockConfig {
+    /// Map from command name → list of forbidden argument substrings.
+    #[serde(default)]
+    pub commands: BTreeMap<String, Vec<String>>,
+}
+
+impl Default for BlockConfig {
+    fn default() -> Self {
+        let mut commands = BTreeMap::new();
+        commands.insert("git".into(), vec!["--no-verify".into()]);
+        Self { commands }
+    }
+}
+
+impl BlockConfig {
+    /// Check whether `command_line` is blocked.  Returns `None` if allowed,
+    /// or `Some(reason)` if the command matches a blocked pattern.
+    pub fn check(&self, command_line: &[String]) -> Option<String> {
+        let cmd_name = command_line.first()?;
+        let base = std::path::Path::new(cmd_name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(cmd_name);
+        let forbidden = self.commands.get(base)?;
+        for arg in &command_line[1..] {
+            for pattern in forbidden {
+                if arg == pattern || arg.starts_with(&format!("{pattern}=")) {
+                    return Some(format!(
+                        "blocked: `{cmd_name} {pattern}` is forbidden by server config\n  (see [block.commands] in server.toml)"
+                    ));
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RetentionConfig {
+    #[serde(default = "default_max_job_history")]
+    pub max_job_history: usize,
+    #[serde(default = "default_max_script_runs")]
+    pub max_script_runs: usize,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_job_history: default_max_job_history(),
+            max_script_runs: default_max_script_runs(),
+        }
+    }
+}
+
+fn default_max_job_history() -> usize {
+    200
+}
+
+fn default_max_script_runs() -> usize {
+    100
 }
 
 impl Config {
@@ -292,6 +389,17 @@ socket_path = "/tmp/legacy.sock"
     }
 
     #[test]
+    fn invalid_config_is_not_silently_defaulted() {
+        let error = Config::load_from_sources(
+            Some((Path::new("server.toml"), "[weft]\nsocket_path = [")),
+            None,
+        )
+        .expect_err("invalid config should fail");
+
+        assert!(error.to_string().contains("parse config server.toml"));
+    }
+
+    #[test]
     fn alias_no_match_passthrough() {
         let cfg = AliasConfig::default();
         assert_eq!(cfg.apply("pip install foo"), "pip install foo");
@@ -339,6 +447,15 @@ git = "alt-git"
     fn alias_empty_input() {
         let cfg: AliasConfig = toml::from_str(r#"pip = "uv pip""#).unwrap();
         assert_eq!(cfg.apply(""), "");
+    }
+
+    #[test]
+    fn alias_preserves_multiline_suffix() {
+        let cfg: AliasConfig = toml::from_str(r#"pip = "uv pip""#).unwrap();
+        assert_eq!(
+            cfg.apply("pip install foo\ncargo test"),
+            "uv pip install foo\ncargo test"
+        );
     }
 
     #[test]
@@ -474,5 +591,81 @@ pip = "uv pip"
         )
         .expect("load config");
         assert!(!config.wrapper.enabled);
+    }
+
+    #[test]
+    fn block_config_default_blocks_git_no_verify() {
+        let config = Config::default();
+        assert!(
+            config
+                .block
+                .check(&["git".into(), "commit".into(), "--no-verify".into()])
+                .is_some()
+        );
+        assert!(config.block.check(&["git".into(), "push".into()]).is_none());
+    }
+
+    #[test]
+    fn block_config_parses_and_checks() {
+        let config = Config::load_from_sources(
+            Some((
+                Path::new("server.toml"),
+                r#"
+[block.commands]
+git = ["--no-verify"]
+npm = ["--force", "--legacy-peer-deps"]
+"#,
+            )),
+            None,
+        )
+        .expect("load config");
+
+        // Blocked patterns
+        assert!(
+            config
+                .block
+                .check(&["git".into(), "push".into(), "--no-verify".into()])
+                .is_some()
+        );
+        assert!(
+            config
+                .block
+                .check(&["git".into(), "commit".into(), "--no-verify".into()])
+                .is_some()
+        );
+        assert!(
+            config
+                .block
+                .check(&["npm".into(), "install".into(), "--force".into()])
+                .is_some()
+        );
+
+        // Allowed patterns
+        assert!(config.block.check(&["git".into(), "push".into()]).is_none());
+        assert!(
+            config
+                .block
+                .check(&["git".into(), "commit".into(), "-m".into(), "fix".into()])
+                .is_none()
+        );
+        assert!(
+            config
+                .block
+                .check(&["npm".into(), "install".into()])
+                .is_none()
+        );
+        assert!(
+            config
+                .block
+                .check(&["cargo".into(), "test".into()])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn default_retention_config_is_present() {
+        let config = Config::default();
+        assert_eq!(config.retention.max_job_history, 200);
+        assert_eq!(config.retention.max_script_runs, 100);
     }
 }

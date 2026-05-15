@@ -153,7 +153,6 @@ pub enum CronSchedule {
     Delay(Duration),                           // in 30s （一次性）
     Preset(CronPreset),                        // daily, hourly, weekly, monthly
     Crontab(CrontabExpr),                      // cron */5 * * * *
-    FreeForm(String),                          // <free> do <cmd>
 }
 
 pub enum CronPreset { Hourly, Daily, Weekly, Monthly }
@@ -321,8 +320,8 @@ pub struct CommandArgs {
 
 | 命令 | 可用模式参数 |
 |------|-------------|
-| `:run()` | `retry`, `timeout`, `shell`, `env` |
-| `:cron()` | `label`, `scope` |
+| `:run()` | `cwd`, `retry`, `retry_delay` |
+| `:cron()` | `cwd` |
 | `:scope new()` | `profile` |
 
 其他命令只有命令参数，无 `()` 语法。

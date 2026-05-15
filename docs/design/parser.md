@@ -7,11 +7,14 @@
 ```
 Raw input (String)
   → Tokenizer  → Vec<Token>
-  → Parser     → Ast (unresolved)
-  → Resolver   → RequestPayload (validated, ready for execution)
+  → Parser     → Ast / Script (unresolved)
+  → Resolver   → ResolvedCommand (validated, ready for execution)
 ```
 
 Client sends `Eval { input }` over IPC; cued runs the full pipeline.
+
+Multiline input is parsed as a **top-level script**: newline separates items only
+at top level, and only when the current chain is already syntactically complete.
 
 ## 2. Implementation
 
@@ -32,7 +35,7 @@ enum Token {
     // Mode params (context: immediately after Command)
     ModeParenOpen,          // ( — mode params context
     ModeParenClose,         // ) — mode params context
-    ParamKey(String),       // retry, timeout, ...
+    ParamKey(String),       // cwd, retry, retry_delay, ...
     ParamEq,               // =
     ParamValue(Value),      // 3, "30s", true, ...
     Comma,                  // ,
@@ -85,8 +88,10 @@ Tokenizer uses positional context:
 ## 4. AST (Unresolved)
 
 ```rust
-/// Top-level parsed input
 enum Ast {
+    Script {
+        items: Vec<ScriptItemAst>,
+    },
     Command {
         name: String,
         mode_params: Vec<(String, Value)>,
@@ -95,6 +100,11 @@ enum Ast {
     BareInput {
         argument: Argument,
     },
+}
+
+struct ScriptItemAst {
+    source: String,
+    statement: Box<Ast>,
 }
 
 /// Argument types — which variant depends on command
@@ -143,7 +153,8 @@ enum CronSchedule {
 ## 5. Grammar (EBNF)
 
 ```ebnf
-input       = command | bare_input
+input       = statement (newline statement)*
+statement   = command | bare_input
 command     = ":" cmd_name mode_params? argument
 bare_input  = argument
 
@@ -175,6 +186,14 @@ schedule    = "every" DURATION
             | "cron" QUOTED_STRING
 ```
 
+Notes:
+
+- newline is a script-item separator only at the top level
+- newline inside an unfinished chain behaves like whitespace, so operators can be
+  wrapped across lines naturally
+- resolver can therefore return either one normal command or one script command
+  containing multiple resolved top-level items
+
 ## 6. Resolver
 
 The Resolver transforms `Ast` → `RequestPayload`:
@@ -190,7 +209,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 
 4. **Mode params merge**: per-invocation params override config.toml defaults
 
-5. **Scope resolution**: default scope = HEAD unless explicit `:run(scope=S0@a3f1)`
+5. **Scope resolution**: jobs start from HEAD; `cwd` mode params override process cwd without mutating HEAD
 
 ## 7. Completion Service
 
@@ -199,7 +218,7 @@ The Resolver transforms `Ast` → `RequestPayload`:
 1. Tokenize up to cursor position
 2. Determine context:
    - After `:` → command name completion (run, kill, jobs, ...)
-   - After `:cmd(` → mode param key completion (retry, timeout, scope, ...)
+   - After `:cmd(` → mode param key completion (cwd, retry, retry_delay, ...)
    - After `=` in mode params → value completion (based on param type)
    - After IdRef prefix `J` → active job ID completion
    - After word → filesystem path / command completion
@@ -270,8 +289,8 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (retry, timeout, scope) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (scope) |
+| `:run` | Chain | ✓ (cwd, retry, retry_delay) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd) |
 | `:kill` | IdRef | ✗ |
 | `:retry` | IdRef | ✗ |
 | `:out` | IdRef | ✗ |

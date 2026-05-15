@@ -6,11 +6,12 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -30,7 +31,6 @@ use crate::word_expansion::expand_command_line;
 // ── Per-child bookkeeping ──
 
 struct ProcessEntry {
-    #[allow(dead_code)]
     job_id: JobId,
     status: JobStatus,
     /// Handle for the background reader/waiter task.
@@ -41,12 +41,18 @@ struct ProcessEntry {
     ring_buffer: Arc<Mutex<RingBuffer>>,
     /// Separate stderr ring buffer.  `None` in PTY mode (streams are merged).
     stderr_ring: Option<Arc<Mutex<RingBuffer>>>,
-    /// PTY master for job input.
-    input: Arc<AsyncFd<std::fs::File>>,
+    /// Job stdin, either the PTY master or a pipe to the first process.
+    input: Option<JobInput>,
     /// PTY master fd used for resize ioctls.
-    resize: Arc<std::fs::File>,
+    resize: Option<Arc<std::fs::File>>,
     /// Which client, if any, owns the foreground stream.
     fg_owner: Arc<Mutex<Option<u64>>>,
+}
+
+#[derive(Clone)]
+enum JobInput {
+    Pty(Arc<AsyncFd<std::fs::File>>),
+    Pipe(Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>),
 }
 
 const DEFAULT_PTY_COLS: u16 = 80;
@@ -54,92 +60,25 @@ const DEFAULT_PTY_ROWS: u16 = 24;
 
 // ── Actor entry point ──
 
-/// Convert a multi-segment pipeline into a single `(program, args)` tuple
-/// suitable for `tokio::process::Command`.  Single-segment pipelines are
-/// returned as-is (first segment command).  Multi-segment pipelines are
-/// wrapped in `sh -c "…"` with shell pipes.
-fn pipeline_to_command(pipeline: &cue_core::pipeline::Pipeline) -> (String, Vec<String>) {
-    if pipeline.segments.is_empty() {
-        return (String::new(), vec![]);
-    }
-    if pipeline.segments.len() == 1 {
-        return (
-            pipeline.segments[0]
-                .command
-                .first()
-                .cloned()
-                .unwrap_or_default(),
-            pipeline.segments[0]
-                .command
-                .get(1..)
-                .unwrap_or(&[])
-                .to_vec(),
-        );
-    }
-    // Multi-segment: convert pipe operators into a shell pipeline while keeping
-    // each command argument shell-quoted so spaces/metacharacters remain data.
-    let shell_pipeline = pipeline
-        .segments
-        .iter()
-        .map(|segment| {
-            let cmd = segment
-                .command
-                .iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ");
-            match segment.pipe_to_next {
-                Some(cue_core::pipeline::PipeOp::Stdout) => format!("{cmd} |"),
-                Some(cue_core::pipeline::PipeOp::StdoutStderr) => {
-                    format!("{{ {cmd} 2>&1; }} |")
-                }
-                Some(cue_core::pipeline::PipeOp::StderrOnly) => {
-                    format!("{cmd} 2>&1 1>&3 3>&- |")
-                }
-                None => cmd,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let shell_cmd = format!("{{ {shell_pipeline}; }} 3>&1");
-    ("sh".to_string(), vec!["-c".to_string(), shell_cmd])
+struct NativePipelineSpawn {
+    children: Vec<tokio::process::Child>,
+    input: Option<JobInput>,
+    stdout_sources: Vec<tokio::process::ChildStdout>,
+    stderr_sources: Vec<tokio::process::ChildStderr>,
 }
 
-fn shell_quote(input: &str) -> String {
-    if input.is_empty() {
-        return "''".to_string();
-    }
-    if !input.chars().any(|ch| {
-        matches!(
-            ch,
-            ' ' | '\t'
-                | '\n'
-                | '\''
-                | '"'
-                | '\\'
-                | '$'
-                | '`'
-                | '!'
-                | ';'
-                | '&'
-                | '|'
-                | '<'
-                | '>'
-                | '('
-                | ')'
-                | '{'
-                | '}'
-                | '*'
-                | '?'
-                | '['
-                | ']'
-                | '#'
-        )
-    }) {
-        return input.to_string();
-    }
+#[derive(Clone, Copy)]
+enum PipelineStreamKind {
+    Stdout,
+    Stderr,
+}
 
-    format!("'{}'", input.replace('\'', r"'\''"))
+enum PipelineReaderMsg {
+    Chunk {
+        kind: PipelineStreamKind,
+        data: Vec<u8>,
+    },
+    Closed,
 }
 
 /// Spawn the ProcessManager actor task.
@@ -204,52 +143,6 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     };
 
                     let effective_snapshot = snapshot.as_ref().map(effective_snapshot);
-
-                    // 2. Build the tokio Command.
-                    let (program, args) = if pipeline.segments.len() > 1 {
-                        pipeline_to_command(&pipeline)
-                    } else {
-                        let command_line = pipeline
-                            .segments
-                            .first()
-                            .map(|s| s.command.clone())
-                            .unwrap_or_default();
-                        let expanded =
-                            expand_command_line(&command_line, effective_snapshot.as_ref());
-                        let prog = expanded.first().cloned().unwrap_or_default();
-                        let rest: Vec<String> =
-                            expanded.get(1..).unwrap_or(&[]).to_vec();
-                        (prog, rest)
-                    };
-
-                    // Apply wrapper prefix for single-segment commands (if enabled).
-                    let (program, args): (String, Vec<String>) = if wrapper_enabled
-                        && pipeline.segments.len() == 1
-                    {
-                        let wbin = &sys.config.wrapper.binary;
-                        if !wbin.is_empty()
-                            && sys.config.wrapper.should_wrap(&program, false, Some(true))
-                        {
-                            let mut wargs = Vec::with_capacity(1 + args.len());
-                            wargs.push(program);
-                            wargs.extend(args);
-                            (wbin.clone(), wargs)
-                        } else {
-                            (program, args)
-                        }
-                    } else {
-                        (program, args)
-                    };
-
-                    let Some(program) = (!program.is_empty()).then_some(program) else {
-                        error!(
-                            %job_id,
-                            pipeline = ?pipeline.segments.first().map(|s| &s.command),
-                            "process_mgr: command is empty"
-                        );
-                        continue;
-                    };
-
                     // Resolve effective cwd: explicit override wins, else scope cwd.
                     let effective_cwd = cwd_override.as_ref().or_else(|| {
                         effective_snapshot.as_ref().map(|s| &s.cwd)
@@ -274,245 +167,49 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         continue;
                     }
 
-                    clear_output_log(job_id).await;
+                    clear_job_logs(job_id).await;
 
-                    let mut cmd = tokio::process::Command::new(&program);
-                    if !args.is_empty() {
-                        cmd.args(&args);
-                    }
-                    if let Some(ref snap) = effective_snapshot {
-                        apply_env(&mut cmd, snap);
-                    }
-                    // Apply cwd override after apply_env (which also sets cwd).
-                    if let Some(ref cwd) = cwd_override {
-                        cmd.current_dir(cwd);
-                    }
-
-                    let pty_pair = match crate::pty::open_pty() {
-                        Ok(pair) => pair,
-                        Err(error) => {
-                            error!(%job_id, err = %error, "process_mgr: open pty failed");
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                                .await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let master_file = std::fs::File::from(pty_pair.master);
-                    let slave = pty_pair.slave;
-                    if let Err(error) = set_nonblocking(master_file.as_raw_fd()) {
-                        error!(%job_id, err = %error, "process_mgr: set pty nonblocking failed");
-                        emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                            .await;
-                        let _ = sys
-                            .scheduler
-                            .send(SchedulerMsg::JobFinished {
-                                job_id,
-                                exit_code: -1,
-                            })
-                            .await;
-                        continue;
-                    }
-                    if let Err(error) =
-                        set_winsize(slave.as_raw_fd(), DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS)
-                    {
-                        warn!(%job_id, err = %error, "process_mgr: set initial pty size failed");
-                    }
-                    let reader_file = match master_file.try_clone() {
-                        Ok(file) => file,
-                        Err(error) => {
-                            error!(%job_id, err = %error, "process_mgr: clone pty reader failed");
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                                .await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let input_file = match master_file.try_clone() {
-                        Ok(file) => file,
-                        Err(error) => {
-                            error!(%job_id, err = %error, "process_mgr: clone pty input failed");
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                                .await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let resize_file = match master_file.try_clone() {
-                        Ok(file) => Arc::new(file),
-                        Err(error) => {
-                            error!(%job_id, err = %error, "process_mgr: clone pty resize failed");
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                                .await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let slave_fd = slave.as_raw_fd();
-                    let master_fd = master_file.as_raw_fd();
-                    // SAFETY: the child process is single-threaded after fork here; the closure
-                    // only performs async-signal-safe libc calls on valid inherited fds.
-                    unsafe {
-                        cmd.pre_exec(move || {
-                            if libc::setsid() == -1 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            #[cfg(target_os = "macos")]
-                            let tiocsctty = libc::TIOCSCTTY.into();
-                            #[cfg(not(target_os = "macos"))]
-                            let tiocsctty = libc::TIOCSCTTY;
-                            if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-                                if libc::dup2(slave_fd, target) == -1 {
-                                    return Err(std::io::Error::last_os_error());
-                                }
-                            }
-                            if slave_fd > libc::STDERR_FILENO {
-                                libc::close(slave_fd);
-                            }
-                            if master_fd > libc::STDERR_FILENO {
-                                libc::close(master_fd);
-                            }
-                            Ok(())
-                        });
-                    }
-                    cmd.stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .kill_on_drop(true);
-
-                    // 3. Spawn the child process.
-                    let mut child = match cmd.spawn() {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!(
-                                %job_id,
-                                program = %program,
-                                args = ?args,
-                                cwd = %snapshot
-                                    .as_ref()
-                                    .map(|snap| snap.cwd.display().to_string())
-                                    .unwrap_or_else(|| "<daemon cwd>".into()),
-                                path = ?snapshot
-                                    .as_ref()
-                                    .and_then(|snap| snap.env.get("PATH").cloned()),
-                                err = %e,
-                                "process_mgr: spawn failed"
-                            );
-                            // Transition directly to Failed.
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    drop(slave);
-                    drop(master_file);
-
-                    let pid = child.id().unwrap_or(0);
-                    info!(%job_id, pid, "process_mgr: child spawned");
-
-                    // 4. Emit Pending → Running.
-                    emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Running).await;
-
-                    // 5. Open log file (FIX 5: offloaded to blocking thread).
-                    let log_file = open_log_file(job_id).await;
-                    let input = match AsyncFd::new(input_file) {
-                        Ok(file) => Arc::new(file),
-                        Err(error) => {
-                            error!(%job_id, err = %error, "process_mgr: async pty input failed");
-                            let _ = child.start_kill();
-                            let _ = child.wait().await;
-                            emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Failed)
-                                .await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let reader = match AsyncFd::new(reader_file) {
-                        Ok(file) => file,
-                        Err(error) => {
-                            error!(%job_id, err = %error, "process_mgr: async pty reader failed");
-                            let _ = child.start_kill();
-                            let _ = child.wait().await;
-                            emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Failed)
-                                .await;
-                            let _ = sys
-                                .scheduler
-                                .send(SchedulerMsg::JobFinished {
-                                    job_id,
-                                    exit_code: -1,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-
-                    // 7. Spawn reader/waiter background task.
-                    let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
-                    // FIX 7: shared ring buffer accessible from ProcessEntry.
-                    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
-                    let ring_clone = ring_buffer.clone();
-                    let fg_owner = Arc::new(Mutex::new(None));
-                    let fg_owner_clone = fg_owner.clone();
-                    let sys_clone = sys.clone();
-                    let cleanup_tx_clone = cleanup_tx.clone();
-                    let reader_handle = tokio::spawn(reader_task(
-                        job_id, child, reader, log_file, kill_rx, sys_clone,
-                        ring_clone, fg_owner_clone, cleanup_tx_clone,
-                    ));
-
-                    children.insert(
-                        job_id.0,
-                        ProcessEntry {
+                    let entry = if pipeline.segments.len() > 1 {
+                        spawn_native_pipeline_job(
                             job_id,
-                            status: JobStatus::Running,
-                            _reader_handle: reader_handle,
-                            kill_tx,
-                            ring_buffer,
-                            stderr_ring: None,
-                            input,
-                            resize: resize_file,
-                            fg_owner,
-                        },
-                    );
+                            &pipeline,
+                            effective_snapshot.as_ref(),
+                            cwd_override.as_ref(),
+                            sys.clone(),
+                            cleanup_tx.clone(),
+                        )
+                        .await
+                    } else {
+                        spawn_single_pty_job(
+                            job_id,
+                            &pipeline,
+                            effective_snapshot.as_ref(),
+                            cwd_override.as_ref(),
+                            wrapper_enabled,
+                            sys.clone(),
+                            cleanup_tx.clone(),
+                        )
+                        .await
+                    };
+
+                    match entry {
+                        Ok(entry) => {
+                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Running)
+                                .await;
+                            children.insert(job_id.0, entry);
+                        }
+                        Err(()) => {
+                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
+                                .await;
+                            let _ = sys
+                                .scheduler
+                                .send(SchedulerMsg::JobFinished {
+                                    job_id,
+                                    exit_code: -1,
+                                })
+                                .await;
+                        }
+                    }
                 }
 
                 ProcessMgrMsg::KillJob { job_id } => {
@@ -551,9 +248,9 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                 }
 
                 ProcessMgrMsg::SendJobInput { job_id, data, reply } => {
-                    let input = children.get(&job_id.0).map(|entry| entry.input.clone());
+                    let input = children.get(&job_id.0).and_then(|entry| entry.input.clone());
                     let handled = if let Some(input) = input {
-                        match write_pty(&input, &data).await {
+                        match write_job_input(&input, &data).await {
                             Ok(()) => Ok(()),
                             Err(error) => Err(format!("failed to write job input: {error}")),
                         }
@@ -571,6 +268,8 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             && owner != client_id
                         {
                             (Err(format!("job {job_id} is already foreground-attached")), None)
+                        } else if entry.resize.is_none() {
+                            (Err(format!("job {job_id} does not support foreground attach")), None)
                         } else {
                             *entry.fg_owner.lock().unwrap() = Some(client_id);
                             (
@@ -629,9 +328,9 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     let input = children
                         .values()
                         .find(|entry| *entry.fg_owner.lock().unwrap() == Some(client_id))
-                        .map(|entry| entry.input.clone());
+                        .and_then(|entry| entry.input.clone());
                     let handled = if let Some(input) = input {
-                        match write_pty(&input, &data).await {
+                        match write_job_input(&input, &data).await {
                             Ok(()) => Ok(()),
                             Err(error) => Err(format!("failed to write fg input: {error}")),
                         }
@@ -646,7 +345,7 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         .values()
                         .find(|entry| *entry.fg_owner.lock().unwrap() == Some(client_id))
                         .map(|entry| entry.resize.clone());
-                    let _ = reply.send(if let Some(resize) = resize {
+                    let _ = reply.send(if let Some(Some(resize)) = resize {
                         set_winsize(resize.as_raw_fd(), cols, rows)
                             .map_err(|error| format!("failed to resize fg session: {error}"))
                     } else {
@@ -749,11 +448,413 @@ async fn write_pty(fd: &AsyncFd<std::fs::File>, data: &[u8]) -> std::io::Result<
     Ok(())
 }
 
+async fn write_job_input(input: &JobInput, data: &[u8]) -> std::io::Result<()> {
+    match input {
+        JobInput::Pty(fd) => write_pty(fd, data).await,
+        JobInput::Pipe(stdin) => {
+            let mut stdin = stdin.lock().await;
+            stdin.write_all(data).await?;
+            stdin.flush().await
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ExpandedSegment {
+    program: String,
+    args: Vec<String>,
+    pipe_to_next: Option<cue_core::pipeline::PipeOp>,
+}
+
+fn expand_pipeline_segments(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: Option<&EnvSnapshot>,
+) -> Result<Vec<ExpandedSegment>, ()> {
+    let mut expanded = Vec::with_capacity(pipeline.segments.len());
+    for segment in &pipeline.segments {
+        let command_line = expand_command_line(&segment.command, snapshot);
+        let Some(program) = command_line
+            .first()
+            .cloned()
+            .filter(|word| !word.is_empty())
+        else {
+            error!(
+                %job_id,
+                pipeline = ?segment.command,
+                "process_mgr: command is empty"
+            );
+            return Err(());
+        };
+        expanded.push(ExpandedSegment {
+            program,
+            args: command_line.get(1..).unwrap_or(&[]).to_vec(),
+            pipe_to_next: segment.pipe_to_next,
+        });
+    }
+    if expanded.is_empty() {
+        error!(%job_id, "process_mgr: pipeline is empty");
+        return Err(());
+    }
+    Ok(expanded)
+}
+
+fn configure_command(
+    cmd: &mut tokio::process::Command,
+    snap: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+) {
+    if let Some(snap) = snap {
+        apply_env(cmd, snap);
+    }
+    if let Some(cwd) = cwd_override {
+        cmd.current_dir(cwd);
+    }
+    cmd.kill_on_drop(true);
+}
+
+fn log_spawn_failure(
+    job_id: JobId,
+    program: &str,
+    args: &[String],
+    snapshot: Option<&EnvSnapshot>,
+    error: &std::io::Error,
+) {
+    error!(
+        %job_id,
+        program,
+        args = ?args,
+        cwd = %snapshot
+            .map(|snap| snap.cwd.display().to_string())
+            .unwrap_or_else(|| "<daemon cwd>".into()),
+        path = ?snapshot.and_then(|snap| snap.env.get("PATH").cloned()),
+        err = %error,
+        "process_mgr: spawn failed"
+    );
+}
+
+async fn spawn_single_pty_job(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
+    let segment = &segments[0];
+    let (program, args) = wrap_single_command_if_enabled(&sys, wrapper_enabled, segment);
+
+    let mut cmd = tokio::process::Command::new(&program);
+    if !args.is_empty() {
+        cmd.args(&args);
+    }
+    configure_command(&mut cmd, snapshot, cwd_override);
+
+    let pty_pair = crate::pty::open_pty().map_err(|error| {
+        error!(%job_id, err = %error, "process_mgr: open pty failed");
+    })?;
+    let master_file = std::fs::File::from(pty_pair.master);
+    let slave = pty_pair.slave;
+    if let Err(error) = set_nonblocking(master_file.as_raw_fd()) {
+        error!(%job_id, err = %error, "process_mgr: set pty nonblocking failed");
+        return Err(());
+    }
+    if let Err(error) = set_winsize(slave.as_raw_fd(), DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS) {
+        warn!(%job_id, err = %error, "process_mgr: set initial pty size failed");
+    }
+    let reader_file = master_file.try_clone().map_err(|error| {
+        error!(%job_id, err = %error, "process_mgr: clone pty reader failed");
+    })?;
+    let input_file = master_file.try_clone().map_err(|error| {
+        error!(%job_id, err = %error, "process_mgr: clone pty input failed");
+    })?;
+    let resize_file = Arc::new(master_file.try_clone().map_err(|error| {
+        error!(%job_id, err = %error, "process_mgr: clone pty resize failed");
+    })?);
+
+    let slave_fd = slave.as_raw_fd();
+    let master_fd = master_file.as_raw_fd();
+    // SAFETY: the child process is single-threaded after fork here; the closure
+    // only performs async-signal-safe libc calls on valid inherited fds.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(target_os = "macos")]
+            let tiocsctty = libc::TIOCSCTTY.into();
+            #[cfg(not(target_os = "macos"))]
+            let tiocsctty = libc::TIOCSCTTY;
+            if libc::ioctl(slave_fd, tiocsctty, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+                if libc::dup2(slave_fd, target) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            if slave_fd > libc::STDERR_FILENO {
+                libc::close(slave_fd);
+            }
+            if master_fd > libc::STDERR_FILENO {
+                libc::close(master_fd);
+            }
+            Ok(())
+        });
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| log_spawn_failure(job_id, &program, &args, snapshot, &error))?;
+    drop(slave);
+    drop(master_file);
+
+    info!(%job_id, pid = child.id().unwrap_or(0), "process_mgr: child spawned");
+
+    let log_file = open_output_log(job_id).await;
+    let input = match AsyncFd::new(input_file) {
+        Ok(file) => Arc::new(file),
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: async pty input failed");
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(());
+        }
+    };
+    let reader = match AsyncFd::new(reader_file) {
+        Ok(file) => file,
+        Err(error) => {
+            error!(%job_id, err = %error, "process_mgr: async pty reader failed");
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(());
+        }
+    };
+
+    let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
+    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+    let ring_clone = ring_buffer.clone();
+    let fg_owner = Arc::new(Mutex::new(None));
+    let fg_owner_clone = fg_owner.clone();
+    let sys_clone = sys.clone();
+    let cleanup_tx_clone = cleanup_tx.clone();
+    let reader_handle = tokio::spawn(reader_task(
+        job_id,
+        child,
+        reader,
+        log_file,
+        kill_rx,
+        sys_clone,
+        ring_clone,
+        fg_owner_clone,
+        cleanup_tx_clone,
+    ));
+
+    Ok(ProcessEntry {
+        job_id,
+        status: JobStatus::Running,
+        _reader_handle: reader_handle,
+        kill_tx,
+        ring_buffer,
+        stderr_ring: None,
+        input: Some(JobInput::Pty(input)),
+        resize: Some(resize_file),
+        fg_owner,
+    })
+}
+
+fn wrap_single_command_if_enabled(
+    sys: &ActorSystem,
+    wrapper_enabled: bool,
+    segment: &ExpandedSegment,
+) -> (String, Vec<String>) {
+    let program = segment.program.clone();
+    let args = segment.args.clone();
+    if !wrapper_enabled {
+        return (program, args);
+    }
+
+    let wrapper = &sys.config.wrapper;
+    if wrapper.binary.is_empty() || !wrapper.should_wrap(&program, false, Some(true)) {
+        return (program, args);
+    }
+
+    let mut wrapped_args = Vec::with_capacity(1 + args.len());
+    wrapped_args.push(program);
+    wrapped_args.extend(args);
+    (wrapper.binary.clone(), wrapped_args)
+}
+
+async fn spawn_native_pipeline_job(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
+    let NativePipelineSpawn {
+        children,
+        input,
+        stdout_sources,
+        stderr_sources,
+    } = spawn_native_pipeline(job_id, &segments, snapshot, cwd_override)?;
+
+    let pids: Vec<u32> = children
+        .iter()
+        .filter_map(tokio::process::Child::id)
+        .collect();
+    info!(%job_id, ?pids, "process_mgr: native pipeline spawned");
+
+    let log_file = open_output_log(job_id).await;
+    let stderr_log = open_stderr_log(job_id).await;
+    let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
+    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+    let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
+    let fg_owner = Arc::new(Mutex::new(None));
+    let reader_handle = tokio::spawn(pipeline_reader_task(
+        job_id,
+        children,
+        stdout_sources,
+        stderr_sources,
+        log_file,
+        stderr_log,
+        kill_rx,
+        sys.clone(),
+        ring_buffer.clone(),
+        stderr_ring.clone(),
+        fg_owner.clone(),
+        cleanup_tx.clone(),
+    ));
+
+    Ok(ProcessEntry {
+        job_id,
+        status: JobStatus::Running,
+        _reader_handle: reader_handle,
+        kill_tx,
+        ring_buffer,
+        stderr_ring: Some(stderr_ring),
+        input,
+        resize: None,
+        fg_owner,
+    })
+}
+
+fn spawn_native_pipeline(
+    job_id: JobId,
+    segments: &[ExpandedSegment],
+    snapshot: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+) -> Result<NativePipelineSpawn, ()> {
+    let mut children = Vec::with_capacity(segments.len());
+    let mut stdout_sources = Vec::new();
+    let mut stderr_sources = Vec::new();
+    let mut input = None;
+    let mut next_stdin = None;
+
+    for (idx, segment) in segments.iter().enumerate() {
+        let mut cmd = tokio::process::Command::new(&segment.program);
+        if !segment.args.is_empty() {
+            cmd.args(&segment.args);
+        }
+        configure_command(&mut cmd, snapshot, cwd_override);
+
+        if idx == 0 {
+            cmd.stdin(Stdio::piped());
+        } else if let Some(stdin) = next_stdin.take() {
+            cmd.stdin(Stdio::from(stdin));
+        } else {
+            error!(%job_id, segment = idx, "process_mgr: missing pipeline stdin");
+            return Err(());
+        }
+
+        match segment.pipe_to_next {
+            Some(cue_core::pipeline::PipeOp::Stdout) => {
+                let (read_end, write_end) = create_pipe().map_err(|error| {
+                    error!(%job_id, segment = idx, err = %error, "process_mgr: create stdout pipe failed");
+                })?;
+                cmd.stdout(Stdio::from(write_end));
+                cmd.stderr(Stdio::piped());
+                next_stdin = Some(read_end);
+            }
+            Some(cue_core::pipeline::PipeOp::StdoutStderr) => {
+                let (read_end, write_end) = create_pipe().map_err(|error| {
+                    error!(%job_id, segment = idx, err = %error, "process_mgr: create stdout+stderr pipe failed");
+                })?;
+                let stderr_write = write_end.try_clone().map_err(|error| {
+                    error!(%job_id, segment = idx, err = %error, "process_mgr: clone combined pipe failed");
+                })?;
+                cmd.stdout(Stdio::from(write_end));
+                cmd.stderr(Stdio::from(stderr_write));
+                next_stdin = Some(read_end);
+            }
+            Some(cue_core::pipeline::PipeOp::StderrOnly) => {
+                let (read_end, write_end) = create_pipe().map_err(|error| {
+                    error!(%job_id, segment = idx, err = %error, "process_mgr: create stderr-only pipe failed");
+                })?;
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::from(write_end));
+                next_stdin = Some(read_end);
+            }
+            None => {
+                cmd.stdout(Stdio::piped());
+                cmd.stderr(Stdio::piped());
+            }
+        }
+
+        let mut child = cmd.spawn().map_err(|error| {
+            log_spawn_failure(job_id, &segment.program, &segment.args, snapshot, &error);
+        })?;
+        if idx == 0 {
+            input = child
+                .stdin
+                .take()
+                .map(|stdin| JobInput::Pipe(Arc::new(tokio::sync::Mutex::new(stdin))));
+        }
+        if let Some(stdout) = child.stdout.take() {
+            stdout_sources.push(stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            stderr_sources.push(stderr);
+        }
+        children.push(child);
+    }
+
+    Ok(NativePipelineSpawn {
+        children,
+        input,
+        stdout_sources,
+        stderr_sources,
+    })
+}
+
+fn create_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` initializes two owned fds on success.
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the returned fds are fresh and uniquely owned here.
+    Ok(unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    })
+}
+
 /// Open (or create) the append-only log file for a job's output.
 ///
 /// FIX 5: runs on the blocking thread-pool so the tokio runtime thread is
 /// never stalled by filesystem syscalls.
-async fn open_log_file(job_id: JobId) -> Option<std::fs::File> {
+async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
     tokio::task::spawn_blocking(move || {
         let dir = crate::dirs::output_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -777,18 +878,44 @@ async fn open_log_file(job_id: JobId) -> Option<std::fs::File> {
     .unwrap_or(None)
 }
 
-async fn clear_output_log(job_id: JobId) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let path = crate::dirs::output_dir().join(format!("{job_id}.log"));
-        if let Err(error) = std::fs::remove_file(&path)
-            && error.kind() != std::io::ErrorKind::NotFound
+async fn open_stderr_log(job_id: JobId) -> Option<std::fs::File> {
+    tokio::task::spawn_blocking(move || {
+        let dir = crate::dirs::output_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            error!(%job_id, err = %e, "process_mgr: cannot create output dir");
+            return None;
+        }
+        let path = dir.join(format!("{job_id}.stderr"));
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
         {
-            warn!(
-                %job_id,
-                path = %path.display(),
-                err = %error,
-                "process_mgr: failed to remove stale output log"
-            );
+            Ok(f) => Some(f),
+            Err(e) => {
+                error!(%job_id, path = %path.display(), err = %e, "process_mgr: open stderr log");
+                None
+            }
+        }
+    })
+    .await
+    .unwrap_or(None)
+}
+
+async fn clear_job_logs(job_id: JobId) {
+    let _ = tokio::task::spawn_blocking(move || {
+        for suffix in [".log", ".stderr"] {
+            let path = crate::dirs::output_dir().join(format!("{job_id}{suffix}"));
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    %job_id,
+                    path = %path.display(),
+                    err = %error,
+                    "process_mgr: failed to remove stale output log"
+                );
+            }
         }
     })
     .await;
@@ -939,6 +1066,184 @@ async fn reader_task(
 
     // FIX 2: tell the main loop to remove our entry.
     let _ = cleanup_tx.send(job_id).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pipeline_reader_task(
+    job_id: JobId,
+    mut children: Vec<tokio::process::Child>,
+    stdout_sources: Vec<tokio::process::ChildStdout>,
+    stderr_sources: Vec<tokio::process::ChildStderr>,
+    log_file: Option<std::fs::File>,
+    stderr_log: Option<std::fs::File>,
+    mut kill_rx: mpsc::Receiver<()>,
+    sys: ActorSystem,
+    ring: Arc<Mutex<RingBuffer>>,
+    stderr_ring: Arc<Mutex<RingBuffer>>,
+    fg_owner: Arc<Mutex<Option<u64>>>,
+    cleanup_tx: mpsc::Sender<JobId>,
+) {
+    let log_file = Arc::new(Mutex::new(log_file));
+    let stderr_log = Arc::new(Mutex::new(stderr_log));
+    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let mut active_readers = 0usize;
+
+    for stdout in stdout_sources {
+        active_readers += 1;
+        spawn_pipeline_stream_reader(stdout, PipelineStreamKind::Stdout, chunk_tx.clone());
+    }
+    for stderr in stderr_sources {
+        active_readers += 1;
+        spawn_pipeline_stream_reader(stderr, PipelineStreamKind::Stderr, chunk_tx.clone());
+    }
+    drop(chunk_tx);
+
+    let mut was_killed = false;
+    while active_readers > 0 {
+        tokio::select! {
+            _ = kill_rx.recv(), if !was_killed => {
+                was_killed = true;
+                info!(%job_id, "process_mgr: killing native pipeline");
+                terminate_children(&mut children).await;
+            }
+            Some(msg) = chunk_rx.recv() => {
+                match msg {
+                    PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stdout, data } => {
+                        ring.lock().unwrap().push(&data);
+                        write_log(&log_file, &data).await;
+                        emit_output(&sys, job_id, OutputStream::Stdout, &data).await;
+                    }
+                    PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stderr, data } => {
+                        stderr_ring.lock().unwrap().push(&data);
+                        write_log(&stderr_log, &data).await;
+                        emit_output(&sys, job_id, OutputStream::Stderr, &data).await;
+                    }
+                    PipelineReaderMsg::Closed => {
+                        active_readers = active_readers.saturating_sub(1);
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+
+    let exit_code = if was_killed {
+        wait_for_children(&mut children).await
+    } else {
+        tokio::select! {
+            _ = kill_rx.recv() => {
+                was_killed = true;
+                terminate_children(&mut children).await;
+                wait_for_children(&mut children).await
+            }
+            code = wait_for_children(&mut children) => code,
+        }
+    };
+
+    let stdout_len = ring.lock().unwrap().len();
+    let stderr_len = stderr_ring.lock().unwrap().len();
+    info!(%job_id, exit_code, stdout_bytes = stdout_len, stderr_bytes = stderr_len, "process_mgr: native pipeline exited");
+
+    let _ = sys
+        .event_bus
+        .send(EventBusMsg::Publish {
+            payload: EventPayload::OutputEof {
+                id: job_id.to_string(),
+            },
+            channel: format!("output:{job_id}"),
+        })
+        .await;
+
+    if was_killed {
+        emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+        emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
+        let _ = sys
+            .scheduler
+            .send(SchedulerMsg::JobFinished {
+                job_id,
+                exit_code: -1,
+            })
+            .await;
+    } else {
+        let new_state = if exit_code == 0 {
+            JobStatus::Done
+        } else {
+            JobStatus::Failed
+        };
+        emit_state_change(&sys, job_id, JobStatus::Running, new_state).await;
+        let reason = if exit_code == 0 {
+            "done".to_string()
+        } else {
+            format!("exit {exit_code}")
+        };
+        emit_fg_exit(&sys, &fg_owner, job_id, &reason).await;
+        let _ = sys
+            .scheduler
+            .send(SchedulerMsg::JobFinished { job_id, exit_code })
+            .await;
+    }
+
+    let _ = cleanup_tx.send(job_id).await;
+}
+
+fn spawn_pipeline_stream_reader<R>(
+    mut reader: R,
+    kind: PipelineStreamKind,
+    tx: mpsc::UnboundedSender<PipelineReaderMsg>,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx
+                        .send(PipelineReaderMsg::Chunk {
+                            kind,
+                            data: buf[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    debug!(err = %error, "process_mgr: pipeline stream read error");
+                    break;
+                }
+            }
+        }
+        let _ = tx.send(PipelineReaderMsg::Closed);
+    });
+}
+
+async fn terminate_children(children: &mut [tokio::process::Child]) {
+    for child in children.iter_mut() {
+        let _ = child.start_kill();
+    }
+}
+
+async fn wait_for_children(children: &mut [tokio::process::Child]) -> i32 {
+    let mut exit_code = -1;
+    let last_idx = children.len().saturating_sub(1);
+    for (idx, child) in children.iter_mut().enumerate() {
+        match child.wait().await {
+            Ok(status) => {
+                if idx == last_idx {
+                    exit_code = status.code().unwrap_or(-1);
+                }
+            }
+            Err(error) => {
+                error!(err = %error, "process_mgr: child wait failed");
+                if idx == last_idx {
+                    exit_code = -1;
+                }
+            }
+        }
+    }
+    exit_code
 }
 
 /// Emit a `JobStateChanged` event.
@@ -1095,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_segment_pipeline_quotes_shell_arguments() {
+    fn multi_segment_pipeline_expands_each_segment_independently() {
         let pipeline = cue_core::pipeline::Pipeline {
             segments: vec![
                 cue_core::pipeline::PipeSegment {
@@ -1109,18 +1414,18 @@ mod tests {
             ],
         };
 
-        let (program, args) = pipeline_to_command(&pipeline);
+        let segments = expand_pipeline_segments(JobId(7), &pipeline, Some(&snapshot()))
+            .expect("expanded segments");
 
-        assert_eq!(program, "sh");
-        assert_eq!(args[0], "-c");
-        assert_eq!(
-            args[1],
-            "{ printf %s 'hello world' | grep 'hello world'; } 3>&1"
-        );
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].program, "printf");
+        assert_eq!(segments[0].args, vec!["%s", "hello world"]);
+        assert_eq!(segments[1].program, "grep");
+        assert_eq!(segments[1].args, vec!["hello world"]);
     }
 
     #[test]
-    fn stderr_only_pipeline_keeps_stdout_out_of_pipe() {
+    fn stderr_only_pipeline_keeps_metacharacters_as_data() {
         let pipeline = cue_core::pipeline::Pipeline {
             segments: vec![
                 cue_core::pipeline::PipeSegment {
@@ -1134,11 +1439,13 @@ mod tests {
             ],
         };
 
-        let (_, args) = pipeline_to_command(&pipeline);
+        let segments = expand_pipeline_segments(JobId(9), &pipeline, Some(&snapshot()))
+            .expect("expanded segments");
 
-        assert_eq!(
-            args[1],
-            "{ producer 'semi;colon' 2>&1 1>&3 3>&- | consumer; } 3>&1"
-        );
+        assert_eq!(segments[0].args, vec!["semi;colon"]);
+        assert!(matches!(
+            segments[0].pipe_to_next,
+            Some(cue_core::pipeline::PipeOp::StderrOnly)
+        ));
     }
 }

@@ -12,15 +12,18 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use cue_core::cron::{CronPreset, CronSchedule, CronStatus, DayFilter, Weekday};
+use cue_core::cron::{
+    CronPreset, CronSchedule, CronStatus, DayFilter, Weekday, parse_day_filter, parse_time_of_day,
+};
 use cue_core::ipc::{
     ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload,
-    ResponsePayload, error_code,
+    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptSubmitError, error_code,
 };
 use cue_core::job::{CancelReason, JobStatus};
+use cue_core::mode::Mode;
 use cue_core::pipeline::{ChainNode, ParallelOp, SerialOp};
 use cue_core::scope::EnvSnapshot;
-use cue_core::{ChainId, CronId, JobId, ScopeHash};
+use cue_core::{ChainId, CronId, JobId, ScopeHash, ScriptId};
 
 use crate::config::Config;
 use crate::parser::parse::Parser as CueParser;
@@ -58,13 +61,15 @@ impl LeafStatus {
 
 /// Tracks a running chain's execution state.
 struct ChainState {
-    #[allow(dead_code)]
-    chain_id: ChainId,
-    #[allow(dead_code)]
-    client_id: u64,
-    #[allow(dead_code)]
-    request_id: u32,
     node: ChainNode,
+    /// Reserved for auto-retry: maximum retry attempts (0 = no retry).
+    #[allow(dead_code)]
+    retry_max: u32,
+    /// Reserved for auto-retry: delay between retry attempts.
+    retry_delay: Option<std::time::Duration>,
+    /// Reserved for auto-retry: attempts made so far.
+    #[allow(dead_code)]
+    retry_attempts: u32,
     /// Maps each leaf index (0-based, left-to-right DFS) to its `JobId`.
     leaf_jobs: HashMap<usize, JobId>,
     /// Maps each leaf index to its current status.
@@ -109,13 +114,9 @@ struct JobEntry {
     start_scope: Option<ScopeHash>,
     end_scope: Option<ScopeHash>,
     open_hint: JobOpenHint,
-    #[allow(dead_code)]
     chain_id: Option<ChainId>,
     chain_index: Option<usize>,
     chain_total: Option<usize>,
-    /// Captured stderr text (empty for PTY-mode jobs where streams are merged).
-    #[allow(dead_code)]
-    stderr: String,
 }
 
 // ── Cron entry ──────────────────────────────────────────────────────────────
@@ -145,6 +146,7 @@ struct SchedulerState {
     next_job: u32,
     next_cron: u32,
     next_chain: u32,
+    next_script: u32,
 
     /// Active chains keyed by `ChainId`.
     chains: HashMap<ChainId, ChainState>,
@@ -166,6 +168,7 @@ impl SchedulerState {
             next_job: 1,
             next_cron: 1,
             next_chain: 1,
+            next_script: 1,
             chains: HashMap::new(),
             job_to_chain: HashMap::new(),
             jobs: HashMap::new(),
@@ -197,6 +200,12 @@ impl SchedulerState {
     fn wrapper_enabled(&self, config: &Config) -> bool {
         self.wrapper_enabled.unwrap_or(config.wrapper.enabled)
     }
+
+    fn alloc_script(&mut self) -> ScriptId {
+        let id = ScriptId(self.next_script);
+        self.next_script += 1;
+        id
+    }
 }
 
 // ── Spawn the actor ─────────────────────────────────────────────────────────
@@ -209,6 +218,8 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
         let mut state = SchedulerState::new();
         restore_jobs(&db, &mut state).await;
         restore_crons(&db, &mut state).await;
+        restore_script_counter(&db, &mut state).await;
+        prune_retained_job_history(&mut state, &db, &config, &sys).await;
         debug!("scheduler: started");
 
         loop {
@@ -347,6 +358,7 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                             break;
                         }
                     }
+                    prune_retained_job_history(&mut state, &db, &config, &sys).await;
                 }
 
                 () = &mut sleep => {
@@ -389,7 +401,6 @@ async fn restore_jobs(db: &storage::SharedConnection, state: &mut SchedulerState
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
-                stderr: job.stderr,
             },
         );
     }
@@ -451,6 +462,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 command: cron.command.clone(),
                 status,
                 scope_hash: cron.scope_hash,
+                cwd_override: cron.cwd_override.clone(),
                 age_secs: cron.age_secs,
             };
             if let Err(e) =
@@ -479,7 +491,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 scope_hash,
                 status,
                 next_trigger,
-                cwd_override: None,
+                cwd_override: cron.cwd_override,
             },
         );
     }
@@ -491,6 +503,61 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
             next_cron = state.next_cron,
             "scheduler: restored crons"
         );
+    }
+}
+
+async fn restore_script_counter(db: &storage::SharedConnection, state: &mut SchedulerState) {
+    match storage::with_connection(db, storage::max_script_run_id).await {
+        Ok(Some(max_id)) => {
+            state.next_script = max_id + 1;
+        }
+        Ok(None) => {}
+        Err(error) => warn!("scheduler: failed to restore script counter: {error}"),
+    }
+}
+
+async fn prune_retained_job_history(
+    state: &mut SchedulerState,
+    db: &storage::SharedConnection,
+    config: &Config,
+    sys: &ActorSystem,
+) {
+    let keep = config.retention.max_job_history;
+    let removed = match storage::with_connection(db, move |conn| {
+        storage::prune_job_history(conn, keep)
+    })
+    .await
+    {
+        Ok(removed) => removed,
+        Err(error) => {
+            warn!("scheduler: failed to prune job history: {error}");
+            return;
+        }
+    };
+
+    for id in removed {
+        if let Some(job_id) = parse_job_id(&id) {
+            state.jobs.remove(&job_id);
+            let _ = sys
+                .gateway
+                .send(GatewayMsg::PushEvent {
+                    payload: EventPayload::JobRemoved {
+                        job_id: job_id.to_string(),
+                    },
+                    channel: "jobs".to_string(),
+                })
+                .await;
+            remove_job_logs(job_id).await;
+        }
+    }
+}
+
+async fn prune_retained_script_runs(db: &storage::SharedConnection, config: &Config) {
+    let keep = config.retention.max_script_runs;
+    if let Err(error) =
+        storage::with_connection(db, move |conn| storage::prune_script_runs(conn, keep)).await
+    {
+        warn!("scheduler: failed to prune script runs: {error}");
     }
 }
 
@@ -530,6 +597,7 @@ fn persist_cron_entry(db: &storage::SharedConnection, entry: &CronEntry) {
             command: chain_to_text(&entry.chain),
             status: entry.status,
             scope_hash: Some(entry.scope_hash),
+            cwd_override: entry.cwd_override.clone(),
             age_secs: 0,
         },
     );
@@ -934,7 +1002,6 @@ fn next_trigger_instant(schedule: &CronSchedule, age_secs: i64) -> Option<Instan
         CronSchedule::Crontab(expr) => {
             instant_from_local(next_crontab_occurrence(Local::now(), expr)?)
         }
-        CronSchedule::FreeForm(_) => None,
     }
 }
 
@@ -1029,130 +1096,6 @@ fn parse_duration(s: &str) -> Option<std::time::Duration> {
         _ => return None,
     };
     Some(std::time::Duration::from_secs(secs))
-}
-
-fn parse_time_of_day(input: &str) -> Option<u32> {
-    let normalized = input.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "midnight" => return Some(0),
-        "noon" => return Some(12 * 3600),
-        _ => {}
-    }
-
-    let (core, meridiem) = if let Some(stripped) = normalized.strip_suffix("am") {
-        (stripped, Some("am"))
-    } else if let Some(stripped) = normalized.strip_suffix("pm") {
-        (stripped, Some("pm"))
-    } else {
-        (normalized.as_str(), None)
-    };
-
-    let (mut hour, minute) = if let Some((hour, minute)) = core.split_once(':') {
-        (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?)
-    } else {
-        (core.parse::<u32>().ok()?, 0)
-    };
-    if minute >= 60 {
-        return None;
-    }
-
-    match meridiem {
-        Some("am") => {
-            if hour == 12 {
-                hour = 0;
-            } else if hour > 11 {
-                return None;
-            }
-        }
-        Some("pm") => {
-            if hour < 12 {
-                hour += 12;
-            } else if hour > 12 {
-                return None;
-            }
-        }
-        None if hour > 23 => return None,
-        None => {}
-        _ => return None,
-    }
-
-    Some(hour * 3600 + minute * 60)
-}
-
-fn parse_day_filter(input: &str) -> Option<DayFilter> {
-    let normalized = input.trim().to_ascii_lowercase();
-    let days = match normalized.as_str() {
-        "daily" => vec![
-            Weekday::Mon,
-            Weekday::Tue,
-            Weekday::Wed,
-            Weekday::Thu,
-            Weekday::Fri,
-            Weekday::Sat,
-            Weekday::Sun,
-        ],
-        "weekdays" => vec![
-            Weekday::Mon,
-            Weekday::Tue,
-            Weekday::Wed,
-            Weekday::Thu,
-            Weekday::Fri,
-        ],
-        "weekends" => vec![Weekday::Sat, Weekday::Sun],
-        _ => {
-            let mut out = Vec::new();
-            for part in normalized.split(',') {
-                if let Some((start, end)) = part.split_once('-') {
-                    let start = parse_weekday_name(start)?;
-                    let end = parse_weekday_name(end)?;
-                    out.extend(expand_weekday_range(start, end));
-                } else {
-                    out.push(parse_weekday_name(part)?);
-                }
-            }
-            out
-        }
-    };
-    Some(DayFilter { days })
-}
-
-fn parse_weekday_name(input: &str) -> Option<Weekday> {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "mon" | "monday" => Some(Weekday::Mon),
-        "tue" | "tues" | "tuesday" => Some(Weekday::Tue),
-        "wed" | "wednesday" => Some(Weekday::Wed),
-        "thu" | "thur" | "thurs" | "thursday" => Some(Weekday::Thu),
-        "fri" | "friday" => Some(Weekday::Fri),
-        "sat" | "saturday" => Some(Weekday::Sat),
-        "sun" | "sunday" => Some(Weekday::Sun),
-        _ => None,
-    }
-}
-
-fn expand_weekday_range(start: Weekday, end: Weekday) -> Vec<Weekday> {
-    let ordered = [
-        Weekday::Mon,
-        Weekday::Tue,
-        Weekday::Wed,
-        Weekday::Thu,
-        Weekday::Fri,
-        Weekday::Sat,
-        Weekday::Sun,
-    ];
-    let start_idx = ordered.iter().position(|day| *day == start).unwrap_or(0);
-    let end_idx = ordered
-        .iter()
-        .position(|day| *day == end)
-        .unwrap_or(start_idx);
-    if start_idx <= end_idx {
-        ordered[start_idx..=end_idx].to_vec()
-    } else {
-        ordered[start_idx..]
-            .iter()
-            .chain(ordered[..=end_idx].iter())
-            .copied()
-            .collect()
-    }
 }
 
 fn chrono_weekday_to_core(day: chrono::Weekday) -> Weekday {
@@ -1646,7 +1589,11 @@ async fn apply_scope_transform(
     derive_scope(sys, start_scope, delta).await
 }
 
-fn classify_job_open_hint(command_line: &[String]) -> JobOpenHint {
+fn classify_job_open_hint(pipeline: &cue_core::pipeline::Pipeline) -> JobOpenHint {
+    if pipeline.segments.len() != 1 {
+        return JobOpenHint::Stream;
+    }
+    let command_line = &pipeline.segments[0].command;
     let Some(command_word) = command_line.first() else {
         return JobOpenHint::Stream;
     };
@@ -1883,6 +1830,8 @@ async fn fire_due_crons(
             0,
             cwd_override,
             wrapper_enabled,
+            0,
+            None,
             state,
             db,
             sys,
@@ -1924,15 +1873,30 @@ async fn fire_due_crons(
 
 // ── Spawn chain / single job ────────────────────────────────────────────────
 
+/// Check whether any pipeline in the chain contains blocked command patterns.
+fn check_chain_blocked(chain: &ChainNode, config: &Config) -> Option<String> {
+    let leaves = flatten_leaves(chain);
+    for leaf in &leaves {
+        for segment in &leaf.pipeline.segments {
+            if let Some(reason) = config.block.check(&segment.command) {
+                return Some(reason);
+            }
+        }
+    }
+    None
+}
+
 /// Spawn a chain (or a single job) from a `ChainNode`, returning the response payload.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_chain(
     chain: ChainNode,
     scope_hash: ScopeHash,
-    client_id: u64,
-    request_id: u32,
+    _client_id: u64,
+    _request_id: u32,
     cwd_override: Option<std::path::PathBuf>,
     wrapper_enabled: bool,
+    retry_max: u32,
+    retry_delay: Option<std::time::Duration>,
     state: &mut SchedulerState,
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
@@ -1946,7 +1910,7 @@ async fn spawn_chain(
     if leaves.len() == 1 {
         let leaf = &leaves[0];
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(leaf.command());
+        let open_hint = classify_job_open_hint(&leaf.pipeline);
 
         state.jobs.insert(
             jid,
@@ -1961,7 +1925,6 @@ async fn spawn_chain(
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
-                stderr: String::new(),
             },
         );
 
@@ -2055,10 +2018,10 @@ async fn spawn_chain(
     }
 
     let chain_state = ChainState {
-        chain_id,
-        client_id,
-        request_id,
         node: chain,
+        retry_max,
+        retry_delay,
+        retry_attempts: 0,
         leaf_jobs: HashMap::new(),
         leaf_status,
         scope_hash,
@@ -2167,7 +2130,7 @@ async fn process_chain_advance(
 
     while let Some((idx, start_scope)) = queue.pop_front() {
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(leaves[idx].command());
+        let open_hint = classify_job_open_hint(&leaves[idx].pipeline);
         if captured.len() < capture_first {
             captured.push(jid);
         }
@@ -2193,7 +2156,6 @@ async fn process_chain_advance(
                 chain_id: Some(chain_id),
                 chain_index: Some(idx),
                 chain_total: Some(leaves.len()),
-                stderr: String::new(),
             },
         );
 
@@ -2357,14 +2319,65 @@ async fn handle_command(
     sys: &ActorSystem,
 ) -> ResponsePayload {
     match cmd {
+        ResolvedCommand::Script { mode, items } => {
+            let script_id = state.alloc_script();
+            let total_items = items.len();
+            let mut created_items = Vec::with_capacity(total_items);
+            let mut submit_error = None;
+
+            for (index, item) in items.into_iter().enumerate() {
+                let source = item.source;
+                let response = Box::pin(handle_command(
+                    *item.command,
+                    client_id,
+                    state,
+                    db,
+                    config,
+                    sys,
+                ))
+                .await;
+                match response {
+                    ResponsePayload::Ok(payload) => {
+                        created_items.push(ScriptItemInfo {
+                            index,
+                            source,
+                            result: script_item_result_from_ok(&payload),
+                        });
+                    }
+                    ResponsePayload::Err { code, message } => {
+                        submit_error = Some(ScriptSubmitError {
+                            index,
+                            source,
+                            code,
+                            message,
+                        });
+                        break;
+                    }
+                }
+            }
+
+            persist_script_submission(script_id, mode, &created_items, submit_error.as_ref(), db);
+            prune_retained_script_runs(db, config).await;
+
+            ResponsePayload::Ok(OkPayload::ScriptCreated {
+                script_id: script_id.to_string(),
+                items: created_items,
+                submit_error,
+            })
+        }
         ResolvedCommand::Run { chain, params } => {
-            // Get current HEAD scope hash.
             let scope_hash = match get_head_scope(sys).await {
                 Ok(h) => h,
                 Err(resp) => return resp,
             };
+            // Check block rules before executing.
+            if let Some(reason) = check_chain_blocked(&chain, config) {
+                return ResponsePayload::err(error_code::BLOCKED, reason);
+            }
             let cwd_override = params.cwd();
             let wrapper_enabled = state.wrapper_enabled(config);
+            let retry_max = params.retry().unwrap_or(0);
+            let retry_delay = params.retry_delay();
             spawn_chain(
                 chain,
                 scope_hash,
@@ -2372,6 +2385,8 @@ async fn handle_command(
                 0,
                 cwd_override,
                 wrapper_enabled,
+                retry_max,
+                retry_delay,
                 state,
                 db,
                 sys,
@@ -2380,17 +2395,11 @@ async fn handle_command(
         }
 
         ResolvedCommand::Cron {
-            schedule_text,
+            schedule,
             chain,
             params,
         } => {
-            let Some(schedule) = parse_schedule(&schedule_text) else {
-                return ResponsePayload::err(
-                    error_code::INVALID_SYNTAX,
-                    format!("cannot parse schedule: {schedule_text}"),
-                );
-            };
-
+            let display_text = schedule.display();
             let scope_hash = match get_head_scope(sys).await {
                 Ok(h) => h,
                 Err(resp) => return resp,
@@ -2400,12 +2409,14 @@ async fn handle_command(
             let Some(next_trigger) = next_trigger_instant(&schedule, 0) else {
                 return ResponsePayload::err(
                     error_code::INVALID_SYNTAX,
-                    format!("cannot compute next trigger for schedule: {schedule_text}"),
+                    format!("cannot compute next trigger for schedule: {display_text}"),
                 );
             };
+            info!(%cron_id, %display_text, "scheduler: cron added");
+
             let entry = CronEntry {
                 cron_id,
-                schedule_text: schedule_text.clone(),
+                schedule_text: display_text,
                 schedule,
                 chain,
                 scope_hash,
@@ -2416,7 +2427,6 @@ async fn handle_command(
             persist_cron_entry(db, &entry);
             state.crons.insert(cron_id, entry);
 
-            info!(%cron_id, %schedule_text, "scheduler: cron added");
             ResponsePayload::Ok(OkPayload::CronAdded {
                 cron_id: cron_id.to_string(),
             })
@@ -2903,7 +2913,7 @@ async fn handle_command(
                     error_code::INVALID_STATE,
                     format!("job {job_id} is not terminal"),
                 );
-            }
+            };
             let Some(start_scope) = entry.start_scope else {
                 return ResponsePayload::err(
                     error_code::INVALID_SCOPE,
@@ -2919,6 +2929,16 @@ async fn handle_command(
                     );
                 }
             };
+            // Apply retry backoff: if the job has a chain with retry config, use it;
+            // otherwise apply a short default delay.
+            let delay = state
+                .chains
+                .values()
+                .find(|c| c.leaf_jobs.values().any(|jid| *jid == job_id))
+                .and_then(|c| c.retry_delay)
+                .unwrap_or(std::time::Duration::from_millis(500));
+            info!(%job_id, ?delay, "scheduler: retrying job with delay");
+            tokio::time::sleep(delay).await;
             let wrapper_enabled = state.wrapper_enabled(config);
             spawn_chain(
                 chain,
@@ -2927,6 +2947,8 @@ async fn handle_command(
                 0,
                 None,
                 wrapper_enabled,
+                0,
+                None,
                 state,
                 db,
                 sys,
@@ -2970,6 +2992,116 @@ async fn handle_command(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+fn script_item_result_from_ok(payload: &OkPayload) -> ScriptItemResult {
+    match payload {
+        OkPayload::JobCreated {
+            job_id,
+            start_scope,
+            open_hint,
+            ..
+        } => ScriptItemResult::Job {
+            job_id: job_id.clone(),
+            start_scope: start_scope.clone(),
+            open_hint: *open_hint,
+        },
+        OkPayload::ChainCreated {
+            chain_id,
+            job_ids,
+            chain,
+        } => ScriptItemResult::Chain {
+            chain_id: chain_id.clone(),
+            job_ids: job_ids.clone(),
+            chain: chain.clone(),
+        },
+        OkPayload::CronAdded { cron_id } => ScriptItemResult::Cron {
+            cron_id: cron_id.clone(),
+        },
+        OkPayload::EvalText { text } => ScriptItemResult::Message { text: text.clone() },
+        OkPayload::Ack {} => ScriptItemResult::Message { text: "ok".into() },
+        OkPayload::ScopeCreated { hash, summary, .. } => ScriptItemResult::Message {
+            text: format!("{hash}\n{summary}"),
+        },
+        OkPayload::Output { id, truncated, .. } => ScriptItemResult::Message {
+            text: if *truncated {
+                format!("opened output snapshot for {id} (truncated)")
+            } else {
+                format!("opened output snapshot for {id}")
+            },
+        },
+        other => ScriptItemResult::Message {
+            text: format!("{other:?}"),
+        },
+    }
+}
+
+fn persist_script_submission(
+    script_id: ScriptId,
+    mode: Mode,
+    items: &[ScriptItemInfo],
+    submit_error: Option<&ScriptSubmitError>,
+    db: &storage::SharedConnection,
+) {
+    let db = Arc::clone(db);
+    let run = storage::StoredScriptRun {
+        id: script_id.to_string(),
+        mode: match mode {
+            Mode::Job => "job".into(),
+            Mode::Cron => "cron".into(),
+        },
+        input: items
+            .iter()
+            .map(|item| item.source.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        status: if submit_error.is_some() {
+            "partial_error".into()
+        } else {
+            "submitted".into()
+        },
+        item_count: items.len(),
+        error_code: submit_error.map(|error| error.code.clone()),
+        error_message: submit_error.map(|error| error.message.clone()),
+    };
+    let stored_items = items
+        .iter()
+        .map(|item| storage::StoredScriptItem {
+            script_id: script_id.to_string(),
+            item_index: item.index,
+            source_text: item.source.clone(),
+            kind: match &item.result {
+                ScriptItemResult::Job { .. } => "job".into(),
+                ScriptItemResult::Chain { .. } => "chain".into(),
+                ScriptItemResult::Cron { .. } => "cron".into(),
+                ScriptItemResult::Message { .. } => "message".into(),
+            },
+            target_id: match &item.result {
+                ScriptItemResult::Job { job_id, .. } => Some(job_id.clone()),
+                ScriptItemResult::Chain { chain_id, .. } => Some(chain_id.clone()),
+                ScriptItemResult::Cron { cron_id } => Some(cron_id.clone()),
+                ScriptItemResult::Message { .. } => None,
+            },
+            chain_id: match &item.result {
+                ScriptItemResult::Chain { chain_id, .. } => Some(chain_id.clone()),
+                _ => None,
+            },
+            job_ids: match &item.result {
+                ScriptItemResult::Job { job_id, .. } => vec![job_id.clone()],
+                ScriptItemResult::Chain { job_ids, .. } => job_ids.clone(),
+                _ => Vec::new(),
+            },
+        })
+        .collect::<Vec<_>>();
+    tokio::spawn(async move {
+        if let Err(error) = storage::with_connection(&db, move |conn| {
+            storage::upsert_script_run(conn, &run, &stored_items)
+        })
+        .await
+        {
+            warn!(script = %script_id, "scheduler: failed to persist script submission: {error}");
+        }
+    });
+}
+
 /// Get the HEAD scope hash from the scope store.
 async fn get_head_scope(sys: &ActorSystem) -> Result<ScopeHash, ResponsePayload> {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2995,6 +3127,20 @@ fn parse_cron_id(s: &str) -> Option<CronId> {
     s.strip_prefix('C')
         .and_then(|n| n.parse::<u32>().ok())
         .map(CronId)
+}
+
+async fn remove_job_logs(job_id: JobId) {
+    let _ = tokio::task::spawn_blocking(move || {
+        for suffix in [".log", ".stderr"] {
+            let path = crate::dirs::output_dir().join(format!("{job_id}{suffix}"));
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(%job_id, path = %path.display(), "scheduler: failed to remove output log: {error}");
+            }
+        }
+    })
+    .await;
 }
 
 enum EnvCommand {
@@ -3434,9 +3580,7 @@ async fn read_stderr_from_log(
         std::fs::read(path)
     })
     .await;
-    if let Ok(Ok(data)) = stderr_data
-        && !data.is_empty()
-    {
+    if let Ok(Ok(data)) = stderr_data {
         let truncated = data.len() > tail_bytes;
         let trimmed = if truncated {
             &data[data.len() - tail_bytes..]
@@ -3622,6 +3766,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -3664,6 +3810,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -3704,6 +3852,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -3740,6 +3890,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -3776,6 +3928,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -3794,7 +3948,7 @@ mod tests {
         let config = Config::default();
         let mut state = SchedulerState::new();
         let cmd = ResolvedCommand::Cron {
-            schedule_text: "every 5m".into(),
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
             chain: leaf("backup.sh"),
             params: cue_core::command::ModeParams::new(),
         };
@@ -3826,7 +3980,7 @@ mod tests {
         let config = Config::default();
         let mut state = SchedulerState::new();
         let cmd = ResolvedCommand::Cron {
-            schedule_text: "every 1h".into(),
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(3600)),
             chain: leaf("check.sh"),
             params: cue_core::command::ModeParams::new(),
         };
@@ -3876,6 +4030,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -3955,6 +4111,7 @@ mod tests {
                 command: "echo hello".into(),
                 status: CronStatus::Scheduled,
                 scope_hash: Some(ScopeHash([5; 32])),
+                cwd_override: Some(std::path::PathBuf::from("/tmp/cue-cron-cwd")),
                 age_secs: 0,
             },
         )
@@ -3967,8 +4124,12 @@ mod tests {
 
         assert_eq!(state.next_cron, 5);
         assert!(state.crons.contains_key(&CronId(4)));
-        assert_eq!(state.crons[&CronId(4)].schedule_text, "every 5m");
+        // schedule_text field replaced by schedule: CronSchedule
         assert_eq!(state.crons[&CronId(4)].status, CronStatus::Scheduled);
+        assert_eq!(
+            state.crons[&CronId(4)].cwd_override.as_deref(),
+            Some(std::path::Path::new("/tmp/cue-cron-cwd"))
+        );
     }
 
     #[test]
@@ -3983,6 +4144,7 @@ mod tests {
                 command: "echo late".into(),
                 status: CronStatus::Scheduled,
                 scope_hash: Some(ScopeHash([8; 32])),
+                cwd_override: None,
                 age_secs: 0,
             },
         )
@@ -4023,6 +4185,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -4059,6 +4223,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -4092,6 +4258,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -4144,6 +4312,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -4316,6 +4486,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -4381,6 +4553,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -4430,6 +4604,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,
@@ -4483,6 +4659,8 @@ mod tests {
             1,
             None,
             false,
+            0,
+            None,
             &mut state,
             &conn,
             &sys,

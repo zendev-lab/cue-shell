@@ -40,7 +40,15 @@ impl ModeParams {
     /// Get retry count, if specified.
     pub fn retry(&self) -> Option<u32> {
         match self.get("retry") {
-            Some(ParamValue::Int(n)) => Some(*n as u32),
+            Some(ParamValue::Int(n)) => u32::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+
+    /// Get retry delay, if specified.
+    pub fn retry_delay(&self) -> Option<Duration> {
+        match self.get("retry_delay") {
+            Some(ParamValue::Duration(d)) => Some(*d),
             _ => None,
         }
     }
@@ -68,5 +76,20 @@ impl ModeParams {
             Some(ParamValue::Bool(b)) => Some(*b),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_param_is_natural_number() {
+        let mut params = ModeParams::new();
+        params.insert("retry", ParamValue::Int(3));
+        assert_eq!(params.retry(), Some(3));
+
+        params.insert("retry", ParamValue::Int(-1));
+        assert_eq!(params.retry(), None);
     }
 }

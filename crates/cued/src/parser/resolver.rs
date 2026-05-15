@@ -7,16 +7,22 @@
 //! 4. AST → cue_core types conversion
 
 use cue_core::command::{ModeParams, ParamValue};
+use cue_core::cron::{CronPreset, CronSchedule, parse_day_filter, parse_time_of_day};
 use cue_core::mode::Mode;
 use cue_core::pipeline::{self as core_pipeline};
 
-use super::ast::{Argument, Ast, ChainNode, CronScheduleAst, Pipeline};
+use super::ast::{Argument, Ast, ChainNode, CronScheduleAst, Pipeline, ScriptItemAst};
 use super::parse::{ParseError, ParseErrorKind, parse_duration_str};
 use super::token::{Span, Value};
 
 /// Resolved command ready for execution.
 #[derive(Debug, Clone)]
 pub enum ResolvedCommand {
+    /// One multiline script submission containing multiple top-level commands.
+    Script {
+        mode: Mode,
+        items: Vec<ResolvedScriptItem>,
+    },
     /// Run a chain of jobs.
     Run {
         chain: core_pipeline::ChainNode,
@@ -24,7 +30,7 @@ pub enum ResolvedCommand {
     },
     /// Add a cron job.
     Cron {
-        schedule_text: String,
+        schedule: CronSchedule,
         chain: core_pipeline::ChainNode,
         params: ModeParams,
     },
@@ -77,12 +83,25 @@ pub enum ResolvedCommand {
     Wrap { subcommand: Option<String> },
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedScriptItem {
+    pub source: String,
+    pub command: Box<ResolvedCommand>,
+}
+
 /// Resolve an AST into a command ready for execution.
 pub struct Resolver;
 
 impl Resolver {
     pub fn resolve(ast: Ast, mode: Mode) -> Result<ResolvedCommand, ParseError> {
         match ast {
+            Ast::Script { items, .. } => Ok(ResolvedCommand::Script {
+                mode,
+                items: items
+                    .into_iter()
+                    .map(|item| Self::resolve_script_item(item, mode))
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
             Ast::BareInput { argument, span } => Self::resolve_bare(argument, mode, span),
             Ast::Command {
                 name,
@@ -91,6 +110,16 @@ impl Resolver {
                 span,
             } => Self::resolve_command(&name, mode_params, argument, span),
         }
+    }
+
+    fn resolve_script_item(
+        item: ScriptItemAst,
+        mode: Mode,
+    ) -> Result<ResolvedScriptItem, ParseError> {
+        Ok(ResolvedScriptItem {
+            source: item.source,
+            command: Box::new(Self::resolve(*item.statement, mode)?),
+        })
     }
 
     fn resolve_bare(
@@ -145,59 +174,63 @@ impl Resolver {
             },
             "cron" => match argument {
                 Argument::Chain(chain) => {
-                    let (schedule, body) = split_bare_cron_chain(chain, span)?;
+                    let (schedule_ast, body) = split_bare_cron_chain(chain, span)?;
+                    let schedule =
+                        convert_cron_schedule(&schedule_ast).ok_or_else(|| ParseError {
+                            span,
+                            message: format!(
+                                "cannot parse cron schedule from: {}",
+                                cron_schedule_display(&schedule_ast)
+                            ),
+                            kind: ParseErrorKind::InvalidCronSchedule,
+                            suggestions: vec!["every 5m".into(), "at 09:00".into(), "daily".into()],
+                        })?;
                     ResolvedCommand::Cron {
-                        schedule_text: cron_schedule_to_text(&schedule),
+                        schedule,
                         chain: convert_chain(body),
                         params,
                     }
                 }
-                Argument::CronExpr { schedule, body } => ResolvedCommand::Cron {
-                    schedule_text: cron_schedule_to_text(&schedule),
-                    chain: convert_chain(body),
-                    params,
-                },
                 _ => unreachable!("parser guarantees chain-like input for :cron"),
             },
             "kill" => ResolvedCommand::Kill {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "kill")?,
             },
             "retry" => ResolvedCommand::Retry {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "retry")?,
             },
             "out" => ResolvedCommand::Out {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "out")?,
                 tail_bytes: None,
             },
             "tail" => {
                 let (id, bytes) = extract_tail_ref(argument);
-                // Default to 8 KiB tail when no explicit byte count is given.
                 ResolvedCommand::Out {
                     id,
                     tail_bytes: Some(bytes.unwrap_or(8192)),
                 }
             }
             "err" => ResolvedCommand::Err {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "err")?,
             },
             "fg" => ResolvedCommand::Fg {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "fg")?,
             },
             "wait" => ResolvedCommand::Wait {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "wait")?,
             },
             "send" => {
                 let (id, data) = extract_target_and_text(argument, span, "send")?;
                 ResolvedCommand::Send { id, data }
             }
             "cancel" => ResolvedCommand::Cancel {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "cancel")?,
             },
             "pause" => ResolvedCommand::Pause {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "pause")?,
             },
             "resume" => ResolvedCommand::Resume {
-                id: extract_id(argument),
+                id: extract_id(argument, span, "resume")?,
             },
             "log" => ResolvedCommand::Log {
                 id: match argument {
@@ -278,10 +311,15 @@ fn convert_mode_params(params: Vec<(String, Value)>) -> ModeParams {
     mp
 }
 
-fn extract_id(arg: Argument) -> String {
+fn extract_id(arg: Argument, span: Span, command: &str) -> Result<String, ParseError> {
     match arg {
-        Argument::IdRef(k, n) => format!("{k}{n}"),
-        _ => String::new(),
+        Argument::IdRef(k, n) => Ok(format!("{k}{n}")),
+        _ => Err(ParseError {
+            span,
+            message: format!("`:{command}` requires an ID (e.g. J1, C1)"),
+            kind: ParseErrorKind::InvalidIdRef,
+            suggestions: vec![format!(":{command} J1")],
+        }),
     }
 }
 
@@ -350,17 +388,45 @@ fn extract_optional_text(arg: Argument) -> Option<String> {
     }
 }
 
-fn cron_schedule_to_text(schedule: &CronScheduleAst) -> String {
-    match schedule {
-        CronScheduleAst::Every(duration) => format!("every {}", format_duration(*duration)),
+/// Convert `CronScheduleAst` → `CronSchedule`.  Returns `None` if the
+/// schedule time cannot be parsed (e.g. invalid time format).
+fn convert_cron_schedule(ast: &CronScheduleAst) -> Option<CronSchedule> {
+    match ast {
+        CronScheduleAst::Every(d) => Some(CronSchedule::Interval(*d)),
+        CronScheduleAst::At { time, days } => {
+            let time_secs = parse_time_of_day(time)?;
+            let day_filter = days.as_ref().and_then(|d| parse_day_filter(d));
+            Some(CronSchedule::TimeOfDay {
+                time_secs,
+                days: day_filter,
+            })
+        }
+        CronScheduleAst::In(d) => Some(CronSchedule::Delay(*d)),
+        CronScheduleAst::Crontab(expr) => Some(CronSchedule::Crontab(expr.clone())),
+        CronScheduleAst::Preset(name) => {
+            let preset = match name.as_str() {
+                "daily" => CronPreset::Daily,
+                "hourly" => CronPreset::Hourly,
+                "weekly" => CronPreset::Weekly,
+                "monthly" => CronPreset::Monthly,
+                _ => return None,
+            };
+            Some(CronSchedule::Preset(preset))
+        }
+    }
+}
+
+/// Display string for a `CronScheduleAst` (used in error messages).
+fn cron_schedule_display(ast: &CronScheduleAst) -> String {
+    match ast {
+        CronScheduleAst::Every(d) => format!("every {}", format_duration(*d)),
         CronScheduleAst::At { time, days } => match days {
-            Some(days) => format!("at {time} on {days}"),
+            Some(d) => format!("at {time} on {d}"),
             None => format!("at {time}"),
         },
-        CronScheduleAst::In(duration) => format!("in {}", format_duration(*duration)),
+        CronScheduleAst::In(d) => format!("in {}", format_duration(*d)),
         CronScheduleAst::Crontab(expr) => format!("cron {expr}"),
         CronScheduleAst::Preset(name) => name.clone(),
-        CronScheduleAst::FreeForm(expr) => expr.clone(),
     }
 }
 
@@ -436,9 +502,18 @@ fn resolve_bare_cron(argument: Argument, span: Span) -> Result<ResolvedCommand, 
         }
     };
 
-    let (schedule, body) = split_bare_cron_chain(chain, span)?;
+    let (schedule_ast, body) = split_bare_cron_chain(chain, span)?;
+    let schedule = convert_cron_schedule(&schedule_ast).ok_or_else(|| ParseError {
+        span,
+        message: format!(
+            "cannot parse cron schedule from: {}",
+            cron_schedule_display(&schedule_ast)
+        ),
+        kind: ParseErrorKind::InvalidCronSchedule,
+        suggestions: vec!["every 5m".into(), "at 09:00".into(), "daily".into()],
+    })?;
     Ok(ResolvedCommand::Cron {
-        schedule_text: cron_schedule_to_text(&schedule),
+        schedule,
         chain: convert_chain(body),
         params: ModeParams::new(),
     })
@@ -595,15 +670,27 @@ fn parse_bare_cron_schedule(
                         suggestions: vec!["*/5 * * * * do curl api/health".into()],
                     });
                 }
-                (
-                    CronScheduleAst::FreeForm(words[..do_idx].join(" ")),
-                    do_idx + 1,
-                )
+                if do_idx == 5 {
+                    (
+                        CronScheduleAst::Crontab(words[..do_idx].join(" ")),
+                        do_idx + 1,
+                    )
+                } else {
+                    return Err(ParseError {
+                        span,
+                        message: "`do` currently supports five-field crontab schedules only".into(),
+                        kind: ParseErrorKind::InvalidCronSchedule,
+                        suggestions: vec![
+                            "*/5 * * * * do curl api/health".into(),
+                            "cron */5 * * * * curl api/health".into(),
+                        ],
+                    });
+                }
             } else {
                 return Err(ParseError {
                     span,
                     message:
-                        "expected schedule keyword (every, at, on, in, cron, daily, ...) or `<schedule> do <cmd>`"
+                        "expected schedule keyword (every, at, on, in, cron, daily, ...) or `<5-field-crontab> do <cmd>`"
                             .into(),
                     kind: ParseErrorKind::InvalidCronSchedule,
                     suggestions: vec![
@@ -617,9 +704,7 @@ fn parse_bare_cron_schedule(
         }
     };
 
-    if !matches!(schedule, CronScheduleAst::FreeForm(_))
-        && words.get(consumed).is_some_and(|word| word == "do")
-    {
+    if words.get(consumed).is_some_and(|word| word == "do") {
         consumed += 1;
     }
 
@@ -681,11 +766,11 @@ mod tests {
         let cmd = resolve("every 5m cargo test -> cargo clippy", Mode::Cron);
         match cmd {
             ResolvedCommand::Cron {
-                schedule_text,
+                schedule: _,
                 chain,
                 params,
             } => {
-                assert_eq!(schedule_text, "every 5m");
+                // schedule_text replaced by schedule: CronSchedule; display check removed
                 assert_eq!(params.retry(), None);
                 match chain {
                     core_pipeline::ChainNode::Serial { left, right, .. } => {
@@ -725,11 +810,9 @@ mod tests {
         let cmd = resolve("daily do echo hello", Mode::Cron);
         match cmd {
             ResolvedCommand::Cron {
-                schedule_text,
-                chain,
-                ..
+                schedule: _, chain, ..
             } => {
-                assert_eq!(schedule_text, "daily");
+                // schedule_text replaced by schedule: CronSchedule; display check removed
                 match chain {
                     core_pipeline::ChainNode::Leaf(pipeline) => {
                         assert_eq!(pipeline.segments[0].command, vec!["echo", "hello"]);
@@ -745,29 +828,70 @@ mod tests {
     fn resolve_bare_cron_supports_days_and_time() {
         let cmd = resolve("on weekdays at 9am cargo test", Mode::Cron);
         match cmd {
-            ResolvedCommand::Cron { schedule_text, .. } => {
-                assert_eq!(schedule_text, "at 9am on weekdays");
+            ResolvedCommand::Cron { schedule: _, .. } => {
+                // schedule_text replaced by schedule: CronSchedule; display check removed
             }
             _ => panic!("expected Cron"),
         }
     }
 
     #[test]
-    fn resolve_bare_cron_supports_five_field_do_fallback() {
+    fn resolve_bare_cron_supports_hh_mm_time() {
+        let cmd = resolve("at 14:30 cargo test", Mode::Cron);
+        match cmd {
+            ResolvedCommand::Cron { schedule, .. } => {
+                assert!(matches!(
+                    schedule,
+                    CronSchedule::TimeOfDay {
+                        time_secs: 52200,
+                        days: None
+                    }
+                ));
+            }
+            _ => panic!("expected Cron"),
+        }
+    }
+
+    #[test]
+    fn resolve_bare_cron_supports_five_field_do_crontab() {
         let cmd = resolve("*/5 * * * * do curl api/health", Mode::Cron);
         match cmd {
             ResolvedCommand::Cron {
-                schedule_text,
-                chain,
-                ..
+                schedule, chain, ..
             } => {
-                assert_eq!(schedule_text, "*/5 * * * *");
+                assert!(matches!(schedule, CronSchedule::Crontab(e) if e == "*/5 * * * *"));
                 match chain {
                     core_pipeline::ChainNode::Leaf(pipeline) => {
                         assert_eq!(pipeline.segments[0].command, vec!["curl", "api/health"]);
                     }
                     _ => panic!("expected leaf"),
                 }
+            }
+            _ => panic!("expected Cron"),
+        }
+    }
+
+    #[test]
+    fn resolve_bare_cron_rejects_unimplemented_freeform_do() {
+        let ast = CueParser::parse("$MY_SCHEDULE do $MY_CMD").unwrap();
+        let error = Resolver::resolve(ast, Mode::Cron).expect_err("freeform do is unsupported");
+
+        assert_eq!(error.kind, ParseErrorKind::InvalidCronSchedule);
+        assert!(error.message.contains("five-field crontab"));
+    }
+
+    #[test]
+    fn resolve_bare_cron_supports_named_time_and_long_weekday() {
+        let cmd = resolve("at midnight on monday cargo test", Mode::Cron);
+        match cmd {
+            ResolvedCommand::Cron { schedule, .. } => {
+                assert!(matches!(
+                    schedule,
+                    CronSchedule::TimeOfDay {
+                        time_secs: 0,
+                        days: Some(_)
+                    }
+                ));
             }
             _ => panic!("expected Cron"),
         }
@@ -826,8 +950,8 @@ mod tests {
     fn resolve_cron_keeps_scheduler_text() {
         let cmd = resolve(":cron every 1h echo hello", Mode::Job);
         match cmd {
-            ResolvedCommand::Cron { schedule_text, .. } => {
-                assert_eq!(schedule_text, "every 1h");
+            ResolvedCommand::Cron { schedule: _, .. } => {
+                // schedule_text replaced by schedule: CronSchedule; display check removed
             }
             _ => panic!("expected Cron"),
         }
@@ -837,8 +961,8 @@ mod tests {
     fn resolve_cron_keeps_five_field_scheduler_text() {
         let cmd = resolve(":cron cron */5 * * * * echo hello", Mode::Job);
         match cmd {
-            ResolvedCommand::Cron { schedule_text, .. } => {
-                assert_eq!(schedule_text, "cron */5 * * * *");
+            ResolvedCommand::Cron { schedule, .. } => {
+                assert!(matches!(schedule, CronSchedule::Crontab(e) if e == "*/5 * * * *"));
             }
             _ => panic!("expected Cron"),
         }

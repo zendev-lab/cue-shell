@@ -50,6 +50,9 @@ enum Message {
 // Response (error)
 {"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "unexpected token '||?' at position 15"}}}
 
+// Response (success — Eval resolved to a multiline script submission)
+{"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
+
 // Request: Subscribe (protocol command)
 {"type": "request", "id": 2, "payload": {"Subscribe": {"channels": ["jobs", "crons", "output:J1"]}}}
 
@@ -143,6 +146,11 @@ enum ResponsePayload {
 
 enum OkPayload {
     Ack {},  // generic success (Subscribe, Kill, FgDetach, etc.)
+    ScriptCreated {
+        script_id: String,
+        items: Vec<ScriptItemInfo>,
+        submit_error: Option<ScriptSubmitError>,
+    },  // one multiline submission; items are ack-ordered during creation but run asynchronously after creation
     JobCreated {
         job_id: String,
         start_scope: Option<String>,
@@ -254,6 +262,34 @@ struct ChainInfo {
     pipeline: String,
     total_jobs: usize,
     jobs: Vec<ChainJobInfo>,
+}
+
+struct ScriptItemInfo {
+    index: usize,
+    source: String,
+    result: ScriptItemResult,
+}
+
+enum ScriptItemResult {
+    Job {
+        job_id: String,
+        start_scope: Option<String>,
+        open_hint: JobOpenHint,
+    },
+    Chain {
+        chain_id: String,
+        job_ids: Vec<String>,
+        chain: ChainInfo,
+    },
+    Cron { cron_id: String },
+    Message { text: String },
+}
+
+struct ScriptSubmitError {
+    index: usize,
+    source: String,
+    code: String,
+    message: String,
 }
 
 struct ChainJobInfo {

@@ -88,6 +88,24 @@ impl<'a> Tokenizer<'a> {
         let start = self.pos;
         let b = self.bytes[self.pos];
 
+        if b == b'\n' {
+            self.pos += 1;
+            self.last_significant = None;
+            return Ok(Spanned {
+                token: Token::Newline,
+                span: Span::new(start, self.pos),
+            });
+        }
+
+        if b == b'\r' && self.peek_at(1) == Some(b'\n') {
+            self.pos += 2;
+            self.last_significant = None;
+            return Ok(Spanned {
+                token: Token::Newline,
+                span: Span::new(start, self.pos),
+            });
+        }
+
         // Whitespace
         if b == b' ' || b == b'\t' {
             self.pos += 1;
@@ -103,7 +121,7 @@ impl<'a> Tokenizer<'a> {
         }
 
         let tok = match b {
-            b':' if start == 0 || self.last_significant.is_none() || self.is_colon_context() => {
+            b':' if start == 0 || self.last_significant.is_none() => {
                 self.pos += 1;
                 self.last_significant = Some(TokenClass::Other);
 
@@ -173,28 +191,6 @@ impl<'a> Tokenizer<'a> {
             token: tok,
             span: Span::new(start, self.pos),
         })
-    }
-
-    /// Check if `:` is in a position where it starts a command
-    /// (start of input, or after whitespace/operator/group-open).
-    fn is_colon_context(&self) -> bool {
-        if self.pos == 0 {
-            return true;
-        }
-        // Look at previous non-whitespace character
-        let mut i = self.pos;
-        while i > 0 {
-            i -= 1;
-            let c = self.bytes[i];
-            if c == b' ' || c == b'\t' {
-                continue;
-            }
-            return matches!(
-                c,
-                b'>' | b'(' | b'|' | b'?' // after operators or group open
-            );
-        }
-        true // start of input
     }
 
     /// Tokenize after `(` when in mode-params context.
@@ -349,7 +345,7 @@ impl<'a> Tokenizer<'a> {
     fn tokenize_quoted_string(&mut self) -> Result<Token, TokenizeError> {
         let start = self.pos;
         self.pos += 1; // skip opening quote
-        let mut s = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
         loop {
             match self.advance() {
                 None => {
@@ -360,13 +356,13 @@ impl<'a> Tokenizer<'a> {
                 }
                 Some(b'"') => break,
                 Some(b'\\') => match self.advance() {
-                    Some(b'"') => s.push('"'),
-                    Some(b'\\') => s.push('\\'),
-                    Some(b'n') => s.push('\n'),
-                    Some(b't') => s.push('\t'),
+                    Some(b'"') => bytes.push(b'"'),
+                    Some(b'\\') => bytes.push(b'\\'),
+                    Some(b'n') => bytes.push(b'\n'),
+                    Some(b't') => bytes.push(b'\t'),
                     Some(c) => {
-                        s.push('\\');
-                        s.push(c as char);
+                        bytes.push(b'\\');
+                        bytes.push(c);
                     }
                     None => {
                         return Err(TokenizeError {
@@ -375,9 +371,13 @@ impl<'a> Tokenizer<'a> {
                         });
                     }
                 },
-                Some(c) => s.push(c as char),
+                Some(c) => bytes.push(c),
             }
         }
+        let s = String::from_utf8(bytes).map_err(|_| TokenizeError {
+            pos: start,
+            message: "invalid UTF-8 in string".into(),
+        })?;
         self.last_significant = Some(TokenClass::Other);
         Ok(Token::Word(s))
     }
@@ -390,7 +390,7 @@ impl<'a> Tokenizer<'a> {
     fn tokenize_single_quoted_string(&mut self) -> Result<Token, TokenizeError> {
         let start = self.pos;
         self.pos += 1; // skip opening quote
-        let mut s = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
         loop {
             match self.advance() {
                 None => {
@@ -400,9 +400,13 @@ impl<'a> Tokenizer<'a> {
                     });
                 }
                 Some(b'\'') => break,
-                Some(c) => s.push(c as char),
+                Some(c) => bytes.push(c),
             }
         }
+        let s = String::from_utf8(bytes).map_err(|_| TokenizeError {
+            pos: start,
+            message: "invalid UTF-8 in single-quoted string".into(),
+        })?;
         self.last_significant = Some(TokenClass::Other);
         Ok(Token::Word(s))
     }
@@ -445,10 +449,7 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 fn is_delimiter(b: u8) -> bool {
-    matches!(
-        b,
-        b' ' | b'\t' | b'\n' | b'(' | b')' | b'|' | b':' | b',' | b'"'
-    )
+    matches!(b, b' ' | b'\t' | b'\n' | b'(' | b')' | b'|' | b',' | b'"')
     // Note: `-` and `~` are NOT delimiters here.
     // The main tokenize loop handles `->` and `~>` as operators before
     // falling through to word tokenization, so `-` inside words (e.g. `--release`)
@@ -520,6 +521,21 @@ mod tests {
                 Token::Command("run".into()),
                 Token::Word("cargo".into()),
                 Token::Word("test".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_is_tokenized() {
+        let toks = tokens("echo hi\npwd");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("hi".into()),
+                Token::Newline,
+                Token::Word("pwd".into()),
                 Token::Eof,
             ]
         );
@@ -670,6 +686,24 @@ mod tests {
             vec![
                 Token::Word("sleep".into()),
                 Token::Word("4s".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn non_leading_colons_stay_in_words() {
+        let toks = tokens(":run tr [:upper:] [:lower:] https://example.com at 14:30");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Command("run".into()),
+                Token::Word("tr".into()),
+                Token::Word("[:upper:]".into()),
+                Token::Word("[:lower:]".into()),
+                Token::Word("https://example.com".into()),
+                Token::Word("at".into()),
+                Token::Word("14:30".into()),
                 Token::Eof,
             ]
         );
@@ -849,6 +883,58 @@ mod tests {
                 Token::Word("b".into()),
                 Token::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn emoji_in_words() {
+        let tokens = Tokenizer::tokenize("echo 🎉").unwrap();
+        let filtered: Vec<_> = tokens
+            .iter()
+            .filter(|s| !matches!(s.token, Token::Whitespace(_)))
+            .collect();
+        assert_eq!(filtered[0].token, Token::Word("echo".into()));
+        assert_eq!(filtered[1].token, Token::Word("🎉".into()));
+
+        // Multi-emoji
+        let tokens = Tokenizer::tokenize("echo 🎉✅🚀").unwrap();
+        let filtered: Vec<_> = tokens
+            .iter()
+            .filter(|s| !matches!(s.token, Token::Whitespace(_)))
+            .collect();
+        assert_eq!(filtered[1].token, Token::Word("🎉✅🚀".into()));
+
+        // Single-quoted emoji
+        let tokens = Tokenizer::tokenize("echo '📝'").unwrap();
+        let filtered: Vec<_> = tokens
+            .iter()
+            .filter(|s| !matches!(s.token, Token::Whitespace(_)))
+            .collect();
+        assert_eq!(filtered[1].token, Token::Word("📝".into()));
+
+        // Double-quoted emoji
+        let tokens = Tokenizer::tokenize("echo \"📝\"").unwrap();
+        let filtered: Vec<_> = tokens
+            .iter()
+            .filter(|s| !matches!(s.token, Token::Whitespace(_)))
+            .collect();
+        assert_eq!(filtered[1].token, Token::Word("📝".into()));
+
+        // Emoji in mode params
+        let tokens = Tokenizer::tokenize(":run(desc=🎉) cargo test").unwrap();
+        let filtered: Vec<_> = tokens
+            .iter()
+            .filter(|s| !matches!(s.token, Token::Whitespace(_)))
+            .collect();
+        assert_eq!(filtered[0].token, Token::Command("run".into()));
+        assert_eq!(filtered[1].token, Token::ModeParenOpen);
+        // ModeParam value with emoji (token is Word, parser converts to Value::Str)
+        let has_emoji_word = filtered
+            .iter()
+            .any(|s| matches!(&s.token, Token::Word(w) if w == "🎉"));
+        assert!(
+            has_emoji_word,
+            "emoji should survive mode param tokenization"
         );
     }
 }

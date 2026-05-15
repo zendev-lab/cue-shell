@@ -18,7 +18,7 @@
 
 use cue_core::pipeline::{ParallelOp, PipeOp, SerialOp};
 
-use super::ast::{Argument, Ast, ChainNode, PipeSegment, Pipeline};
+use super::ast::{Argument, Ast, ChainNode, PipeSegment, Pipeline, ScriptItemAst};
 use super::token::{Span, Spanned, Token, Value};
 use super::tokenizer::Tokenizer;
 
@@ -55,6 +55,12 @@ pub struct Parser<'a> {
     input: &'a str,
 }
 
+struct ScriptChunk {
+    tokens: Vec<Spanned>,
+    source: String,
+    span: Span,
+}
+
 impl<'a> Parser<'a> {
     /// Parse a raw input string into an AST.
     pub fn parse(input: &'a str) -> Result<Ast, ParseError> {
@@ -65,19 +71,53 @@ impl<'a> Parser<'a> {
             suggestions: vec![],
         })?;
 
-        // Filter whitespace for the parser (keep spans intact).
+        // Filter horizontal whitespace for the parser (keep spans intact).
         let tokens: Vec<Spanned> = all_tokens
             .into_iter()
             .filter(|s| !matches!(s.token, Token::Whitespace(_)))
             .collect();
 
+        Self::parse_tokens(tokens, input)
+    }
+
+    fn parse_tokens(tokens: Vec<Spanned>, input: &str) -> Result<Ast, ParseError> {
+        let chunks = split_top_level_statements(&tokens, input);
+        if chunks.is_empty() {
+            return Ok(Ast::BareInput {
+                argument: Argument::Empty,
+                span: Span::new(0, 0),
+            });
+        }
+
         let mut parser = Parser {
-            tokens,
+            tokens: chunks[0].tokens.clone(),
             pos: 0,
             input_len: input.len(),
             input,
         };
-        parser.parse_input()
+        if chunks.len() == 1 {
+            return parser.parse_single_statement();
+        }
+
+        let span = Span::new(
+            chunks.first().map(|chunk| chunk.span.start).unwrap_or(0),
+            chunks.last().map(|chunk| chunk.span.end).unwrap_or(0),
+        );
+        let mut items = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let mut parser = Parser {
+                tokens: chunk.tokens,
+                pos: 0,
+                input_len: input.len(),
+                input,
+            };
+            items.push(ScriptItemAst {
+                source: chunk.source,
+                span: chunk.span,
+                statement: Box::new(parser.parse_single_statement()?),
+            });
+        }
+        Ok(Ast::Script { items, span })
     }
 
     fn peek(&self) -> &Token {
@@ -117,7 +157,20 @@ impl<'a> Parser<'a> {
         matches!(self.peek(), Token::Eof)
     }
 
-    fn parse_input(&mut self) -> Result<Ast, ParseError> {
+    fn parse_single_statement(&mut self) -> Result<Ast, ParseError> {
+        let ast = self.parse_statement()?;
+        if !self.at_end() {
+            return Err(ParseError {
+                span: self.peek_span(),
+                message: format!("unexpected token {}", self.peek()),
+                kind: ParseErrorKind::UnexpectedToken,
+                suggestions: vec![],
+            });
+        }
+        Ok(ast)
+    }
+
+    fn parse_statement(&mut self) -> Result<Ast, ParseError> {
         let span_start = self.peek_span().start;
 
         if let Token::Command(_) = self.peek() {
@@ -465,11 +518,20 @@ impl<'a> Parser<'a> {
 
     /// Parse words for one atom in a pipeline (or a grouped chain).
     fn parse_atom_words(&mut self) -> Result<Vec<String>, ParseError> {
-        // Grouped chain: ( chain )
+        // Grouped chain at pipeline level is illegal:
+        // `cmd |> (chain) |> cmd` — can't nest chain inside pipeline.
         if matches!(self.peek(), Token::GroupOpen) {
-            // For grouped chains within pipes, this is illegal (chain can't pipe to process).
-            // But for grouped chains at chain level, it's valid.
-            // We handle this at the chain level instead.
+            let span = self.peek_span();
+            self.advance(); // consume GroupOpen to avoid downstream confusion
+            return Err(ParseError {
+                span,
+                message: "cannot nest a chain group `(...)` inside a pipeline. Use `|>` for process pipes, `->` / `||` for job chains.".into(),
+                kind: ParseErrorKind::UnexpectedToken,
+                suggestions: vec![
+                    "use |> for piping between processes".into(),
+                    "use -> for serial job chaining".into(),
+                ],
+            });
         }
 
         let mut words = vec![];
@@ -496,6 +558,100 @@ impl<'a> Parser<'a> {
         }
         Ok(words)
     }
+}
+
+fn split_top_level_statements(tokens: &[Spanned], input: &str) -> Vec<ScriptChunk> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut depth = 0usize;
+
+    for (idx, spanned) in tokens.iter().enumerate() {
+        match spanned.token {
+            Token::Eof => break,
+            Token::ModeParenOpen | Token::GroupOpen => {
+                depth += 1;
+                current.push(spanned.clone());
+            }
+            Token::ModeParenClose | Token::GroupClose => {
+                depth = depth.saturating_sub(1);
+                current.push(spanned.clone());
+            }
+            Token::Newline => {
+                if should_split_on_newline(tokens, idx, depth, &current) {
+                    push_script_chunk(&mut chunks, &mut current, input);
+                }
+            }
+            _ => current.push(spanned.clone()),
+        }
+    }
+
+    push_script_chunk(&mut chunks, &mut current, input);
+    chunks
+}
+
+fn should_split_on_newline(
+    tokens: &[Spanned],
+    newline_index: usize,
+    depth: usize,
+    current: &[Spanned],
+) -> bool {
+    if current.is_empty() {
+        return true;
+    }
+    if depth > 0 {
+        return false;
+    }
+    let prev = current.last().map(|spanned| &spanned.token);
+    if prev.is_some_and(token_requires_continuation) {
+        return false;
+    }
+    let next = tokens[newline_index + 1..]
+        .iter()
+        .find_map(|spanned| match &spanned.token {
+            Token::Newline | Token::Eof => None,
+            other => Some(other),
+        });
+    !next.is_some_and(token_continues_previous_line)
+}
+
+fn token_requires_continuation(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::SerialThen
+            | Token::SerialAlways
+            | Token::ParallelAll
+            | Token::ParallelRace
+            | Token::PipeStdout
+            | Token::PipeAll
+            | Token::PipeStderr
+    )
+}
+
+fn token_continues_previous_line(token: &Token) -> bool {
+    token_requires_continuation(token)
+}
+
+fn push_script_chunk(chunks: &mut Vec<ScriptChunk>, current: &mut Vec<Spanned>, input: &str) {
+    if current.is_empty() {
+        return;
+    }
+    let span = Span::new(
+        current
+            .first()
+            .map(|spanned| spanned.span.start)
+            .unwrap_or(0),
+        current.last().map(|spanned| spanned.span.end).unwrap_or(0),
+    );
+    let source = input[span.start..span.end].trim().to_string();
+    if source.is_empty() {
+        current.clear();
+        return;
+    }
+    chunks.push(ScriptChunk {
+        tokens: std::mem::take(current),
+        source,
+        span,
+    });
 }
 
 pub(super) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
@@ -763,6 +919,65 @@ mod tests {
                 _ => panic!("expected single-segment pipeline"),
             },
             _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn unquoted_args_with_colon() {
+        let ast = Parser::parse(":run tr [:upper:] [:lower:]").unwrap();
+        match ast {
+            Ast::Command { argument, .. } => match argument {
+                Argument::Chain(ChainNode::Leaf(p)) => {
+                    assert_eq!(p.segments.len(), 1);
+                    assert_eq!(p.segments[0].command, vec!["tr", "[:upper:]", "[:lower:]"]);
+                }
+                _ => panic!("expected single-segment pipeline"),
+            },
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn parse_multiline_script() {
+        let ast = Parser::parse("cargo test\n:run cargo clippy").unwrap();
+        match ast {
+            Ast::Script { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].source, "cargo test");
+                assert_eq!(items[1].source, ":run cargo clippy");
+            }
+            _ => panic!("expected Script"),
+        }
+    }
+
+    #[test]
+    fn parse_multiline_chain_continues_after_operator() {
+        let ast = Parser::parse("cargo test ->\ncargo clippy").unwrap();
+        match ast {
+            Ast::BareInput { argument, .. } => {
+                assert!(matches!(
+                    argument,
+                    Argument::Chain(ChainNode::Serial { .. })
+                ));
+            }
+            _ => panic!("expected BareInput"),
+        }
+    }
+
+    #[test]
+    fn parse_multiline_chain_continues_before_operator() {
+        let ast = Parser::parse("cat a\n|| cat b").unwrap();
+        match ast {
+            Ast::BareInput { argument, .. } => {
+                assert!(matches!(
+                    argument,
+                    Argument::Chain(ChainNode::Parallel {
+                        op: ParallelOp::All,
+                        ..
+                    })
+                ));
+            }
+            _ => panic!("expected BareInput"),
         }
     }
 }

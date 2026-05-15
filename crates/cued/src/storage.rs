@@ -2,7 +2,7 @@
 //!
 //! Uses WAL mode for concurrent reads.  The schema is migrated on open.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
@@ -37,7 +37,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 10;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS crons (
     command     TEXT NOT NULL,
     enabled     INTEGER NOT NULL DEFAULT 1,
     scope_hash  BLOB,
+    cwd_override TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -88,6 +89,34 @@ UPDATE jobs_history
 SET start_scope = COALESCE(start_scope, scope_hash),
     end_scope = COALESCE(end_scope, scope_hash)
 WHERE start_scope IS NULL OR end_scope IS NULL;
+";
+
+const MIGRATION_V9: &str = r"
+CREATE TABLE IF NOT EXISTS script_runs (
+    id            TEXT PRIMARY KEY,
+    mode          TEXT NOT NULL,
+    input         TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    item_count    INTEGER NOT NULL,
+    error_code    TEXT,
+    error_message TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS script_items (
+    script_id     TEXT NOT NULL REFERENCES script_runs(id) ON DELETE CASCADE,
+    item_index    INTEGER NOT NULL,
+    source_text   TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    target_id     TEXT,
+    chain_id      TEXT,
+    job_ids_json  TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (script_id, item_index)
+);
+";
+
+const MIGRATION_V10: &str = r"
+ALTER TABLE crons ADD COLUMN cwd_override TEXT;
 ";
 
 /// Open (or create) the database at `path`, apply WAL mode and run migrations.
@@ -162,6 +191,18 @@ fn migrate(conn: &Connection) -> Result<()> {
                 "ALTER TABLE jobs_history ADD COLUMN stderr TEXT NOT NULL DEFAULT '';",
             )
             .context("failed to add jobs_history.stderr")?;
+        }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    if current < 9 {
+        conn.execute_batch(MIGRATION_V9)
+            .context("failed to run schema migration v9")?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    if current < 10 {
+        if !column_exists(conn, "crons", "cwd_override")? {
+            conn.execute_batch(MIGRATION_V10)
+                .context("failed to run schema migration v10")?;
         }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -276,7 +317,30 @@ pub struct StoredCron {
     pub command: String,
     pub status: CronStatus,
     pub scope_hash: Option<ScopeHash>,
+    pub cwd_override: Option<PathBuf>,
     pub age_secs: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredScriptRun {
+    pub id: String,
+    pub mode: String,
+    pub input: String,
+    pub status: String,
+    pub item_count: usize,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredScriptItem {
+    pub script_id: String,
+    pub item_index: usize,
+    pub source_text: String,
+    pub kind: String,
+    pub target_id: Option<String>,
+    pub chain_id: Option<String>,
+    pub job_ids: Vec<String>,
 }
 
 pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
@@ -384,15 +448,20 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
     let scope_hash = cron.scope_hash.map(|hash| hash.0.to_vec());
     let status = serde_json::to_string(&cron.status).context("serialize cron status")?;
     let enabled = i64::from(cron.status.is_runnable());
+    let cwd_override = cron
+        .cwd_override
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     conn.execute(
-        "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status, cwd_override)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(id) DO UPDATE SET
               schedule = excluded.schedule,
               command = excluded.command,
               enabled = excluded.enabled,
               scope_hash = excluded.scope_hash,
-              status = excluded.status",
+              status = excluded.status,
+              cwd_override = excluded.cwd_override",
         rusqlite::params![
             cron.id,
             cron.schedule,
@@ -400,9 +469,109 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
             enabled,
             scope_hash,
             status,
+            cwd_override,
         ],
     )?;
     Ok(())
+}
+
+pub fn upsert_script_run(
+    conn: &Connection,
+    script: &StoredScriptRun,
+    items: &[StoredScriptItem],
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO script_runs (id, mode, input, status, item_count, error_code, error_message)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+              mode = excluded.mode,
+              input = excluded.input,
+              status = excluded.status,
+              item_count = excluded.item_count,
+              error_code = excluded.error_code,
+              error_message = excluded.error_message",
+        rusqlite::params![
+            script.id,
+            script.mode,
+            script.input,
+            script.status,
+            script.item_count as i64,
+            script.error_code,
+            script.error_message,
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM script_items WHERE script_id = ?1",
+        rusqlite::params![script.id],
+    )?;
+    for item in items {
+        conn.execute(
+            "INSERT INTO script_items (
+                 script_id, item_index, source_text, kind, target_id, chain_id, job_ids_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                item.script_id,
+                item.item_index as i64,
+                item.source_text,
+                item.kind,
+                item.target_id,
+                item.chain_id,
+                serde_json::to_string(&item.job_ids).context("serialize script item job ids")?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn max_script_run_id(conn: &Connection) -> Result<Option<u32>> {
+    let mut stmt = conn.prepare("SELECT id FROM script_runs")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut max_id = None;
+    for row in rows {
+        let id = row?;
+        if let Some(n) = parse_numeric_suffix(&id) {
+            max_id = Some(max_id.unwrap_or(0).max(n));
+        }
+    }
+    Ok(max_id)
+}
+
+pub fn prune_job_history(conn: &Connection, keep: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM jobs_history")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    ids.sort_by_key(|id| parse_numeric_suffix(id).unwrap_or(u32::MAX));
+    let drop_count = ids.len().saturating_sub(keep);
+    let removed = ids.into_iter().take(drop_count).collect::<Vec<_>>();
+    for id in &removed {
+        conn.execute(
+            "DELETE FROM jobs_history WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+    }
+    Ok(removed)
+}
+
+pub fn prune_script_runs(conn: &Connection, keep: usize) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM script_runs")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    ids.sort_by_key(|id| parse_numeric_suffix(id).unwrap_or(u32::MAX));
+    let drop_count = ids.len().saturating_sub(keep);
+    let removed = ids.into_iter().take(drop_count).collect::<Vec<_>>();
+    for id in &removed {
+        conn.execute(
+            "DELETE FROM script_runs WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+    }
+    Ok(removed)
 }
 
 pub fn delete_cron(conn: &Connection, id: &str) -> Result<()> {
@@ -414,6 +583,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
     let mut stmt = conn.prepare(
         "SELECT id, schedule, command, enabled, scope_hash,
                 COALESCE(status, CASE WHEN enabled != 0 THEN 'scheduled' ELSE 'paused' END) AS status,
+                cwd_override,
                 CAST((julianday('now') - julianday(created_at)) * 86400 AS INTEGER) AS age_secs
           FROM crons",
     )?;
@@ -424,7 +594,8 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
         let enabled: i64 = row.get(3)?;
         let scope_blob: Option<Vec<u8>> = row.get(4)?;
         let status_text: String = row.get(5)?;
-        let age_secs: i64 = row.get(6)?;
+        let cwd_override: Option<String> = row.get(6)?;
+        let age_secs: i64 = row.get(7)?;
         Ok((
             id,
             schedule,
@@ -432,13 +603,15 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
             enabled,
             scope_blob,
             status_text,
+            cwd_override,
             age_secs,
         ))
     })?;
 
     let mut crons = Vec::new();
     for row in rows {
-        let (id, schedule, command, enabled, scope_blob, status_text, age_secs) = row?;
+        let (id, schedule, command, enabled, scope_blob, status_text, cwd_override, age_secs) =
+            row?;
         let status = match parse_cron_status(&status_text) {
             Ok(status) => status,
             Err(_) => {
@@ -455,6 +628,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<StoredCron>> {
             command,
             status,
             scope_hash: scope_blob.as_deref().map(blob_to_scope_hash).transpose()?,
+            cwd_override: cwd_override.map(PathBuf::from),
             age_secs,
         });
     }
@@ -618,6 +792,7 @@ mod tests {
             command: "cargo test".into(),
             status: CronStatus::Scheduled,
             scope_hash: Some(ScopeHash([9; 32])),
+            cwd_override: Some(PathBuf::from("/tmp/cue-cron-cwd")),
             age_secs: 0,
         };
 
@@ -630,6 +805,7 @@ mod tests {
         assert_eq!(loaded[0].command, cron.command);
         assert_eq!(loaded[0].status, cron.status);
         assert_eq!(loaded[0].scope_hash, cron.scope_hash);
+        assert_eq!(loaded[0].cwd_override, cron.cwd_override);
     }
 
     #[test]
