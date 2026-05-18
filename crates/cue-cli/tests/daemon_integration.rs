@@ -190,7 +190,7 @@ async fn connect_bridge(
     let socket = UnixStream::connect(socket)
         .await
         .expect("connect bridge socket");
-    let relay = tokio::spawn(cued::gateway_stdio::relay(
+    let relay = tokio::spawn(cue_daemon::gateway_stdio::relay(
         relay_input,
         relay_output,
         socket,

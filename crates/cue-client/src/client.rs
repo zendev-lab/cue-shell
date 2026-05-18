@@ -12,7 +12,8 @@ use tokio::task::JoinHandle;
 
 use cue_core::Mode;
 use cue_core::ipc::{
-    EventPayload, MAX_MESSAGE_SIZE, Message, RequestPayload, ResponsePayload, encode_message,
+    EventPayload, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
+    encode_message,
 };
 
 /// Client handle for a single connection to the cued daemon.
@@ -72,6 +73,18 @@ impl CuedClient {
     /// Convenience: send a Ping request.
     pub async fn ping(&mut self) -> Result<u32> {
         self.send(RequestPayload::Ping {}).await
+    }
+
+    /// Validate that the daemon speaks the expected IPC protocol.
+    pub async fn ping_roundtrip(&mut self) -> Result<()> {
+        let ping_id = self.ping().await?;
+        match self.recv().await? {
+            Message::Response {
+                id,
+                payload: ResponsePayload::Ok(OkPayload::Pong {}),
+            } if id == ping_id => Ok(()),
+            message => bail!("unexpected message while validating daemon transport: {message:?}"),
+        }
     }
 
     /// Split the client into read/write halves for concurrent use.

@@ -40,9 +40,17 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 ```
 crates/
 ├── cue-core/   — Core types and logic: Job, Scope, Chain, Cron
-├── cued/       — Background daemon: Unix socket server, job orchestration
-├── cue-tui/    — TUI frontend: mode switching, command input, job display
-└── cue-cli/    — CLI entry point: command parsing, mode dispatch
+├── cue-client/ — Client connection stack shared by frontends
+├── cue-daemon/ — Background daemon implementation library used by the `cued` CLI
+├── cue-tui/    — Optional TUI extension mounted as the `cue tui` subcommand
+├── cue-cli/    — CLI entry crate; builds `cue` and `cued` via `tui`/`daemon`
+```
+
+## Installation
+
+```bash
+# Install both `cue` and `cued` from PyPI
+uv tool install cue-shell
 ```
 
 ## Development
@@ -60,7 +68,7 @@ cued -f
 cargo run -p cue-cli -- tui
 
 # Restart the daemon directly
-cargo run -p cued -- restart
+cargo run -p cue-cli --bin cued -- restart
 
 # Restart from inside the TUI
 :restart
@@ -170,7 +178,7 @@ with a message that includes the profile's explicit `start_command`.
 | Cargo workspace | ✅ Scaffolded |
 | CI/CD | ✅ Configured |
 | cue-core | ✅ Core types / IPC / parser in place |
-| cued daemon | 🚧 Functional prototype |
+| cue-daemon | 🚧 Functional prototype |
 | cue-tui | 🚧 Functional prototype |
 | cue-cli | 🚧 Functional prototype |
 

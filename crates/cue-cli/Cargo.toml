@@ -11,15 +11,42 @@ license.workspace = true
 name = "cue"
 path = "src/main.rs"
 
+[[bin]]
+name = "cued"
+path = "src/bin/cued.rs"
+required-features = ["daemon"]
+
+[[test]]
+name = "daemon_integration"
+path = "tests/daemon_integration.rs"
+required-features = ["daemon"]
+
 [dependencies]
 anyhow.workspace = true
-cue-client = { path = "../cue-client" }
-cue-core = { path = "../cue-core" }
-cue-tui = { path = "../cue-tui" }
-serde.workspace = true
-tokio.workspace = true
-toml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+cue-client = { path = "../cue-client", optional = true }
+cue-daemon = { path = "../cue-daemon", optional = true }
+cue-tui = { path = "../cue-tui", optional = true }
+serde = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
+cue-core = { path = "../cue-core" }
+libc.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[features]
+default = ["daemon", "tui"]
+daemon = ["dep:cue-daemon"]
+tui = [
+  "dep:cue-client",
+  "dep:cue-tui",
+  "dep:serde",
+  "dep:tokio",
+  "dep:toml",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+]

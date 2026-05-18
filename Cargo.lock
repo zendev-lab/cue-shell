@@ -305,8 +305,11 @@ dependencies = [
  "anyhow",
  "cue-client",
  "cue-core",
+ "cue-daemon",
  "cue-tui",
+ "libc",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
@@ -336,25 +339,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cue-tui"
-version = "0.1.0"
-dependencies = [
- "ansi-to-tui",
- "anyhow",
- "base64",
- "crossterm",
- "cue-client",
- "cue-core",
- "ratatui",
- "serde_json",
- "tokio",
- "toml",
- "tracing",
- "tui-term",
-]
-
-[[package]]
-name = "cued"
+name = "cue-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -370,6 +355,24 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cue-tui"
+version = "0.1.0"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "base64",
+ "crossterm",
+ "cue-client",
+ "cue-core",
+ "ratatui",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
+ "tui-term",
 ]
 
 [[package]]

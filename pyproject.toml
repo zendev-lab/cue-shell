@@ -1,0 +1,39 @@
+[project]
+name = "cue-shell"
+description = "Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "Zhan Rongrui" }]
+keywords = ["cli", "daemon", "shell", "terminal", "tui"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
+  "Topic :: System :: Shells",
+  "Topic :: Terminals",
+  "Topic :: Utilities",
+]
+dynamic = ["version"]
+
+[project.urls]
+Documentation = "https://github.com/zrr1999/cue-shell#readme"
+Homepage = "https://github.com/zrr1999/cue-shell"
+Releases = "https://github.com/zrr1999/cue-shell/releases"
+Repository = "https://github.com/zrr1999/cue-shell"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "crates/cue-cli/Cargo.toml"
+strip = true

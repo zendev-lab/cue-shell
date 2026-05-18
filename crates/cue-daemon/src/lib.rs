@@ -1,8 +1,9 @@
-//! cued — background daemon for cue-shell.
+//! cue-daemon — background daemon for cue-shell.
 //!
 //! This crate contains the parser, actor system, and process manager.
 
 pub mod actor;
+pub mod cli;
 pub mod config;
 pub mod dirs;
 pub mod gateway_stdio;

@@ -4,8 +4,8 @@ members = [
   "crates/cue-cli",
   "crates/cue-client",
   "crates/cue-core",
+  "crates/cue-daemon",
   "crates/cue-tui",
-  "crates/cued",
 ]
 
 [workspace.package]
@@ -27,6 +27,7 @@ blake3 = "1"
 bpaf = { version = "0.9", features = ["dull-color"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 crossterm = { version = "0.29", features = ["bracketed-paste", "events"] }
+libc = "0.2"
 owo-colors = "4"
 # TUI
 ratatui = "0.30"

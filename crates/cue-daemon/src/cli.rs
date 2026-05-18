@@ -147,7 +147,7 @@ fn cli() -> bpaf::OptionParser<Cli> {
         .descr("cued — background daemon for cue-shell")
 }
 
-fn main() {
+pub fn run() {
     let parser = cli();
     let args = normalized_cli_args();
     let args = bpaf::Args::from(args.as_slice()).set_name("cued");
@@ -180,9 +180,9 @@ fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<
     if force {
         // When the service manager owns cued, delegate restart to it rather than
         // sending a raw SIGTERM (which would fight launchd/systemd's KeepAlive).
-        if cued::service::is_installed() && socket_override.is_none() {
+        if crate::service::is_installed() && socket_override.is_none() {
             println!("cued: daemon is managed by the service manager — restarting via service");
-            cued::service::restart()?;
+            crate::service::restart()?;
             println!("cued: daemon restarted");
             return Ok(());
         }
@@ -205,7 +205,7 @@ fn run_restart(socket_override: Option<PathBuf>) -> Result<()> {
 fn run_start_background(socket_override: Option<PathBuf>) -> Result<()> {
     let socket_path = socket_override
         .clone()
-        .unwrap_or_else(cued::dirs::socket_path);
+        .unwrap_or_else(crate::dirs::socket_path);
     let current_exe = std::env::current_exe().context("resolve current cued executable")?;
 
     let mut cmd = Command::new(current_exe);
@@ -263,11 +263,11 @@ fn run_start_foreground(socket_override: Option<PathBuf>) -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let pid_path = cued::dirs::pid_path();
-    let socket_path = socket_override.unwrap_or_else(cued::dirs::socket_path);
+    let pid_path = crate::dirs::pid_path();
+    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
 
     // Ensure directories exist.
-    cued::dirs::ensure_dirs().context("create directories")?;
+    crate::dirs::ensure_dirs().context("create directories")?;
 
     // Write PID file.
     std::fs::write(&pid_path, format!("{}", process::id()))
@@ -295,17 +295,17 @@ fn run_start_foreground(socket_override: Option<PathBuf>) -> Result<()> {
 
 async fn async_main(socket_path: PathBuf) -> Result<()> {
     // Load config.
-    let config = cued::config::Config::load().context("load daemon config")?;
+    let config = crate::config::Config::load().context("load daemon config")?;
 
     // Open database.
-    let db_path = cued::dirs::db_path();
-    let scope_db = cued::storage::open_db(&db_path)
+    let db_path = crate::dirs::db_path();
+    let scope_db = crate::storage::open_db(&db_path)
         .with_context(|| format!("open database {}", db_path.display()))?;
-    let scheduler_db = cued::storage::open_db(&db_path)
+    let scheduler_db = crate::storage::open_db(&db_path)
         .with_context(|| format!("open database {}", db_path.display()))?;
 
     // Spawn all actors.
-    let sys = cued::actor::spawn_all(socket_path, scope_db, scheduler_db, config).await?;
+    let sys = crate::actor::spawn_all(socket_path, scope_db, scheduler_db, config).await?;
 
     info!("cued ready — waiting for signals");
 
@@ -336,7 +336,7 @@ fn cleanup(pid_path: &PathBuf, socket_path: &PathBuf) {
 // ── Stop ──
 
 fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
-    let socket_path = socket_override.unwrap_or_else(cued::dirs::socket_path);
+    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let mut stream = tokio::net::UnixStream::connect(&socket_path)
@@ -347,10 +347,10 @@ fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
             id: 0,
             payload: cue_core::ipc::RequestPayload::Shutdown {},
         };
-        cued::actor::gateway::write_message(&mut stream, &msg).await?;
+        crate::actor::gateway::write_message(&mut stream, &msg).await?;
 
         // Read ack.
-        match cued::actor::gateway::read_message(&mut stream).await {
+        match crate::actor::gateway::read_message(&mut stream).await {
             Ok(cue_core::ipc::Message::Response { payload, .. }) => match payload {
                 cue_core::ipc::ResponsePayload::Ok(_) => {
                     println!("cued: shutdown acknowledged");
@@ -372,8 +372,8 @@ fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
 // ── Status ──
 
 fn run_status(socket_override: Option<PathBuf>) -> Result<()> {
-    let pid_path = cued::dirs::pid_path();
-    let socket_path = socket_override.unwrap_or_else(cued::dirs::socket_path);
+    let pid_path = crate::dirs::pid_path();
+    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
 
     // Check PID file.
     if pid_path.exists()
@@ -400,24 +400,24 @@ fn run_status(socket_override: Option<PathBuf>) -> Result<()> {
 fn run_gateway(stdio: bool, socket_override: Option<PathBuf>) -> Result<()> {
     anyhow::ensure!(stdio, "gateway currently supports only --stdio");
 
-    let socket_path = socket_override.unwrap_or_else(cued::dirs::socket_path);
+    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
-    rt.block_on(cued::gateway_stdio::run(socket_path))
+    rt.block_on(crate::gateway_stdio::run(socket_path))
 }
 
 // ── Install / Uninstall / Upgrade ──
 
 fn run_install() -> Result<()> {
     let exe = std::env::current_exe().context("resolve current executable path")?;
-    cued::service::install(&exe)
+    crate::service::install(&exe)
 }
 
 fn run_uninstall() -> Result<()> {
-    cued::service::uninstall()
+    crate::service::uninstall()
 }
 
 fn run_upgrade() -> Result<()> {
-    cued::upgrade::run_upgrade()
+    crate::upgrade::run_upgrade()
 }
 
 // ── Helpers ──
@@ -488,8 +488,8 @@ fn implicit_start_args_only(args: &[OsString]) -> bool {
 
 /// Kill any running daemon and wait for it to exit (used by `--force`).
 fn force_stop_if_running() -> Result<()> {
-    let pid_path = cued::dirs::pid_path();
-    let socket_path = cued::dirs::socket_path();
+    let pid_path = crate::dirs::pid_path();
+    let socket_path = crate::dirs::socket_path();
 
     if !pid_path.exists() {
         return Ok(());
@@ -535,7 +535,7 @@ fn force_stop_if_running() -> Result<()> {
 }
 
 fn ensure_not_running() -> Result<()> {
-    let pid_path = cued::dirs::pid_path();
+    let pid_path = crate::dirs::pid_path();
     if !pid_path.exists() {
         return Ok(());
     }
