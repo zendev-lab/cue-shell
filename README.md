@@ -18,7 +18,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 - **Foreground PTY attach**: `:fg J<n>` proxies a real terminal session with input, paste, and resize support
 - **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
-- **Chain syntax**: `->` serial · `~>` ignore-failure · `||` parallel · `||?` any-success
+- **Chain syntax**: `->` serial · `~>` ignore-failure · `|||` parallel · `|?|` any-success; `&&` / `||` stay inside one job
 - **Daemon durability**: persisted HEAD scope, job history, cron definitions, auto-reconnect TUI
 
 ## Architecture
@@ -113,7 +113,7 @@ mapping:
 
 ```text
 cat _typos.toml |> rg files
-|| cat Cargo.toml |> rg author
+||| cat Cargo.toml |> rg author
 ```
 
 - the submission gets a script id such as `R12`

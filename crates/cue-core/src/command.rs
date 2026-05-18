@@ -77,6 +77,15 @@ impl ModeParams {
             _ => None,
         }
     }
+
+    /// Whether `:run` may apply scope-transform leaves (`cd`, `env set`) to
+    /// the chain scope. Defaults to false when unspecified.
+    pub fn scope(&self) -> Option<bool> {
+        match self.get("scope") {
+            Some(ParamValue::Bool(b)) => Some(*b),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

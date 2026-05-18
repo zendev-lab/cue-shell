@@ -11,7 +11,7 @@ use cue_core::cron::{CronPreset, CronSchedule, parse_day_filter, parse_time_of_d
 use cue_core::mode::Mode;
 use cue_core::pipeline::{self as core_pipeline};
 
-use super::ast::{Argument, Ast, ChainNode, CronScheduleAst, Pipeline, ScriptItemAst};
+use super::ast::{Argument, Ast, ChainNode, CronScheduleAst, JobExpr, Pipeline, ScriptItemAst};
 use super::parse::{ParseError, ParseErrorKind, parse_duration_str};
 use super::token::{Span, Value};
 
@@ -270,7 +270,7 @@ impl Resolver {
 
 fn convert_chain(node: ChainNode) -> core_pipeline::ChainNode {
     match node {
-        ChainNode::Leaf(p) => core_pipeline::ChainNode::Leaf(convert_pipeline(p)),
+        ChainNode::Leaf(expr) => core_pipeline::ChainNode::Leaf(convert_job_expr(expr)),
         ChainNode::Serial { op, left, right } => core_pipeline::ChainNode::Serial {
             left: Box::new(convert_chain(*left)),
             op,
@@ -280,6 +280,20 @@ fn convert_chain(node: ChainNode) -> core_pipeline::ChainNode {
             left: Box::new(convert_chain(*left)),
             op,
             right: Box::new(convert_chain(*right)),
+        },
+    }
+}
+
+fn convert_job_expr(expr: JobExpr) -> core_pipeline::JobPlan {
+    match expr {
+        JobExpr::Pipeline(p) => core_pipeline::JobPlan::Pipeline(convert_pipeline(p)),
+        JobExpr::And { left, right } => core_pipeline::JobPlan::And {
+            left: Box::new(convert_job_expr(*left)),
+            right: Box::new(convert_job_expr(*right)),
+        },
+        JobExpr::Or { left, right } => core_pipeline::JobPlan::Or {
+            left: Box::new(convert_job_expr(*left)),
+            right: Box::new(convert_job_expr(*right)),
         },
     }
 }
@@ -450,20 +464,7 @@ fn format_duration(duration: std::time::Duration) -> String {
 /// Convert a chain AST back to text (for legacy prompt-mode bare input).
 fn chain_to_text(node: &ChainNode) -> String {
     match node {
-        ChainNode::Leaf(p) => p
-            .segments
-            .iter()
-            .map(|s| {
-                let cmd = s.command.join(" ");
-                match s.pipe_to_next {
-                    Some(core_pipeline::PipeOp::Stdout) => format!("{cmd} |>"),
-                    Some(core_pipeline::PipeOp::StdoutStderr) => format!("{cmd} |&>"),
-                    Some(core_pipeline::PipeOp::StderrOnly) => format!("{cmd} |!>"),
-                    None => cmd,
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+        ChainNode::Leaf(expr) => job_expr_to_text(expr),
         ChainNode::Serial { left, op, right } => {
             let op_str = match op {
                 core_pipeline::SerialOp::Then => "->",
@@ -473,12 +474,41 @@ fn chain_to_text(node: &ChainNode) -> String {
         }
         ChainNode::Parallel { left, op, right } => {
             let op_str = match op {
-                core_pipeline::ParallelOp::All => "||",
-                core_pipeline::ParallelOp::Race => "||?",
+                core_pipeline::ParallelOp::All => "|||",
+                core_pipeline::ParallelOp::Race => "|?|",
             };
             format!("{} {op_str} {}", chain_to_text(left), chain_to_text(right))
         }
     }
+}
+
+fn job_expr_to_text(expr: &JobExpr) -> String {
+    match expr {
+        JobExpr::Pipeline(p) => pipeline_to_text(p),
+        JobExpr::And { left, right } => {
+            format!("{} && {}", job_expr_to_text(left), job_expr_to_text(right))
+        }
+        JobExpr::Or { left, right } => {
+            format!("{} || {}", job_expr_to_text(left), job_expr_to_text(right))
+        }
+    }
+}
+
+fn pipeline_to_text(pipeline: &Pipeline) -> String {
+    pipeline
+        .segments
+        .iter()
+        .map(|s| {
+            let cmd = s.command.join(" ");
+            match s.pipe_to_next {
+                Some(core_pipeline::PipeOp::Stdout) => format!("{cmd} |>"),
+                Some(core_pipeline::PipeOp::StdoutStderr) => format!("{cmd} |&>"),
+                Some(core_pipeline::PipeOp::StderrOnly) => format!("{cmd} |!>"),
+                None => cmd,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn resolve_bare_cron(argument: Argument, span: Span) -> Result<ResolvedCommand, ParseError> {
@@ -546,13 +576,20 @@ fn split_bare_cron_chain(
 
 fn leftmost_command_words_mut(node: &mut ChainNode) -> Option<&mut Vec<String>> {
     match node {
-        ChainNode::Leaf(pipeline) => pipeline
-            .segments
-            .first_mut()
-            .map(|segment| &mut segment.command),
+        ChainNode::Leaf(expr) => leftmost_job_expr_words_mut(expr),
         ChainNode::Serial { left, .. } | ChainNode::Parallel { left, .. } => {
             leftmost_command_words_mut(left)
         }
+    }
+}
+
+fn leftmost_job_expr_words_mut(expr: &mut JobExpr) -> Option<&mut Vec<String>> {
+    match expr {
+        JobExpr::Pipeline(pipeline) => pipeline
+            .segments
+            .first_mut()
+            .map(|segment| &mut segment.command),
+        JobExpr::And { left, .. } | JobExpr::Or { left, .. } => leftmost_job_expr_words_mut(left),
     }
 }
 
@@ -714,7 +751,7 @@ fn parse_bare_cron_schedule(
 fn is_mode_help_request(argument: &Argument) -> bool {
     matches!(
         argument,
-        Argument::Chain(ChainNode::Leaf(Pipeline { segments }))
+        Argument::Chain(ChainNode::Leaf(JobExpr::Pipeline(Pipeline { segments })))
             if segments.len() == 1
                 && segments[0].pipe_to_next.is_none()
                 && segments[0].command == ["?"]
@@ -731,6 +768,7 @@ fn mode_help_topic(mode: Mode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use cue_core::command_spec::{COMMAND_SPECS, CommandArgKind};
+    use cue_core::pipeline::JobPlan;
 
     use super::super::parse::Parser as CueParser;
     use super::*;
@@ -738,6 +776,13 @@ mod tests {
     fn resolve(input: &str, mode: Mode) -> ResolvedCommand {
         let ast = CueParser::parse(input).unwrap();
         Resolver::resolve(ast, mode).unwrap()
+    }
+
+    fn leaf_pipeline(chain: core_pipeline::ChainNode) -> core_pipeline::Pipeline {
+        match chain {
+            core_pipeline::ChainNode::Leaf(JobPlan::Pipeline(pipeline)) => pipeline,
+            other => panic!("expected leaf pipeline, got {other:?}"),
+        }
     }
 
     #[test]
@@ -776,18 +821,10 @@ mod tests {
                 assert_eq!(params.retry(), None);
                 match chain {
                     core_pipeline::ChainNode::Serial { left, right, .. } => {
-                        match *left {
-                            core_pipeline::ChainNode::Leaf(pipeline) => {
-                                assert_eq!(pipeline.segments[0].command, vec!["cargo", "test"]);
-                            }
-                            _ => panic!("expected left leaf"),
-                        }
-                        match *right {
-                            core_pipeline::ChainNode::Leaf(pipeline) => {
-                                assert_eq!(pipeline.segments[0].command, vec!["cargo", "clippy"]);
-                            }
-                            _ => panic!("expected right leaf"),
-                        }
+                        let pipeline = leaf_pipeline(*left);
+                        assert_eq!(pipeline.segments[0].command, vec!["cargo", "test"]);
+                        let pipeline = leaf_pipeline(*right);
+                        assert_eq!(pipeline.segments[0].command, vec!["cargo", "clippy"]);
                     }
                     _ => panic!("expected serial chain"),
                 }
@@ -815,12 +852,8 @@ mod tests {
                 schedule: _, chain, ..
             } => {
                 // schedule_text replaced by schedule: CronSchedule; display check removed
-                match chain {
-                    core_pipeline::ChainNode::Leaf(pipeline) => {
-                        assert_eq!(pipeline.segments[0].command, vec!["echo", "hello"]);
-                    }
-                    _ => panic!("expected leaf"),
-                }
+                let pipeline = leaf_pipeline(chain);
+                assert_eq!(pipeline.segments[0].command, vec!["echo", "hello"]);
             }
             _ => panic!("expected Cron"),
         }
@@ -862,12 +895,8 @@ mod tests {
                 schedule, chain, ..
             } => {
                 assert!(matches!(schedule, CronSchedule::Crontab(e) if e == "*/5 * * * *"));
-                match chain {
-                    core_pipeline::ChainNode::Leaf(pipeline) => {
-                        assert_eq!(pipeline.segments[0].command, vec!["curl", "api/health"]);
-                    }
-                    _ => panic!("expected leaf"),
-                }
+                let pipeline = leaf_pipeline(chain);
+                assert_eq!(pipeline.segments[0].command, vec!["curl", "api/health"]);
             }
             _ => panic!("expected Cron"),
         }

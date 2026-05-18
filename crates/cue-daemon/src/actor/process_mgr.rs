@@ -4,7 +4,7 @@
 //! stdout/stderr into a [`RingBuffer`], writes a persistent log file, and
 //! publishes output chunks + state-change events.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::process::Stdio;
@@ -18,6 +18,7 @@ use tracing::{debug, error, info, warn};
 use cue_core::JobId;
 use cue_core::ipc::{EventPayload, Stream as OutputStream};
 use cue_core::job::JobStatus;
+use cue_core::pipeline::JobPlan;
 use cue_core::scope::EnvSnapshot;
 
 use super::{
@@ -81,6 +82,11 @@ enum PipelineReaderMsg {
     Closed,
 }
 
+enum JobLocalBuiltin {
+    Cd { path: String },
+    EnvSet { assignments: Vec<String> },
+}
+
 /// Spawn the ProcessManager actor task.
 pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
     tokio::spawn(async move {
@@ -98,12 +104,12 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     match msg {
                 ProcessMgrMsg::SpawnJob {
                     job_id,
-                    pipeline,
+                    plan,
                     scope_hash,
                     cwd_override,
                     wrapper_enabled,
                 } => {
-                    info!(%job_id, segments = pipeline.segments.len(), %scope_hash, "process_mgr: spawn");
+                    info!(%job_id, plan = %job_plan_to_text(&plan), %scope_hash, "process_mgr: spawn");
 
                     // 1. Query ScopeStore for the environment snapshot.
                     let snapshot = {
@@ -169,28 +175,16 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                     clear_job_logs(job_id).await;
 
-                    let entry = if pipeline.segments.len() > 1 {
-                        spawn_native_pipeline_job(
-                            job_id,
-                            &pipeline,
-                            effective_snapshot.as_ref(),
-                            cwd_override.as_ref(),
-                            sys.clone(),
-                            cleanup_tx.clone(),
-                        )
-                        .await
-                    } else {
-                        spawn_single_pty_job(
-                            job_id,
-                            &pipeline,
-                            effective_snapshot.as_ref(),
-                            cwd_override.as_ref(),
-                            wrapper_enabled,
-                            sys.clone(),
-                            cleanup_tx.clone(),
-                        )
-                        .await
-                    };
+                    let entry = spawn_job_plan(
+                        job_id,
+                        &plan,
+                        effective_snapshot.as_ref(),
+                        cwd_override.as_ref(),
+                        wrapper_enabled,
+                        sys.clone(),
+                        cleanup_tx.clone(),
+                    )
+                    .await;
 
                     match entry {
                         Ok(entry) => {
@@ -533,6 +527,104 @@ fn log_spawn_failure(
     );
 }
 
+fn pipeline_has_job_local_builtin(pipeline: &cue_core::pipeline::Pipeline) -> bool {
+    pipeline.segments.len() == 1
+        && detect_job_local_builtin(&pipeline.segments[0].command).is_some()
+}
+
+fn detect_job_local_builtin(words: &[String]) -> Option<JobLocalBuiltin> {
+    let command = words.first()?.as_str();
+    match command {
+        "cd" => Some(JobLocalBuiltin::Cd {
+            path: words.get(1).cloned().unwrap_or_else(|| "~".into()),
+        }),
+        "env" if words.get(1).map(String::as_str) == Some("set") => Some(JobLocalBuiltin::EnvSet {
+            assignments: words.get(2..).unwrap_or(&[]).to_vec(),
+        }),
+        _ => None,
+    }
+}
+
+fn job_plan_to_text(plan: &JobPlan) -> String {
+    match plan {
+        JobPlan::Pipeline(pipeline) => pipeline_to_text(pipeline),
+        JobPlan::And { left, right } => {
+            format!("{} && {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+        JobPlan::Or { left, right } => {
+            format!("{} || {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+    }
+}
+
+fn pipeline_to_text(pipeline: &cue_core::pipeline::Pipeline) -> String {
+    pipeline
+        .segments
+        .iter()
+        .map(|segment| {
+            let cmd = segment.command.join(" ");
+            match segment.pipe_to_next {
+                Some(cue_core::pipeline::PipeOp::Stdout) => format!("{cmd} |>"),
+                Some(cue_core::pipeline::PipeOp::StdoutStderr) => format!("{cmd} |&>"),
+                Some(cue_core::pipeline::PipeOp::StderrOnly) => format!("{cmd} |!>"),
+                None => cmd,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn spawn_job_plan(
+    job_id: JobId,
+    plan: &JobPlan,
+    snapshot: Option<&EnvSnapshot>,
+    cwd_override: Option<&std::path::PathBuf>,
+    wrapper_enabled: bool,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    match plan {
+        JobPlan::Pipeline(pipeline) if pipeline_has_job_local_builtin(pipeline) => {
+            spawn_logical_job(
+                job_id,
+                plan.clone(),
+                snapshot.cloned(),
+                cwd_override.cloned(),
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+        JobPlan::Pipeline(pipeline) if pipeline.segments.len() == 1 => {
+            spawn_single_pty_job(
+                job_id,
+                pipeline,
+                snapshot,
+                cwd_override,
+                wrapper_enabled,
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+        JobPlan::Pipeline(pipeline) => {
+            spawn_native_pipeline_job(job_id, pipeline, snapshot, cwd_override, sys, cleanup_tx)
+                .await
+        }
+        JobPlan::And { .. } | JobPlan::Or { .. } => {
+            spawn_logical_job(
+                job_id,
+                plan.clone(),
+                snapshot.cloned(),
+                cwd_override.cloned(),
+                sys,
+                cleanup_tx,
+            )
+            .await
+        }
+    }
+}
+
 async fn spawn_single_pty_job(
     job_id: JobId,
     pipeline: &cue_core::pipeline::Pipeline,
@@ -741,6 +833,48 @@ async fn spawn_native_pipeline_job(
         ring_buffer,
         stderr_ring: Some(stderr_ring),
         input,
+        resize: None,
+        fg_owner,
+    })
+}
+
+async fn spawn_logical_job(
+    job_id: JobId,
+    plan: JobPlan,
+    snapshot: Option<EnvSnapshot>,
+    cwd_override: Option<std::path::PathBuf>,
+    sys: ActorSystem,
+    cleanup_tx: mpsc::Sender<JobId>,
+) -> Result<ProcessEntry, ()> {
+    let log_file = open_output_log(job_id).await;
+    let stderr_log = open_stderr_log(job_id).await;
+    let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
+    let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+    let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
+    let fg_owner = Arc::new(Mutex::new(None));
+    let reader_handle = tokio::spawn(logical_job_task(
+        job_id,
+        plan,
+        snapshot,
+        cwd_override,
+        log_file,
+        stderr_log,
+        kill_rx,
+        sys.clone(),
+        ring_buffer.clone(),
+        stderr_ring.clone(),
+        fg_owner.clone(),
+        cleanup_tx.clone(),
+    ));
+
+    Ok(ProcessEntry {
+        job_id,
+        status: JobStatus::Running,
+        _reader_handle: reader_handle,
+        kill_tx,
+        ring_buffer,
+        stderr_ring: Some(stderr_ring),
+        input: None,
         resize: None,
         fg_owner,
     })
@@ -1184,6 +1318,373 @@ async fn pipeline_reader_task(
     }
 
     let _ = cleanup_tx.send(job_id).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn logical_job_task(
+    job_id: JobId,
+    plan: JobPlan,
+    snapshot: Option<EnvSnapshot>,
+    cwd_override: Option<std::path::PathBuf>,
+    log_file: Option<std::fs::File>,
+    stderr_log: Option<std::fs::File>,
+    mut kill_rx: mpsc::Receiver<()>,
+    sys: ActorSystem,
+    ring: Arc<Mutex<RingBuffer>>,
+    stderr_ring: Arc<Mutex<RingBuffer>>,
+    fg_owner: Arc<Mutex<Option<u64>>>,
+    cleanup_tx: mpsc::Sender<JobId>,
+) {
+    let log_file = Arc::new(Mutex::new(log_file));
+    let stderr_log = Arc::new(Mutex::new(stderr_log));
+    let mut was_killed = false;
+    let mut local_snapshot = snapshot.unwrap_or_else(|| EnvSnapshot {
+        env: std::env::vars().collect::<BTreeMap<_, _>>(),
+        cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    });
+    if let Some(cwd) = cwd_override.as_ref() {
+        local_snapshot.cwd = cwd.clone();
+    }
+    let exit_code = run_job_plan_streaming(
+        job_id,
+        &plan,
+        &mut local_snapshot,
+        &mut kill_rx,
+        &mut was_killed,
+        &sys,
+        &ring,
+        &stderr_ring,
+        &log_file,
+        &stderr_log,
+    )
+    .await;
+
+    let _ = sys
+        .event_bus
+        .send(EventBusMsg::Publish {
+            payload: EventPayload::OutputEof {
+                id: job_id.to_string(),
+            },
+            channel: format!("output:{job_id}"),
+        })
+        .await;
+
+    if was_killed {
+        emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+        emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
+        let _ = sys
+            .scheduler
+            .send(SchedulerMsg::JobFinished {
+                job_id,
+                exit_code: -1,
+            })
+            .await;
+    } else {
+        let new_state = if exit_code == 0 {
+            JobStatus::Done
+        } else {
+            JobStatus::Failed
+        };
+        emit_state_change(&sys, job_id, JobStatus::Running, new_state).await;
+        let reason = if exit_code == 0 {
+            "done".to_string()
+        } else {
+            format!("exit {exit_code}")
+        };
+        emit_fg_exit(&sys, &fg_owner, job_id, &reason).await;
+        let _ = sys
+            .scheduler
+            .send(SchedulerMsg::JobFinished { job_id, exit_code })
+            .await;
+    }
+
+    let _ = cleanup_tx.send(job_id).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_job_plan_streaming(
+    job_id: JobId,
+    plan: &JobPlan,
+    snapshot: &mut EnvSnapshot,
+    kill_rx: &mut mpsc::Receiver<()>,
+    was_killed: &mut bool,
+    sys: &ActorSystem,
+    ring: &Arc<Mutex<RingBuffer>>,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    log_file: &Arc<Mutex<Option<std::fs::File>>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+) -> i32 {
+    if *was_killed {
+        return -1;
+    }
+    match plan {
+        JobPlan::Pipeline(pipeline) => {
+            run_pipeline_streaming(
+                job_id,
+                pipeline,
+                snapshot,
+                kill_rx,
+                was_killed,
+                sys,
+                ring,
+                stderr_ring,
+                log_file,
+                stderr_log,
+            )
+            .await
+        }
+        JobPlan::And { left, right } => {
+            let code = Box::pin(run_job_plan_streaming(
+                job_id,
+                left,
+                snapshot,
+                kill_rx,
+                was_killed,
+                sys,
+                ring,
+                stderr_ring,
+                log_file,
+                stderr_log,
+            ))
+            .await;
+            if code == 0 && !*was_killed {
+                Box::pin(run_job_plan_streaming(
+                    job_id,
+                    right,
+                    snapshot,
+                    kill_rx,
+                    was_killed,
+                    sys,
+                    ring,
+                    stderr_ring,
+                    log_file,
+                    stderr_log,
+                ))
+                .await
+            } else {
+                code
+            }
+        }
+        JobPlan::Or { left, right } => {
+            let code = Box::pin(run_job_plan_streaming(
+                job_id,
+                left,
+                snapshot,
+                kill_rx,
+                was_killed,
+                sys,
+                ring,
+                stderr_ring,
+                log_file,
+                stderr_log,
+            ))
+            .await;
+            if code != 0 && !*was_killed {
+                Box::pin(run_job_plan_streaming(
+                    job_id,
+                    right,
+                    snapshot,
+                    kill_rx,
+                    was_killed,
+                    sys,
+                    ring,
+                    stderr_ring,
+                    log_file,
+                    stderr_log,
+                ))
+                .await
+            } else {
+                code
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline_streaming(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: &mut EnvSnapshot,
+    kill_rx: &mut mpsc::Receiver<()>,
+    was_killed: &mut bool,
+    sys: &ActorSystem,
+    ring: &Arc<Mutex<RingBuffer>>,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    log_file: &Arc<Mutex<Option<std::fs::File>>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+) -> i32 {
+    if let Some(code) =
+        run_job_local_builtin(job_id, pipeline, snapshot, stderr_ring, stderr_log).await
+    {
+        return code;
+    }
+
+    let segments = match expand_pipeline_segments(job_id, pipeline, Some(snapshot)) {
+        Ok(segments) => segments,
+        Err(()) => return -1,
+    };
+    let mut spawn = match spawn_native_pipeline(job_id, &segments, Some(snapshot), None) {
+        Ok(spawn) => spawn,
+        Err(()) => return -1,
+    };
+
+    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let mut active_readers = 0usize;
+
+    for stdout in spawn.stdout_sources.drain(..) {
+        active_readers += 1;
+        spawn_pipeline_stream_reader(stdout, PipelineStreamKind::Stdout, chunk_tx.clone());
+    }
+    for stderr in spawn.stderr_sources.drain(..) {
+        active_readers += 1;
+        spawn_pipeline_stream_reader(stderr, PipelineStreamKind::Stderr, chunk_tx.clone());
+    }
+    drop(chunk_tx);
+
+    while active_readers > 0 {
+        tokio::select! {
+            _ = kill_rx.recv(), if !*was_killed => {
+                *was_killed = true;
+                terminate_children(&mut spawn.children).await;
+            }
+            Some(msg) = chunk_rx.recv() => {
+                match msg {
+                    PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stdout, data } => {
+                        ring.lock().unwrap().push(&data);
+                        write_log(log_file, &data).await;
+                        emit_output(sys, job_id, OutputStream::Stdout, &data).await;
+                    }
+                    PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stderr, data } => {
+                        stderr_ring.lock().unwrap().push(&data);
+                        write_log(stderr_log, &data).await;
+                        emit_output(sys, job_id, OutputStream::Stderr, &data).await;
+                    }
+                    PipelineReaderMsg::Closed => {
+                        active_readers = active_readers.saturating_sub(1);
+                    }
+                }
+            }
+            else => break,
+        }
+    }
+
+    if *was_killed {
+        wait_for_children(&mut spawn.children).await;
+        -1
+    } else {
+        tokio::select! {
+            _ = kill_rx.recv() => {
+                *was_killed = true;
+                terminate_children(&mut spawn.children).await;
+                wait_for_children(&mut spawn.children).await;
+                -1
+            }
+            code = wait_for_children(&mut spawn.children) => code,
+        }
+    }
+}
+
+async fn run_job_local_builtin(
+    job_id: JobId,
+    pipeline: &cue_core::pipeline::Pipeline,
+    snapshot: &mut EnvSnapshot,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+) -> Option<i32> {
+    if pipeline.segments.len() != 1 {
+        return None;
+    }
+    let segment = &pipeline.segments[0];
+    if segment.pipe_to_next.is_some() {
+        return None;
+    }
+
+    let expanded = expand_command_line(&segment.command, Some(snapshot));
+    match detect_job_local_builtin(&expanded)? {
+        JobLocalBuiltin::Cd { path } => {
+            if expanded.len() > 2 {
+                write_job_local_stderr(
+                    job_id,
+                    stderr_ring,
+                    stderr_log,
+                    b"cd: too many arguments\n",
+                )
+                .await;
+                return Some(1);
+            }
+            match resolve_job_local_cd_target(snapshot, &path) {
+                Ok(cwd) => {
+                    snapshot.cwd = cwd;
+                    Some(0)
+                }
+                Err(message) => {
+                    let line = format!("{message}\n");
+                    write_job_local_stderr(job_id, stderr_ring, stderr_log, line.as_bytes()).await;
+                    Some(1)
+                }
+            }
+        }
+        JobLocalBuiltin::EnvSet { assignments } => {
+            if assignments.is_empty() {
+                write_job_local_stderr(
+                    job_id,
+                    stderr_ring,
+                    stderr_log,
+                    b"env set: expected KEY=VALUE\n",
+                )
+                .await;
+                return Some(1);
+            }
+            for assignment in assignments {
+                let Some((key, value)) = assignment.split_once('=') else {
+                    let line = format!("env set: expected KEY=VALUE, got `{assignment}`\n");
+                    write_job_local_stderr(job_id, stderr_ring, stderr_log, line.as_bytes()).await;
+                    return Some(1);
+                };
+                if key.is_empty() {
+                    write_job_local_stderr(
+                        job_id,
+                        stderr_ring,
+                        stderr_log,
+                        b"env set: empty variable name\n",
+                    )
+                    .await;
+                    return Some(1);
+                }
+                snapshot.env.insert(key.to_string(), value.to_string());
+            }
+            Some(0)
+        }
+    }
+}
+
+fn resolve_job_local_cd_target(
+    snapshot: &EnvSnapshot,
+    path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let requested = std::path::PathBuf::from(path);
+    let target = if requested.is_absolute() {
+        requested
+    } else {
+        snapshot.cwd.join(requested)
+    };
+    let resolved = std::fs::canonicalize(&target)
+        .map_err(|error| format!("cd: {}: {error}", target.display()))?;
+    if !resolved.is_dir() {
+        return Err(format!("cd: {}: not a directory", resolved.display()));
+    }
+    Ok(resolved)
+}
+
+async fn write_job_local_stderr(
+    job_id: JobId,
+    stderr_ring: &Arc<Mutex<RingBuffer>>,
+    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
+    data: &[u8],
+) {
+    stderr_ring.lock().unwrap().push(data);
+    write_log(stderr_log, data).await;
+    debug!(%job_id, bytes = data.len(), "process_mgr: job-local builtin stderr");
 }
 
 fn spawn_pipeline_stream_reader<R>(

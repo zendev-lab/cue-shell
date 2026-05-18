@@ -55,7 +55,7 @@ pub enum Argument {
 /// Chain AST — tree structure of job-level operations.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChainNode {
-    Leaf(Pipeline),
+    Leaf(JobExpr),
     Serial {
         op: SerialOp,
         left: Box<ChainNode>,
@@ -65,6 +65,21 @@ pub enum ChainNode {
         op: ParallelOp,
         left: Box<ChainNode>,
         right: Box<ChainNode>,
+    },
+}
+
+/// Job-internal expression. This is one cue Job even when it contains
+/// shell-style logical operators.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobExpr {
+    Pipeline(Pipeline),
+    And {
+        left: Box<JobExpr>,
+        right: Box<JobExpr>,
+    },
+    Or {
+        left: Box<JobExpr>,
+        right: Box<JobExpr>,
     },
 }
 
@@ -106,5 +121,11 @@ impl Pipeline {
                 pipe_to_next: None,
             }],
         }
+    }
+}
+
+impl JobExpr {
+    pub fn simple(command: Vec<String>) -> Self {
+        Self::Pipeline(Pipeline::simple(command))
     }
 }

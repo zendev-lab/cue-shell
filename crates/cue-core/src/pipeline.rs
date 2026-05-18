@@ -1,6 +1,20 @@
 use serde::{Deserialize, Serialize};
 
-// ── Pipeline (Job-internal process pipe) ──
+// ── Job-internal execution plan ──
+
+/// A single Job's execution plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobPlan {
+    Pipeline(Pipeline),
+    And {
+        left: Box<JobPlan>,
+        right: Box<JobPlan>,
+    },
+    Or {
+        left: Box<JobPlan>,
+        right: Box<JobPlan>,
+    },
+}
 
 /// A single Job's command, possibly a multi-process pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,10 +47,10 @@ pub enum PipeOp {
 
 /// Tree-shaped AST for chaining multiple Jobs.
 ///
-/// Leaf nodes are Pipelines (each becomes one Job).
+/// Leaf nodes are Job plans (each becomes one Job).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChainNode {
-    Leaf(Pipeline),
+    Leaf(JobPlan),
     Serial {
         left: Box<ChainNode>,
         op: SerialOp,
@@ -61,9 +75,9 @@ pub enum SerialOp {
 /// Parallel chain operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParallelOp {
-    /// `||` — fire all branches simultaneously, wait for all.
+    /// `|||` — fire all branches simultaneously, wait for all.
     All,
-    /// `||?` — fire all branches, succeed when any one succeeds.
+    /// `|?|` — fire all branches, succeed when any one succeeds.
     Race,
 }
 
@@ -85,6 +99,39 @@ impl Pipeline {
                 command,
                 pipe_to_next: None,
             }],
+        }
+    }
+}
+
+impl JobPlan {
+    pub fn simple(command: Vec<String>) -> Self {
+        Self::Pipeline(Pipeline::simple(command))
+    }
+
+    pub fn first_command(&self) -> &[String] {
+        match self {
+            Self::Pipeline(pipeline) => pipeline
+                .segments
+                .first()
+                .map(|segment| segment.command.as_slice())
+                .unwrap_or(&[]),
+            Self::And { left, .. } | Self::Or { left, .. } => left.first_command(),
+        }
+    }
+
+    pub fn pipelines(&self) -> Vec<&Pipeline> {
+        let mut pipelines = Vec::new();
+        self.collect_pipelines(&mut pipelines);
+        pipelines
+    }
+
+    fn collect_pipelines<'a>(&'a self, pipelines: &mut Vec<&'a Pipeline>) {
+        match self {
+            Self::Pipeline(pipeline) => pipelines.push(pipeline),
+            Self::And { left, right } | Self::Or { left, right } => {
+                left.collect_pipelines(pipelines);
+                right.collect_pipelines(pipelines);
+            }
         }
     }
 }
@@ -114,9 +161,9 @@ mod tests {
 
     #[test]
     fn chain_leaf_count() {
-        let a = ChainNode::Leaf(Pipeline::simple(vec!["a".into()]));
-        let b = ChainNode::Leaf(Pipeline::simple(vec!["b".into()]));
-        let c = ChainNode::Leaf(Pipeline::simple(vec!["c".into()]));
+        let a = ChainNode::Leaf(JobPlan::simple(vec!["a".into()]));
+        let b = ChainNode::Leaf(JobPlan::simple(vec!["b".into()]));
+        let c = ChainNode::Leaf(JobPlan::simple(vec!["c".into()]));
         let chain = ChainNode::Serial {
             left: Box::new(a),
             op: SerialOp::Then,

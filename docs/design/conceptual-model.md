@@ -129,7 +129,9 @@ may emit a **JobId**:
 
 - **`A |> B` inside one job**: piping within a single OS-level job (see pipeline
   vs chain in [`core-types.md`](core-types.md)).
-- **Chain operators across jobs** (`->`, `~>`, `||`, `||?`): serial and
+- **Job logical operators** (`&&`, `||`): shell-style short-circuiting inside one
+  JobId.
+- **Chain operators across jobs** (`->`, `~>`, `|||`, `|?|`): serial and
   parallel composition at the **scheduler** layer; see precedence in
   [`README.md`](README.md#operator-model-two-layers).
 
@@ -138,7 +140,7 @@ Useful mnemonics:
 ```
 a -> b    serial on success
 a ~> b    serial, ignore failure of a
-a || b    parallel, both arms
+a ||| b   parallel, both arms
 ```
 
 Exact semantics and parser details: [`parser.md`](parser.md).
@@ -215,7 +217,7 @@ requires a clear notion of env/cwd compatibility.
 ### 6.3 Graph-shaped composition
 
 When two subgraphs funnel into one consumer, the dependency shape is DAG-like.
-That is the natural setting for richer `||?` / race semantics — keep the heavy
+That is the natural setting for richer `|?|` / race semantics — keep the heavy
 DAG runtime (`loom`) separate from cue-shell’s **minimal** chain layer.
 
 ### 6.4 Richer deltas

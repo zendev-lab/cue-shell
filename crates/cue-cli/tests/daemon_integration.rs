@@ -869,6 +869,171 @@ async fn test_chain_execution() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_job_logical_operators_stay_single_job() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("job-logical");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: "false && printf no || printf yes".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected single JobCreated, got {other:?}"),
+        };
+
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+        assert_eq!(status, JobStatus::Done);
+
+        let out_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match out_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                assert_eq!(data.trim(), "yes");
+                assert!(!data.contains("no"));
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_chain_parallel_operator_uses_triple_pipe() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("triple-pipe");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: "printf a ||| printf b".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::ChainCreated { job_ids, .. }) => {
+                assert_eq!(job_ids.len(), 2);
+            }
+            other => panic!("expected ChainCreated for |||, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_job_local_cd_does_not_update_global_scope_by_default() {
+    timeout(TEST_TIMEOUT, async {
+        let env = TestEnv::new("job-local-cd");
+        let job_cwd = env.root.join("job-cwd");
+        std::fs::create_dir_all(&job_cwd).expect("create job cwd");
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: format!("cd {} && pwd", job_cwd.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = match resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+
+        let out_resp = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match out_resp {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                let actual = std::fs::canonicalize(data.trim()).expect("canonicalize job pwd");
+                let expected = std::fs::canonicalize(&job_cwd).expect("canonicalize expected cwd");
+                assert_eq!(actual, expected);
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        let pwd_resp = roundtrip(
+            &mut stream,
+            4,
+            RequestPayload::Eval {
+                input: "pwd".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let pwd_job = match pwd_resp {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 5, &pwd_job).await,
+            JobStatus::Done
+        );
+
+        let pwd_out = roundtrip(
+            &mut stream,
+            6,
+            RequestPayload::Eval {
+                input: format!(":out {pwd_job}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match pwd_out {
+            ResponsePayload::Ok(OkPayload::Output { data, .. }) => {
+                let actual = std::fs::canonicalize(data.trim()).expect("canonicalize global pwd");
+                let expected = std::fs::canonicalize(std::env::current_dir().expect("cwd"))
+                    .expect("canonicalize initial cwd");
+                assert_eq!(actual, expected);
+            }
+            other => panic!("expected Output, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_job_kill() {
     timeout(TEST_TIMEOUT, async {
         let env = TestEnv::new("kill");

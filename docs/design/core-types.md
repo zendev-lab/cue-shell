@@ -175,7 +175,8 @@ pub struct DayFilter {
 
 ```
 Pipeline（|> |&> |!>）= 单个 Job 内部的进程管道
-Chain（-> ~> || ||?）  = Job 之间的编排
+Job logical（&& ||）   = 单个 Job 内部的短路逻辑
+Chain（-> ~> ||| |?|） = Job 之间的编排
 
 合法：a |> b -> c |> d    = Job1(a|>b) -> Job2(c|>d)
 非法：(a -> b) |> c       = chain 不能作为管道输入
@@ -234,8 +235,8 @@ pub enum SerialOp {
 }
 
 pub enum ParallelOp {
-    All,        // ||   全部同时发射
-    Race,       // ||?  任一成功即可
+    All,        // |||  全部同时发射
+    Race,       // |?|  任一成功即可
 }
 
 pub enum ChainStatus {
@@ -253,20 +254,21 @@ pub enum ChainStatus {
 | Pipeline（Job 内） | `\|>` | stdout → stdin | 1（最高） |
 | Pipeline（Job 内） | `\|&>` | stdout+stderr → stdin | 1 |
 | Pipeline（Job 内） | `\|!>` | 仅 stderr → stdin | 1 |
-| Chain（Job 间） | `\|\|` | 并行-全部同时启动 | 2 |
-| Chain（Job 间） | `\|\|?` | 并行-任一成功 | 2 |
-| Chain（Job 间） | `->` | 串行-前者成功才继续 | 3（最低） |
-| Chain（Job 间） | `~>` | 串行-忽略前者结果 | 3 |
+| Job logical（Job 内） | `&&` / `\|\|` | 短路逻辑，同一 JobId | 2 |
+| Chain（Job 间） | `\|\|\|` | 并行-全部同时启动 | 3 |
+| Chain（Job 间） | `\|?\|` | 并行-任一成功 | 3 |
+| Chain（Job 间） | `->` | 串行-前者成功才继续 | 4（最低） |
+| Chain（Job 间） | `~>` | 串行-忽略前者结果 | 4 |
 | 分组 | `()` | 括号显式分组 | — |
 
 ```
 解析示例：
-  a |> b -> c || d ~> e
-= (a |> b) -> (c || d) ~> e
-= Job1(a|>b) -> (Job2(c) || Job3(d)) ~> Job4(e)
+  a |> b -> c ||| d ~> e
+= (a |> b) -> (c ||| d) ~> e
+= Job1(a|>b) -> (Job2(c) ||| Job3(d)) ~> Job4(e)
 
-  cargo build |> grep error -> cargo test || cargo clippy
-= Job1(cargo build |> grep error) -> (Job2(cargo test) || Job3(cargo clippy))
+  cargo build |> grep error -> cargo test ||| cargo clippy
+= Job1(cargo build |> grep error) -> (Job2(cargo test) ||| Job3(cargo clippy))
 ```
 
 ### 退出码聚合

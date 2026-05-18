@@ -262,7 +262,7 @@ Dagger 的核心抽象是**不可变、内容寻址的容器状态链**，与 Cu
 ### 6.3 分布式任务队列（参考价值）
 
 - **asynq (Go)**：Redis 后端，优先级队列/重试/死信/去重
-- **machinery (Go)**：Chain/Group/Chord 原语 → 直接对应 Cue Shell 的 `→`/`||`
+- **machinery (Go)**：Chain/Group/Chord 原语 → 直接对应 Cue Shell 的 `->`/`|||`
 
 ### 6.4 调度命令命名对比
 

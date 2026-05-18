@@ -19,6 +19,12 @@ pub struct Tokenizer<'a> {
     in_mode_params: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorBoundary {
+    Any,
+    WhitespaceRequired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TokenClass {
     Command,
@@ -166,16 +172,32 @@ impl<'a> Tokenizer<'a> {
                 Token::GroupClose
             }
 
-            b'-' if self.peek_at(1) == Some(b'>') => {
+            b'-' if self.peek_at(1) == Some(b'>')
+                && self.operator_has_required_whitespace(start, 2) =>
+            {
                 self.pos += 2;
                 self.last_significant = Some(TokenClass::Other);
                 Token::SerialThen
             }
+            b'-' if self.peek_at(1) == Some(b'>') => {
+                return Err(self.missing_operator_whitespace_error(start, "->", 2));
+            }
 
-            b'~' if self.peek_at(1) == Some(b'>') => {
+            b'~' if self.peek_at(1) == Some(b'>')
+                && self.operator_has_required_whitespace(start, 2) =>
+            {
                 self.pos += 2;
                 self.last_significant = Some(TokenClass::Other);
                 Token::SerialAlways
+            }
+            b'~' if self.peek_at(1) == Some(b'>') => {
+                return Err(self.missing_operator_whitespace_error(start, "~>", 2));
+            }
+
+            b'&' if self.peek_at(1) == Some(b'&') => {
+                self.pos += 2;
+                self.last_significant = Some(TokenClass::Other);
+                Token::JobAnd
             }
 
             b'|' => self.tokenize_pipe_or_parallel()?,
@@ -219,6 +241,7 @@ impl<'a> Tokenizer<'a> {
 
     fn tokenize_pipe_or_parallel(&mut self) -> Result<Token, TokenizeError> {
         // Current char is `|`
+        let start = self.pos;
         self.pos += 1;
 
         match self.peek() {
@@ -237,16 +260,28 @@ impl<'a> Tokenizer<'a> {
                 self.last_significant = Some(TokenClass::Other);
                 Ok(Token::PipeStderr)
             }
-            Some(b'|') => {
-                self.pos += 1;
-                if self.peek() == Some(b'?') {
-                    self.pos += 1;
+            Some(b'|') if self.peek_at(1) == Some(b'|') => {
+                if self.operator_has_required_whitespace(start, 3) {
+                    self.pos += 2;
+                    self.last_significant = Some(TokenClass::Other);
+                    Ok(Token::ParallelAll)
+                } else {
+                    Err(self.missing_operator_whitespace_error(start, "|||", 3))
+                }
+            }
+            Some(b'?') if self.peek_at(1) == Some(b'|') => {
+                if self.operator_has_required_whitespace(start, 3) {
+                    self.pos += 2;
                     self.last_significant = Some(TokenClass::Other);
                     Ok(Token::ParallelRace)
                 } else {
-                    self.last_significant = Some(TokenClass::Other);
-                    Ok(Token::ParallelAll)
+                    Err(self.missing_operator_whitespace_error(start, "|?|", 3))
                 }
+            }
+            Some(b'|') => {
+                self.pos += 1;
+                self.last_significant = Some(TokenClass::Other);
+                Ok(Token::JobOr)
             }
             _ => {
                 // Bare `|` — treat as word for now (could be error)
@@ -307,7 +342,16 @@ impl<'a> Tokenizer<'a> {
                 && (self.bytes[self.pos] == b'=' || self.bytes[self.pos] == b','))
         {
             // Stop before any cue-shell operator (longest-match-first).
-            if starts_with_operator(self.bytes, self.pos).is_some() {
+            if let Some((token, boundary)) = starts_with_operator(self.bytes, self.pos) {
+                if boundary == OperatorBoundary::WhitespaceRequired
+                    && !self.operator_has_required_whitespace(
+                        self.pos,
+                        operator_len(self.bytes, self.pos),
+                    )
+                {
+                    let op = token.operator_text();
+                    return Err(self.missing_operator_whitespace_error(self.pos, op, op.len()));
+                }
                 break;
             }
             self.pos += 1;
@@ -340,6 +384,27 @@ impl<'a> Tokenizer<'a> {
             b'C' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Cron),
             b'S' if self.peek_at(1).is_some_and(|b| b.is_ascii_digit()) => Some(IdKind::Scope),
             _ => None,
+        }
+    }
+
+    fn operator_has_required_whitespace(&self, start: usize, len: usize) -> bool {
+        is_operator_boundary_before(self.bytes, start)
+            && is_operator_boundary_after(self.bytes, start + len)
+    }
+
+    fn missing_operator_whitespace_error(
+        &self,
+        start: usize,
+        operator: &str,
+        len: usize,
+    ) -> TokenizeError {
+        let end = (start + len).min(self.bytes.len());
+        TokenizeError {
+            pos: start,
+            message: format!(
+                "cue chain operator `{operator}` must be surrounded by whitespace; quote it to pass it as an argument (saw `{}`)",
+                self.slice(start, end)
+            ),
         }
     }
 
@@ -414,35 +479,69 @@ impl<'a> Tokenizer<'a> {
 }
 
 /// Check whether `bytes[pos..]` starts with a cue-shell operator.
-/// Operators are checked longest-match-first so `||?` is not split into `||` + `?`.
-fn starts_with_operator(bytes: &[u8], pos: usize) -> Option<Token> {
+/// Operators are checked longest-match-first so longer operators are not split.
+fn starts_with_operator(bytes: &[u8], pos: usize) -> Option<(Token, OperatorBoundary)> {
     let tail = &bytes[pos..];
     if tail.len() < 2 {
         return None;
     }
     // longest match first
     if tail.starts_with(b"|&>") {
-        return Some(Token::PipeAll);
+        return Some((Token::PipeAll, OperatorBoundary::Any));
     }
     if tail.starts_with(b"|!>") {
-        return Some(Token::PipeStderr);
+        return Some((Token::PipeStderr, OperatorBoundary::Any));
     }
-    if tail.len() >= 3 && tail.starts_with(b"||?") {
-        return Some(Token::ParallelRace);
+    if tail.starts_with(b"|||") {
+        return Some((Token::ParallelAll, OperatorBoundary::WhitespaceRequired));
+    }
+    if tail.starts_with(b"|?|") {
+        return Some((Token::ParallelRace, OperatorBoundary::WhitespaceRequired));
     }
     if tail.starts_with(b"->") {
-        return Some(Token::SerialThen);
+        return Some((Token::SerialThen, OperatorBoundary::WhitespaceRequired));
     }
     if tail.starts_with(b"~>") {
-        return Some(Token::SerialAlways);
+        return Some((Token::SerialAlways, OperatorBoundary::WhitespaceRequired));
     }
     if tail.starts_with(b"|>") {
-        return Some(Token::PipeStdout);
+        return Some((Token::PipeStdout, OperatorBoundary::Any));
+    }
+    if tail.starts_with(b"&&") {
+        return Some((Token::JobAnd, OperatorBoundary::Any));
     }
     if tail.starts_with(b"||") {
-        return Some(Token::ParallelAll);
+        return Some((Token::JobOr, OperatorBoundary::Any));
     }
     None
+}
+
+fn operator_len(bytes: &[u8], pos: usize) -> usize {
+    let tail = &bytes[pos..];
+    for op in [
+        b"|&>".as_slice(),
+        b"|!>",
+        b"|||",
+        b"|?|",
+        b"->",
+        b"~>",
+        b"|>",
+        b"&&",
+        b"||",
+    ] {
+        if tail.starts_with(op) {
+            return op.len();
+        }
+    }
+    0
+}
+
+fn is_operator_boundary_before(bytes: &[u8], start: usize) -> bool {
+    start == 0 || matches!(bytes[start - 1], b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn is_operator_boundary_after(bytes: &[u8], end: usize) -> bool {
+    end >= bytes.len() || matches!(bytes[end], b' ' | b'\t' | b'\n' | b'\r')
 }
 
 fn is_ident_char(b: u8) -> bool {
@@ -566,7 +665,7 @@ mod tests {
 
     #[test]
     fn chain_operators() {
-        let toks = tokens("a -> b ~> c || d ||? e");
+        let toks = tokens("a -> b ~> c ||| d |?| e");
         assert_eq!(
             toks,
             vec![
@@ -631,7 +730,7 @@ mod tests {
 
     #[test]
     fn grouping_parens() {
-        let toks = tokens("(a -> b) || c");
+        let toks = tokens("(a -> b) ||| c");
         assert_eq!(
             toks,
             vec![
@@ -715,7 +814,7 @@ mod tests {
 
     #[test]
     fn complex_chain_with_pipes() {
-        let toks = tokens("cargo build |> grep error -> cargo test || cargo clippy");
+        let toks = tokens("cargo build |> grep error -> cargo test ||| cargo clippy");
         assert_eq!(
             toks,
             vec![
@@ -772,41 +871,78 @@ mod tests {
         );
     }
 
-    /// `->` and `~>` work without whitespace on either side.
+    /// Cue chain operators require whitespace when unquoted.
     #[test]
-    fn chain_operators_no_whitespace() {
+    fn chain_operators_without_whitespace_error() {
+        for input in [
+            "a-> b",
+            "a ->b",
+            "a~> b",
+            "a ~>b",
+            "a||| b",
+            "a |||b",
+            "a|?| b",
+            "a |?|b",
+            "cmd -A-> cmd2",
+        ] {
+            let err = Tokenizer::tokenize(input).unwrap_err();
+            assert!(
+                err.message.contains("must be surrounded by whitespace"),
+                "unexpected error for {input}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_operators_allow_newline_boundaries() {
+        let cases: &[(&str, Token)] = &[
+            ("a\n->\nb", Token::SerialThen),
+            ("a\n~>\nb", Token::SerialAlways),
+            ("a\n|||\nb", Token::ParallelAll),
+            ("a\n|?|\nb", Token::ParallelRace),
+        ];
+        for (input, expected_op) in cases {
+            let toks = tokens(input);
+            assert_eq!(
+                toks,
+                vec![
+                    Token::Word("a".into()),
+                    Token::Newline,
+                    expected_op.clone(),
+                    Token::Newline,
+                    Token::Word("b".into()),
+                    Token::Eof,
+                ],
+                "failed for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_chain_operators_are_words_without_whitespace() {
+        let toks = tokens("echo 'a->b' \"c~>d\" 'e|||f' \"g|?|h\"");
         assert_eq!(
-            tokens("cmd -A-> cmd2"),
+            toks,
             vec![
-                Token::Word("cmd".into()),
-                Token::Word("-A".into()),
-                Token::SerialThen,
-                Token::Word("cmd2".into()),
-                Token::Eof,
-            ]
-        );
-        assert_eq!(
-            tokens("cmd1 ->cmd2"),
-            vec![
-                Token::Word("cmd1".into()),
-                Token::SerialThen,
-                Token::Word("cmd2".into()),
+                Token::Word("echo".into()),
+                Token::Word("a->b".into()),
+                Token::Word("c~>d".into()),
+                Token::Word("e|||f".into()),
+                Token::Word("g|?|h".into()),
                 Token::Eof,
             ]
         );
     }
 
-    /// All 7 operators recognized without whitespace (longest-match-first).
+    /// Job and pipe operators still work without extra whitespace.
     #[test]
     fn all_operators_inside_words() {
         let cases: &[(&str, Token)] = &[
-            ("a->b", Token::SerialThen),
-            ("a~>b", Token::SerialAlways),
             ("a|>b", Token::PipeStdout),
             ("a|&>b", Token::PipeAll),
             ("a|!>b", Token::PipeStderr),
-            ("a||b", Token::ParallelAll),
-            ("a||?b", Token::ParallelRace),
+            ("a&&b", Token::JobAnd),
+            ("a||b", Token::JobOr),
         ];
         for (input, expected_op) in cases {
             let toks = tokens(input);

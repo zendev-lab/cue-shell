@@ -29,10 +29,14 @@ pub enum Token {
     SerialThen,
     /// `~>` serial-always.
     SerialAlways,
-    /// `||` parallel-all.
+    /// `|||` parallel-all.
     ParallelAll,
-    /// `||?` parallel-race.
+    /// `|?|` parallel-race.
     ParallelRace,
+    /// `&&` job-internal AND.
+    JobAnd,
+    /// `||` job-internal OR.
+    JobOr,
 
     // Pipe operators (process-level, within a job)
     /// `|>` stdout pipe.
@@ -122,8 +126,10 @@ impl fmt::Display for Token {
             Self::Comma => f.write_str(","),
             Self::SerialThen => f.write_str("->"),
             Self::SerialAlways => f.write_str("~>"),
-            Self::ParallelAll => f.write_str("||"),
-            Self::ParallelRace => f.write_str("||?"),
+            Self::ParallelAll => f.write_str("|||"),
+            Self::ParallelRace => f.write_str("|?|"),
+            Self::JobAnd => f.write_str("&&"),
+            Self::JobOr => f.write_str("||"),
             Self::PipeStdout => f.write_str("|>"),
             Self::PipeAll => f.write_str("|&>"),
             Self::PipeStderr => f.write_str("|!>"),
@@ -132,6 +138,23 @@ impl fmt::Display for Token {
             Self::Whitespace(s) => write!(f, "{s}"),
             Self::Newline => f.write_str("\\n"),
             Self::Eof => f.write_str("<EOF>"),
+        }
+    }
+}
+
+impl Token {
+    pub fn operator_text(&self) -> &'static str {
+        match self {
+            Self::SerialThen => "->",
+            Self::SerialAlways => "~>",
+            Self::ParallelAll => "|||",
+            Self::ParallelRace => "|?|",
+            Self::JobAnd => "&&",
+            Self::JobOr => "||",
+            Self::PipeStdout => "|>",
+            Self::PipeAll => "|&>",
+            Self::PipeStderr => "|!>",
+            _ => "",
         }
     }
 }

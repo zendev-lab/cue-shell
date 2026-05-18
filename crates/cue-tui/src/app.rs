@@ -2848,7 +2848,7 @@ fn decorate_submission_output(warnings: &[String], body: String) -> String {
 }
 
 fn operator_spacing_warnings(input: &str) -> Vec<String> {
-    const OPERATORS: [&str; 7] = ["|&>", "|!>", "||?", "->", "~>", "||", "|>"];
+    const OPERATORS: [&str; 4] = ["|||", "|?|", "->", "~>"];
 
     let mut warnings = Vec::new();
     let mut pos = 0;
@@ -3352,7 +3352,7 @@ fn shell_segment_completion_candidates(line_prefix: &str, word: &str) -> Vec<Str
 }
 
 fn is_chain_operator(token: &str) -> bool {
-    matches!(token, "->" | "~>" | "||" | "||?" | "|>" | "|&>" | "|!>")
+    matches!(token, "->" | "~>" | "|||" | "|?|")
 }
 
 fn command_completion_candidates(prefix: &str) -> Vec<String> {

@@ -114,7 +114,7 @@ fn token_spans(input: &str) -> Vec<(usize, usize)> {
 /// git = ["--no-verify", "--force"]
 ///
 /// [block.warn_commands]
-/// cd = "Use `cwd` parameter or `cd /path -> cmd` chain syntax instead"
+/// rm = "Careful: this removes files"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct BlockConfig {
@@ -130,11 +130,7 @@ impl Default for BlockConfig {
     fn default() -> Self {
         let mut commands = BTreeMap::new();
         commands.insert("git".into(), vec!["--no-verify".into()]);
-        let mut warn_commands = BTreeMap::new();
-        warn_commands.insert(
-            "cd".into(),
-            "Use `cwd` parameter or `cd /path -> cmd` chain syntax instead".into(),
-        );
+        let warn_commands = BTreeMap::new();
         Self {
             commands,
             warn_commands,
@@ -179,13 +175,10 @@ pub enum BlockDecision {
     Warn(String),
 }
 
-/// Bash compatibility transform configuration.
+/// Deprecated bash compatibility transform configuration.
 ///
-/// When enabled, `&&` is translated to cue-shell's `->` (serial on success).
-/// Other bash operators (`||`, `|`) intentionally stay as cue-shell native
-/// operators to avoid semantic conflicts:
-/// - `||` = cue-shell parallel-all (bash "or" is cue-shell's `~>`)
-/// - `|>` / `|&>` / `|!>` = cue-shell pipe operators
+/// `&&` and `||` are now first-class job-local operators, so this option is
+/// kept only for config compatibility and intentionally performs no rewrite.
 ///
 /// ```toml
 /// [bash_compat]
@@ -199,42 +192,10 @@ pub struct BashCompatConfig {
 
 impl BashCompatConfig {
     /// Apply bash compatibility transformations to the input string.
-    /// Replaces bash-style operators with cue-shell equivalents.
     pub fn apply(&self, input: &str) -> String {
-        if !self.enabled {
-            return input.to_string();
-        }
-        bash_compat_transform(input)
+        let _ = self.enabled;
+        input.to_string()
     }
-}
-
-/// Pre-tokenization transform: `&&` → cue-shell's `->`.
-fn bash_compat_transform(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut result = String::with_capacity(input.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        // `&&` → `->` (only when at word boundary: whitespace before and after)
-        if i + 1 < bytes.len()
-            && bytes[i] == b'&'
-            && bytes[i + 1] == b'&'
-            && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t')
-            && (i + 2 >= bytes.len()
-                || bytes[i + 2] == b' '
-                || bytes[i + 2] == b'\t'
-                || bytes[i + 2] == b'\n')
-        {
-            result.push_str("->");
-            i += 2;
-            continue;
-        }
-
-        result.push(bytes[i] as char);
-        i += 1;
-    }
-
-    result
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -587,6 +548,12 @@ socket_path = "/var/run/weft.sock"
         assert_eq!(config.weft.socket_path, PathBuf::from("/var/run/weft.sock"));
     }
 
+    #[test]
+    fn bash_compat_no_longer_rewrites_job_logical_operators() {
+        let compat = BashCompatConfig { enabled: true };
+        assert_eq!(compat.apply("a && b || c"), "a && b || c");
+    }
+
     // ── WrapperConfig ──
 
     #[test]
@@ -691,6 +658,7 @@ pip = "uv pip"
                 .is_some()
         );
         assert!(config.block.check(&["git".into(), "push".into()]).is_none());
+        assert!(config.block.check(&["cd".into(), "/tmp".into()]).is_none());
     }
 
     #[test]

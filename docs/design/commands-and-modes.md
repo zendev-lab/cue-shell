@@ -109,7 +109,7 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ```text
 cat _typos.toml |> rg files
-|| cat Cargo.toml |> rg author
+||| cat Cargo.toml |> rg author
 ```
 
 - JOB 模式下，多行输入默认视为一次 script 提交；显式 `:run` 也可承载同样的多行 body
@@ -313,20 +313,21 @@ pipe (1, 最高) > parallel (2) > serial (3, 最低)
 ### 解析示例
 
 ```
-a |> b -> c || d ~> e
-= (a |> b) -> (c || d) ~> e
-= Job1(a|>b) -> (Job2(c) || Job3(d)) ~> Job4(e)
+a |> b -> c ||| d ~> e
+= (a |> b) -> (c ||| d) ~> e
+= Job1(a|>b) -> (Job2(c) ||| Job3(d)) ~> Job4(e)
 
-cargo build |> grep error -> cargo test || cargo clippy
-= Job1(cargo build |> grep error) -> (Job2(cargo test) || Job3(cargo clippy))
+cargo build |> grep error -> cargo test ||| cargo clippy
+= Job1(cargo build |> grep error) -> (Job2(cargo test) ||| Job3(cargo clippy))
 ```
 
 ### 关键语义
 
 - Pipeline (`|>`) = **Job 内部**，共享同一 scope
-- Chain (`->` `||`) = **Job 之间**，Scheduler 调度
+- Job logical (`&&` `||`) = **单个 Job 内部**，同一个 JobId
+- Chain (`->` `|||` `|?|`) = **Job 之间**，Scheduler 调度
 - `(a -> b) |> c` **非法** — chain 输出不能作为管道输入
-- `()` 在 chain 层面用于分组：`(a || b) -> c`
+- `()` 在 chain 层面用于分组：`(a ||| b) -> c`
 
 ### Exit code 聚合
 

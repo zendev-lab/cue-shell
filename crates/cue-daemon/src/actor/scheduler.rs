@@ -79,6 +79,8 @@ struct ChainState {
     pipeline_text: String,
     /// Explicit working directory override for all jobs in this chain.
     cwd_override: Option<std::path::PathBuf>,
+    /// Whether scope-transform leaves may derive a new scope for later leaves.
+    scope_enabled: bool,
     /// Whether the wrapper binary is enabled for this chain's jobs.
     wrapper_enabled: bool,
 }
@@ -87,8 +89,8 @@ struct ChainState {
 struct FlatLeaf {
     /// Index in the DFS-order leaf list.
     index: usize,
-    /// Full pipeline (may be multi-segment with pipe operators).
-    pipeline: cue_core::pipeline::Pipeline,
+    /// Full job plan.
+    plan: cue_core::pipeline::JobPlan,
     /// Human-readable pipeline text.
     pipeline_text: String,
 }
@@ -96,11 +98,7 @@ struct FlatLeaf {
 impl FlatLeaf {
     /// First segment's command words (for scope-transform detection and open hint).
     fn command(&self) -> &[String] {
-        self.pipeline
-            .segments
-            .first()
-            .map(|s| s.command.as_slice())
-            .unwrap_or(&[])
+        self.plan.first_command()
     }
 }
 
@@ -133,6 +131,8 @@ struct CronEntry {
     next_trigger: Instant,
     /// Explicit working directory override for jobs spawned by this cron.
     cwd_override: Option<std::path::PathBuf>,
+    /// Whether scope-transform leaves may derive a new scope for later leaves.
+    scope_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -464,6 +464,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 status,
                 scope_hash: cron.scope_hash,
                 cwd_override: cron.cwd_override.clone(),
+                scope_enabled: cron.scope_enabled,
                 age_secs: cron.age_secs,
             };
             if let Err(e) =
@@ -493,6 +494,7 @@ async fn restore_crons(db: &storage::SharedConnection, state: &mut SchedulerStat
                 status,
                 next_trigger,
                 cwd_override: cron.cwd_override,
+                scope_enabled: cron.scope_enabled,
             },
         );
     }
@@ -599,6 +601,7 @@ fn persist_cron_entry(db: &storage::SharedConnection, entry: &CronEntry) {
             status: entry.status,
             scope_hash: Some(entry.scope_hash),
             cwd_override: entry.cwd_override.clone(),
+            scope_enabled: entry.scope_enabled,
             age_secs: 0,
         },
     );
@@ -672,12 +675,12 @@ fn flatten_leaves(node: &ChainNode) -> Vec<FlatLeaf> {
 
 fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
     match node {
-        ChainNode::Leaf(pipeline) => {
+        ChainNode::Leaf(plan) => {
             let idx = out.len();
-            let pipeline_text = pipeline_to_text(pipeline);
+            let pipeline_text = job_plan_to_text(plan);
             out.push(FlatLeaf {
                 index: idx,
-                pipeline: pipeline.clone(),
+                plan: plan.clone(),
                 pipeline_text,
             });
         }
@@ -706,10 +709,22 @@ fn pipeline_to_text(pipeline: &cue_core::pipeline::Pipeline) -> String {
         .join(" ")
 }
 
+fn job_plan_to_text(plan: &cue_core::pipeline::JobPlan) -> String {
+    match plan {
+        cue_core::pipeline::JobPlan::Pipeline(pipeline) => pipeline_to_text(pipeline),
+        cue_core::pipeline::JobPlan::And { left, right } => {
+            format!("{} && {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+        cue_core::pipeline::JobPlan::Or { left, right } => {
+            format!("{} || {}", job_plan_to_text(left), job_plan_to_text(right))
+        }
+    }
+}
+
 /// Convert a full `ChainNode` to text.
 fn chain_to_text(node: &ChainNode) -> String {
     match node {
-        ChainNode::Leaf(p) => pipeline_to_text(p),
+        ChainNode::Leaf(plan) => job_plan_to_text(plan),
         ChainNode::Serial { left, op, right } => {
             let op_str = match op {
                 SerialOp::Then => "->",
@@ -719,8 +734,8 @@ fn chain_to_text(node: &ChainNode) -> String {
         }
         ChainNode::Parallel { left, op, right } => {
             let op_str = match op {
-                ParallelOp::All => "||",
-                ParallelOp::Race => "||?",
+                ParallelOp::All => "|||",
+                ParallelOp::Race => "|?|",
             };
             format!("{} {op_str} {}", chain_to_text(left), chain_to_text(right))
         }
@@ -1451,9 +1466,29 @@ fn scope_transform_from_pipeline(
     Ok(found)
 }
 
+fn scope_transform_from_job_plan(
+    plan: &cue_core::pipeline::JobPlan,
+) -> Result<Option<ScopeTransform>, String> {
+    match plan {
+        cue_core::pipeline::JobPlan::Pipeline(pipeline) => scope_transform_from_pipeline(pipeline),
+        cue_core::pipeline::JobPlan::And { left, right }
+        | cue_core::pipeline::JobPlan::Or { left, right } => {
+            let left_transform = scope_transform_from_job_plan(left)?;
+            let right_transform = scope_transform_from_job_plan(right)?;
+            if left_transform.is_some() || right_transform.is_some() {
+                return Err(
+                    "scope-transform steps are not supported inside job-local &&/|| expressions yet"
+                        .into(),
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn subtree_contains_scope_transform(node: &ChainNode) -> Result<bool, String> {
     match node {
-        ChainNode::Leaf(pipeline) => Ok(scope_transform_from_pipeline(pipeline)?.is_some()),
+        ChainNode::Leaf(plan) => Ok(scope_transform_from_job_plan(plan)?.is_some()),
         ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
             Ok(subtree_contains_scope_transform(left)? || subtree_contains_scope_transform(right)?)
         }
@@ -1462,8 +1497,8 @@ fn subtree_contains_scope_transform(node: &ChainNode) -> Result<bool, String> {
 
 fn validate_scope_transform_support(node: &ChainNode) -> Result<(), String> {
     match node {
-        ChainNode::Leaf(pipeline) => {
-            let _ = scope_transform_from_pipeline(pipeline)?;
+        ChainNode::Leaf(plan) => {
+            let _ = scope_transform_from_job_plan(plan)?;
             Ok(())
         }
         ChainNode::Serial { left, right, .. } => {
@@ -1627,6 +1662,15 @@ fn classify_job_open_hint(pipeline: &cue_core::pipeline::Pipeline) -> JobOpenHin
         JobOpenHint::Fg
     } else {
         JobOpenHint::Stream
+    }
+}
+
+fn classify_job_plan_open_hint(plan: &cue_core::pipeline::JobPlan) -> JobOpenHint {
+    match plan {
+        cue_core::pipeline::JobPlan::Pipeline(pipeline) => classify_job_open_hint(pipeline),
+        cue_core::pipeline::JobPlan::And { .. } | cue_core::pipeline::JobPlan::Or { .. } => {
+            JobOpenHint::Stream
+        }
     }
 }
 
@@ -1819,6 +1863,7 @@ async fn fire_due_crons(
         let schedule = entry.schedule.clone();
         let is_oneshot = schedule.is_oneshot();
         let cwd_override = entry.cwd_override.clone();
+        let scope_enabled = entry.scope_enabled;
 
         info!(%cron_id, "scheduler: cron triggered");
 
@@ -1830,6 +1875,7 @@ async fn fire_due_crons(
             0,
             0,
             cwd_override,
+            scope_enabled,
             wrapper_enabled,
             0,
             None,
@@ -1878,9 +1924,11 @@ async fn fire_due_crons(
 fn check_chain_blocked(chain: &ChainNode, config: &Config) -> Option<BlockDecision> {
     let leaves = flatten_leaves(chain);
     for leaf in &leaves {
-        for segment in &leaf.pipeline.segments {
-            if let Some(decision) = config.block.check(&segment.command) {
-                return Some(decision);
+        for pipeline in leaf.plan.pipelines() {
+            for segment in &pipeline.segments {
+                if let Some(decision) = config.block.check(&segment.command) {
+                    return Some(decision);
+                }
             }
         }
     }
@@ -1895,6 +1943,7 @@ async fn spawn_chain(
     _client_id: u64,
     _request_id: u32,
     cwd_override: Option<std::path::PathBuf>,
+    scope_enabled: bool,
     wrapper_enabled: bool,
     retry_max: u32,
     retry_delay: Option<std::time::Duration>,
@@ -1902,7 +1951,7 @@ async fn spawn_chain(
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
 ) -> ResponsePayload {
-    if let Err(message) = validate_scope_transform_support(&chain) {
+    if scope_enabled && let Err(message) = validate_scope_transform_support(&chain) {
         return ResponsePayload::err(error_code::INVALID_SYNTAX, message);
     }
 
@@ -1911,7 +1960,7 @@ async fn spawn_chain(
     if leaves.len() == 1 {
         let leaf = &leaves[0];
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(&leaf.pipeline);
+        let open_hint = classify_job_plan_open_hint(&leaf.plan);
 
         state.jobs.insert(
             jid,
@@ -1931,7 +1980,10 @@ async fn spawn_chain(
 
         publish_job_created(sys, state, jid, &leaf.pipeline_text, scope_hash, open_hint).await;
 
-        match scope_transform_from_command(leaf.command()) {
+        match scope_enabled
+            .then(|| scope_transform_from_command(leaf.command()))
+            .transpose()
+        {
             Ok(Some(_)) => {
                 info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: applying single scope-transform job");
                 match apply_scope_transform(sys, scope_hash, leaf.command()).await {
@@ -1974,7 +2026,7 @@ async fn spawn_chain(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        pipeline: leaf.pipeline.clone(),
+                        plan: leaf.plan.clone(),
                         scope_hash,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
@@ -2028,6 +2080,7 @@ async fn spawn_chain(
         scope_hash,
         pipeline_text: chain_text,
         cwd_override: cwd_override.clone(),
+        scope_enabled,
         wrapper_enabled,
     };
     state.chains.insert(chain_id, chain_state);
@@ -2119,11 +2172,15 @@ async fn process_chain_advance(
 ) -> Vec<JobId> {
     cancel_chain_leaves(chain_id, to_cancel, state, db, sys).await;
 
-    let (leaves, wrapper_enabled) = {
+    let (leaves, wrapper_enabled, scope_enabled) = {
         let Some(chain) = state.chains.get(&chain_id) else {
             return Vec::new();
         };
-        (flatten_leaves(&chain.node), chain.wrapper_enabled)
+        (
+            flatten_leaves(&chain.node),
+            chain.wrapper_enabled,
+            chain.scope_enabled,
+        )
     };
 
     let mut queue: VecDeque<(usize, ScopeHash)> = newly_ready.into();
@@ -2131,7 +2188,7 @@ async fn process_chain_advance(
 
     while let Some((idx, start_scope)) = queue.pop_front() {
         let jid = state.alloc_job();
-        let open_hint = classify_job_open_hint(&leaves[idx].pipeline);
+        let open_hint = classify_job_plan_open_hint(&leaves[idx].plan);
         if captured.len() < capture_first {
             captured.push(jid);
         }
@@ -2171,7 +2228,10 @@ async fn process_chain_advance(
         )
         .await;
 
-        match scope_transform_from_command(leaves[idx].command()) {
+        match scope_enabled
+            .then(|| scope_transform_from_command(leaves[idx].command()))
+            .transpose()
+        {
             Ok(Some(_)) => {
                 match apply_scope_transform(sys, start_scope, leaves[idx].command()).await {
                     Ok(end_scope) => {
@@ -2220,7 +2280,7 @@ async fn process_chain_advance(
                     .process_mgr
                     .send(ProcessMgrMsg::SpawnJob {
                         job_id: jid,
-                        pipeline: leaves[idx].pipeline.clone(),
+                        plan: leaves[idx].plan.clone(),
                         scope_hash: start_scope,
                         cwd_override: cwd_override.clone(),
                         wrapper_enabled,
@@ -2381,6 +2441,7 @@ async fn handle_command(
                 };
             }
             let cwd_override = params.cwd();
+            let scope_enabled = params.scope().unwrap_or(false);
             let wrapper_enabled = state.wrapper_enabled(config);
             let retry_max = params.retry().unwrap_or(0);
             let retry_delay = params.retry_delay();
@@ -2390,6 +2451,7 @@ async fn handle_command(
                 0,
                 0,
                 cwd_override,
+                scope_enabled,
                 wrapper_enabled,
                 retry_max,
                 retry_delay,
@@ -2429,6 +2491,7 @@ async fn handle_command(
                 status: CronStatus::Scheduled,
                 next_trigger,
                 cwd_override: params.cwd(),
+                scope_enabled: params.scope().unwrap_or(false),
             };
             persist_cron_entry(db, &entry);
             state.crons.insert(cron_id, entry);
@@ -2952,6 +3015,7 @@ async fn handle_command(
                 0,
                 0,
                 None,
+                false,
                 wrapper_enabled,
                 0,
                 None,
@@ -3309,7 +3373,7 @@ fn job_help_text() -> String {
             "Examples:\n",
             "- `cargo test`\n",
             "- `git status -> cargo test`\n",
-            "- `cargo test || cargo clippy`\n",
+            "- `cargo test ||| cargo clippy`\n",
             "\n",
             "Useful builtins:\n",
             "{}"
@@ -3647,19 +3711,19 @@ async fn read_stderr_from_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cue_core::pipeline::{PipeSegment, Pipeline};
+    use cue_core::pipeline::{JobPlan, PipeSegment, Pipeline};
     use std::path::Path;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
     /// Helper: build a simple leaf from a command string.
     fn leaf(cmd: &str) -> ChainNode {
-        ChainNode::Leaf(Pipeline {
+        ChainNode::Leaf(JobPlan::Pipeline(Pipeline {
             segments: vec![PipeSegment {
                 command: cmd.split_whitespace().map(String::from).collect(),
                 pipe_to_next: None,
             }],
-        })
+        }))
     }
 
     type TestActorSystem = (
@@ -3719,6 +3783,14 @@ mod tests {
                                 cwd: std::env::current_dir().expect("current dir"),
                             }),
                         }));
+                    }
+                    ScopeStoreMsg::Derive { base, delta, reply } => {
+                        let snapshot = cue_core::scope::EnvSnapshot {
+                            env: std::collections::BTreeMap::new(),
+                            cwd: std::env::current_dir().expect("current dir"),
+                        };
+                        let child = cue_core::scope::Scope::fork(base, &snapshot, delta);
+                        let _ = reply.send(Ok(child.hash));
                     }
                     ScopeStoreMsg::Shutdown => break,
                     _ => {}
@@ -3785,6 +3857,7 @@ mod tests {
             1,
             None,
             false,
+            false,
             0,
             None,
             &mut state,
@@ -3829,6 +3902,7 @@ mod tests {
             1,
             None,
             false,
+            false,
             0,
             None,
             &mut state,
@@ -3871,6 +3945,7 @@ mod tests {
             1,
             None,
             false,
+            false,
             0,
             None,
             &mut state,
@@ -3908,6 +3983,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             false,
             0,
             None,
@@ -3947,6 +4023,7 @@ mod tests {
             1,
             None,
             false,
+            false,
             0,
             None,
             &mut state,
@@ -3956,6 +4033,74 @@ mod tests {
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(spawned.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn single_scope_transform_defaults_to_regular_job() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut state = SchedulerState::new();
+        let resp = spawn_chain(
+            leaf("cd ."),
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            false,
+            false,
+            0,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(spawned.len(), 1);
+        let entry = state.jobs.get(&spawned[0]).expect("job entry");
+        assert_eq!(entry.status, JobStatus::Running);
+        assert_eq!(entry.end_scope, None);
+    }
+
+    #[tokio::test]
+    async fn single_scope_transform_requires_scope_param() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut state = SchedulerState::new();
+        let resp = spawn_chain(
+            leaf("cd ."),
+            ScopeHash([0; 32]),
+            1,
+            1,
+            None,
+            true,
+            false,
+            0,
+            None,
+            &mut state,
+            &conn,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert!(spawned.is_empty());
+        let entry = state.jobs.get(&JobId(1)).expect("job entry");
+        assert_eq!(entry.status, JobStatus::Done);
+        assert!(entry.end_scope.is_some());
     }
 
     #[tokio::test]
@@ -4049,6 +4194,7 @@ mod tests {
             1,
             None,
             false,
+            false,
             0,
             None,
             &mut state,
@@ -4131,6 +4277,7 @@ mod tests {
                 status: CronStatus::Scheduled,
                 scope_hash: Some(ScopeHash([5; 32])),
                 cwd_override: Some(std::path::PathBuf::from("/tmp/cue-cron-cwd")),
+                scope_enabled: true,
                 age_secs: 0,
             },
         )
@@ -4149,6 +4296,7 @@ mod tests {
             state.crons[&CronId(4)].cwd_override.as_deref(),
             Some(std::path::Path::new("/tmp/cue-cron-cwd"))
         );
+        assert!(state.crons[&CronId(4)].scope_enabled);
     }
 
     #[test]
@@ -4164,6 +4312,7 @@ mod tests {
                 status: CronStatus::Scheduled,
                 scope_hash: Some(ScopeHash([8; 32])),
                 cwd_override: None,
+                scope_enabled: false,
                 age_secs: 0,
             },
         )
@@ -4204,6 +4353,7 @@ mod tests {
             1,
             None,
             false,
+            false,
             0,
             None,
             &mut state,
@@ -4242,6 +4392,7 @@ mod tests {
             1,
             None,
             false,
+            false,
             0,
             None,
             &mut state,
@@ -4276,6 +4427,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             false,
             0,
             None,
@@ -4330,6 +4482,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             false,
             0,
             None,
@@ -4477,7 +4630,7 @@ mod tests {
 
     // ── FIX 1 test: Race + Serial — cancelled leaf must not be re-spawned ──
 
-    /// `(a -> b) ||? c` — when `c` succeeds, Race should cancel both `a`/`b`.
+    /// `(a -> b) |?| c` — when `c` succeeds, Race should cancel both `a`/`b`.
     /// When `a` also succeeds, `b` should NOT be spawned because it was cancelled.
     #[tokio::test]
     async fn race_serial_cancelled_leaf_not_respawned() {
@@ -4486,7 +4639,7 @@ mod tests {
 
         let conn = test_db();
         let mut state = SchedulerState::new();
-        // (a -> b) ||? c
+        // (a -> b) |?| c
         // Leaves: 0=a, 1=b, 2=c
         let chain = ChainNode::Parallel {
             left: Box::new(ChainNode::Serial {
@@ -4504,6 +4657,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             false,
             0,
             None,
@@ -4544,7 +4698,7 @@ mod tests {
 
     // ── FIX 3 test: Race waits for entire branch, not single leaf ──
 
-    /// `(compile -> test) ||? lint`
+    /// `(compile -> test) |?| lint`
     /// When `compile` succeeds but `test` hasn't run yet, Race should NOT fire.
     #[tokio::test]
     async fn race_does_not_fire_on_partial_branch_success() {
@@ -4553,7 +4707,7 @@ mod tests {
 
         let conn = test_db();
         let mut state = SchedulerState::new();
-        // (compile -> test) ||? lint
+        // (compile -> test) |?| lint
         // Leaves: 0=compile, 1=test, 2=lint
         let chain = ChainNode::Parallel {
             left: Box::new(ChainNode::Serial {
@@ -4571,6 +4725,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             false,
             0,
             None,
@@ -4622,6 +4777,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             false,
             0,
             None,
@@ -4677,6 +4833,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             false,
             0,
             None,

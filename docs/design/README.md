@@ -52,12 +52,13 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 
 ```
 Pipeline (within a Job):  |>   |&>   |!>
-Chain (between Jobs):     ->   ~>    ||   ||?
+Job logical (one Job):     &&   ||
+Chain (between Jobs):     ->   ~>    |||  |?|
 ```
 
-Priority: pipe (1) > parallel (2) > serial (3).
+Priority: pipe (1) > job logical (2) > chain parallel (3) > chain serial (4).
 
-`a |> b -> c || d ~> e` parses as `Job1(a|>b) -> (Job2(c) || Job3(d)) ~> Job4(e)`.
+`a |> b -> c ||| d ~> e` parses as `Job1(a|>b) -> (Job2(c) ||| Job3(d)) ~> Job4(e)`.
 
 ## Modes
 

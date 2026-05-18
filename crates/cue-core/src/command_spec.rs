@@ -71,6 +71,11 @@ pub const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
         value_hint: "true",
         detail: "Override the runtime wrapper for this invocation",
     },
+    ModeParamSpec {
+        name: "scope",
+        value_hint: "true",
+        detail: "Allow run jobs to update the chain scope",
+    },
 ];
 
 pub const COMMAND_SPECS: &[CommandSpec] = &[

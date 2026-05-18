@@ -580,6 +580,8 @@ fn highlight_input(input: &str) -> Vec<HighlightSpan> {
                     | Token::SerialAlways
                     | Token::ParallelAll
                     | Token::ParallelRace
+                    | Token::JobAnd
+                    | Token::JobOr
                     | Token::PipeStdout
                     | Token::PipeAll
                     | Token::PipeStderr => HighlightKind::Operator,
