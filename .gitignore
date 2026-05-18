@@ -18,6 +18,7 @@
 .vscode/
 .cursor/
 *.iml
+.pi-lens/
 
 # Coverage
 lcov.info
