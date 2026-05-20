@@ -114,6 +114,7 @@ struct JobRow {
     start_scope: Option<String>,
     end_scope: Option<String>,
     open_hint: JobOpenHint,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1492,6 +1493,7 @@ impl AppState {
         status: JobStatus,
         start_scope: Option<String>,
         open_hint: JobOpenHint,
+        warnings: Vec<String>,
     ) {
         if let Some(job) = self.jobs.iter_mut().find(|job| job.id == id) {
             if !label.is_empty() {
@@ -1502,6 +1504,9 @@ impl AppState {
                 job.start_scope = start_scope;
             }
             job.open_hint = open_hint;
+            if !warnings.is_empty() {
+                job.warnings = warnings;
+            }
             return;
         }
 
@@ -1512,6 +1517,7 @@ impl AppState {
             start_scope,
             end_scope: None,
             open_hint,
+            warnings,
         });
     }
 
@@ -1534,6 +1540,7 @@ impl AppState {
                 start_scope: None,
                 end_scope,
                 open_hint: JobOpenHint::Stream,
+                warnings: Vec::new(),
             });
             self.refresh_cron_trigger_card(id);
         }
@@ -1566,6 +1573,7 @@ impl AppState {
                 &job.status,
                 job.start_scope.as_deref(),
                 job.end_scope.as_deref(),
+                &job.warnings,
             ),
         );
         self.main_view
@@ -1598,6 +1606,7 @@ impl AppState {
                 start_scope: job.start_scope,
                 end_scope: job.end_scope,
                 open_hint: job.open_hint,
+                warnings: Vec::new(),
             })
             .collect();
     }
@@ -2021,6 +2030,7 @@ impl AppState {
                                             JobStatus::Running,
                                             start_scope.clone(),
                                             *open_hint,
+                                            Vec::new(),
                                         );
                                         sidebar_dirty = true;
                                     }
@@ -2035,6 +2045,7 @@ impl AppState {
                                                     job.status.clone(),
                                                     job.start_scope.clone(),
                                                     *open_hint,
+                                                    Vec::new(),
                                                 );
                                                 sidebar_dirty = true;
                                             }
@@ -2073,6 +2084,7 @@ impl AppState {
                             job_id,
                             start_scope,
                             open_hint,
+                            warnings,
                             ..
                         } => {
                             let label = pending
@@ -2085,6 +2097,7 @@ impl AppState {
                                 JobStatus::Running,
                                 start_scope,
                                 open_hint,
+                                warnings.clone(),
                             );
                             self.sync_sidebar_items();
                             if let Some(pending) = pending.as_ref()
@@ -2108,13 +2121,18 @@ impl AppState {
                             chain_id,
                             job_ids,
                             chain,
+                            warnings,
                         } => {
                             if let Some(pending) = pending.as_ref()
                                 && !pending.silent
                             {
+                                let body = decorate_submission_output(
+                                    &warnings,
+                                    format!("{}: {}", chain_id, job_ids.join(", ")),
+                                );
                                 let card_index = self.show_submission_result(
                                     pending,
-                                    format!("{}: {}", chain_id, job_ids.join(", ")),
+                                    body,
                                     CardStatus::Success,
                                     Some(chain_id.clone()),
                                 );
@@ -2306,6 +2324,7 @@ impl AppState {
                         JobStatus::Running,
                         start_scope,
                         open_hint,
+                        Vec::new(),
                     );
                     // Annotate the chain card with a step label when a new chain job starts.
                     if let (Some(cid), Some(idx), Some(total)) =
@@ -3090,6 +3109,7 @@ fn format_cron_trigger_record(
                 &job.status,
                 job.start_scope.as_deref(),
                 job.end_scope.as_deref(),
+                &job.warnings,
             ));
         }
         None => {
@@ -3223,11 +3243,15 @@ fn format_job_record(
     status: &JobStatus,
     start_scope: Option<&str>,
     end_scope: Option<&str>,
+    warnings: &[String],
 ) -> String {
-    let mut lines = vec![
-        job_id.to_string(),
-        format!("status: {}", format_job_status(status)),
-    ];
+    let mut lines = Vec::new();
+    lines.extend(warnings.iter().cloned());
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.push(job_id.to_string());
+    lines.push(format!("status: {}", format_job_status(status)));
     if let Some(start_scope) = start_scope {
         lines.push(format!("start scope: {start_scope}"));
     }
@@ -3601,6 +3625,7 @@ mod tests {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 
@@ -3629,6 +3654,7 @@ mod tests {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 
@@ -3659,6 +3685,7 @@ mod tests {
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
         state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
@@ -3699,6 +3726,7 @@ mod tests {
             start_scope: None,
             end_scope: None,
             open_hint: JobOpenHint::Stream,
+            warnings: Vec::new(),
         });
 
         state.activate_sidebar_row(0);
@@ -3717,6 +3745,7 @@ mod tests {
             start_scope: None,
             end_scope: None,
             open_hint: JobOpenHint::Fg,
+            warnings: Vec::new(),
         });
 
         state.activate_sidebar_row(0);
@@ -3891,6 +3920,7 @@ mod tests {
                 start_scope: None,
                 end_scope: None,
                 open_hint: JobOpenHint::Stream,
+                warnings: Vec::new(),
             },
             JobRow {
                 id: "J2".into(),
@@ -3899,6 +3929,7 @@ mod tests {
                 start_scope: None,
                 end_scope: None,
                 open_hint: JobOpenHint::Stream,
+                warnings: Vec::new(),
             },
         ];
 
@@ -4844,6 +4875,7 @@ destination = "devbox"
                     total_jobs: 1,
                     jobs: vec![],
                 },
+                warnings: Vec::new(),
             }),
         });
 
@@ -4920,6 +4952,7 @@ destination = "devbox"
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 
@@ -4952,6 +4985,7 @@ destination = "devbox"
                 chain_id: None,
                 chain_index: None,
                 chain_total: None,
+                warnings: Vec::new(),
             }),
         });
 

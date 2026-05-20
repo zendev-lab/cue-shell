@@ -93,11 +93,15 @@ pub enum OkPayload {
         chain_id: Option<String>,
         chain_index: Option<usize>,
         chain_total: Option<usize>,
+        #[serde(default)]
+        warnings: Vec<String>,
     },
     ChainCreated {
         chain_id: String,
         job_ids: Vec<String>,
         chain: ChainInfo,
+        #[serde(default)]
+        warnings: Vec<String>,
     },
     CronAdded {
         cron_id: String,

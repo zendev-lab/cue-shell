@@ -121,7 +121,7 @@ pub struct BlockConfig {
     /// Map from command name → list of forbidden argument substrings.
     #[serde(default)]
     pub commands: BTreeMap<String, Vec<String>>,
-    /// Map from command name → warning hint (requires user approval).
+    /// Map from command name → advisory warning hint.
     #[serde(default)]
     pub warn_commands: BTreeMap<String, String>,
 }
@@ -141,7 +141,7 @@ impl Default for BlockConfig {
 impl BlockConfig {
     /// Check whether `command_line` is blocked.  Returns `None` if allowed,
     /// `Some(BlockDecision::Block(reason))` if blocked,
-    /// `Some(BlockDecision::Warn(hint))` if the command needs approval.
+    /// `Some(BlockDecision::Warn(hint))` if the command should warn before running.
     pub fn check(&self, command_line: &[String]) -> Option<BlockDecision> {
         let cmd_name = command_line.first()?;
         let base = std::path::Path::new(cmd_name)
@@ -552,6 +552,15 @@ socket_path = "/var/run/weft.sock"
     fn bash_compat_no_longer_rewrites_job_logical_operators() {
         let compat = BashCompatConfig { enabled: true };
         assert_eq!(compat.apply("a && b || c"), "a && b || c");
+    }
+
+    #[test]
+    fn bash_compat_preserves_utf8_input() {
+        let compat = BashCompatConfig { enabled: true };
+        assert_eq!(
+            compat.apply("echo café/路径 && pwd"),
+            "echo café/路径 && pwd"
+        );
     }
 
     // ── WrapperConfig ──

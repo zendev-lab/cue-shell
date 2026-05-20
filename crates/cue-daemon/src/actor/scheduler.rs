@@ -1885,6 +1885,7 @@ async fn fire_due_crons(
             state,
             db,
             sys,
+            Vec::new(),
         )
         .await;
         let first_job_id = match &response {
@@ -1923,19 +1924,23 @@ async fn fire_due_crons(
 
 // ── Spawn chain / single job ────────────────────────────────────────────────
 
-/// Check whether any pipeline in the chain contains blocked or warned command patterns.
-fn check_chain_blocked(chain: &ChainNode, config: &Config) -> Option<BlockDecision> {
+/// Check whether any pipeline in the chain contains blocked command patterns.
+/// Warn-only rules are returned as advisory messages and do not prevent execution.
+fn check_chain_guardrails(chain: &ChainNode, config: &Config) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
     let leaves = flatten_leaves(chain);
     for leaf in &leaves {
         for pipeline in leaf.plan.pipelines() {
             for segment in &pipeline.segments {
-                if let Some(decision) = config.block.check(&segment.command) {
-                    return Some(decision);
+                match config.block.check(&segment.command) {
+                    Some(BlockDecision::Block(reason)) => return Err(reason),
+                    Some(BlockDecision::Warn(hint)) => warnings.push(hint),
+                    None => {}
                 }
             }
         }
     }
-    None
+    Ok(warnings)
 }
 
 /// Spawn a chain (or a single job) from a `ChainNode`, returning the response payload.
@@ -1954,6 +1959,7 @@ async fn spawn_chain(
     state: &mut SchedulerState,
     db: &Arc<Mutex<Connection>>,
     sys: &ActorSystem,
+    warnings: Vec<String>,
 ) -> ResponsePayload {
     if scope_enabled && let Err(message) = validate_scope_transform_support(&chain) {
         return ResponsePayload::err(error_code::INVALID_SYNTAX, message);
@@ -2063,6 +2069,7 @@ async fn spawn_chain(
             chain_id: None,
             chain_index: None,
             chain_total: None,
+            warnings,
         });
     }
 
@@ -2111,6 +2118,7 @@ async fn spawn_chain(
         chain_id: chain_id.to_string(),
         job_ids: spawned_job_ids.iter().map(|j| j.to_string()).collect(),
         chain: build_chain_info(state, chain_id).expect("chain info after creation"),
+        warnings,
     })
 }
 
@@ -2439,15 +2447,10 @@ async fn handle_command(
                 Ok(h) => h,
                 Err(resp) => return resp,
             };
-            // Check block rules before executing.
-            if let Some(decision) = check_chain_blocked(&chain, config) {
-                return match decision {
-                    BlockDecision::Block(reason) => {
-                        ResponsePayload::err(error_code::BLOCKED, reason)
-                    }
-                    BlockDecision::Warn(hint) => ResponsePayload::err(error_code::WARNED, hint),
-                };
-            }
+            let warnings = match check_chain_guardrails(&chain, config) {
+                Ok(warnings) => warnings,
+                Err(reason) => return ResponsePayload::err(error_code::BLOCKED, reason),
+            };
             let cwd_override = params.cwd();
             let scope_enabled = params.scope().unwrap_or(false);
             let wrapper_enabled = state.wrapper_enabled(config);
@@ -2468,6 +2471,7 @@ async fn handle_command(
                 state,
                 db,
                 sys,
+                warnings,
             )
             .await
         }
@@ -3033,6 +3037,7 @@ async fn handle_command(
                 state,
                 db,
                 sys,
+                Vec::new(),
             )
             .await
         }
@@ -3089,6 +3094,7 @@ fn script_item_result_from_ok(payload: &OkPayload) -> ScriptItemResult {
             chain_id,
             job_ids,
             chain,
+            ..
         } => ScriptItemResult::Chain {
             chain_id: chain_id.clone(),
             job_ids: job_ids.clone(),
@@ -3875,6 +3881,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
 
@@ -3921,6 +3928,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -3965,6 +3973,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4005,6 +4014,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4045,6 +4055,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4072,6 +4083,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         assert!(matches!(
@@ -4107,6 +4119,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         assert!(matches!(
@@ -4119,6 +4132,47 @@ mod tests {
         let entry = state.jobs.get(&JobId(1)).expect("job entry");
         assert_eq!(entry.status, JobStatus::Done);
         assert!(entry.end_scope.is_some());
+    }
+
+    #[tokio::test]
+    async fn warned_run_commands_still_execute() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut config = Config::default();
+        config
+            .block
+            .warn_commands
+            .insert("cd".into(), "review before changing directory".into());
+        let mut state = SchedulerState::new();
+        let chain = ChainNode::Serial {
+            left: Box::new(leaf("cd /tmp")),
+            op: SerialOp::Then,
+            right: Box::new(leaf("pwd")),
+        };
+
+        let resp = handle_command(
+            ResolvedCommand::Run {
+                chain,
+                params: cue_core::command::ModeParams::new(),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+
+        match resp {
+            ResponsePayload::Ok(OkPayload::ChainCreated { warnings, .. }) => {
+                assert_eq!(warnings, vec!["review before changing directory"]);
+            }
+            other => panic!("expected warned chain to execute, got {other:?}"),
+        }
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(spawned.len(), 1);
     }
 
     #[tokio::test]
@@ -4219,6 +4273,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         assert!(matches!(
@@ -4379,6 +4434,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         // Single leaf → JobCreated, not ChainCreated.
@@ -4419,6 +4475,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let chain = match resp {
@@ -4456,6 +4513,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let job_id = match resp {
@@ -4512,6 +4570,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let job_id = match resp {
@@ -4688,6 +4747,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4757,6 +4817,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4810,6 +4871,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -4867,6 +4929,7 @@ mod tests {
             &mut state,
             &conn,
             &sys,
+            Vec::new(),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;

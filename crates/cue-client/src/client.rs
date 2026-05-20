@@ -554,6 +554,7 @@ mod tests {
                         chain_id: None,
                         chain_index: None,
                         chain_total: None,
+                        warnings: Vec::new(),
                     }),
                 },
             )

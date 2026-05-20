@@ -250,6 +250,28 @@ where
     }
 }
 
+/// Send a request and return the matching response plus any messages observed before it.
+async fn roundtrip_with_messages<S>(
+    stream: &mut S,
+    id: u32,
+    payload: RequestPayload,
+) -> (ResponsePayload, Vec<Message>)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send(stream, &request(id, payload)).await;
+    let mut observed = Vec::new();
+    loop {
+        let msg = recv(stream).await;
+        match msg {
+            Message::Response {
+                id: rid, payload, ..
+            } if rid == id => return (payload, observed),
+            other => observed.push(other),
+        }
+    }
+}
+
 /// Poll `:jobs` until `job_id` reaches a terminal state.
 async fn wait_for_job_terminal<S>(stream: &mut S, mut request_id: u32, job_id: &str) -> JobStatus
 where
@@ -1179,21 +1201,33 @@ async fn test_fg_attach_input_and_detach() {
             "expected FgOutput containing tty echo, got {msgs:?}"
         );
 
-        let detach_resp = roundtrip(&mut stream, 4, RequestPayload::FgDetach {}).await;
+        let (detach_resp, mut msgs) =
+            roundtrip_with_messages(&mut stream, 4, RequestPayload::FgDetach {}).await;
         assert!(
             matches!(detach_resp, ResponsePayload::Ok(OkPayload::Ack {})),
             "expected Ack for fg detach, got {detach_resp:?}"
         );
 
-        let msgs = collect_until(&mut stream, Duration::from_secs(5), |msg| {
+        if !msgs.iter().any(|msg| {
             matches!(
                 msg,
                 Message::Event {
                     payload: EventPayload::FgExited { id, reason },
                 } if id == &job_id && reason == "detached"
             )
-        })
-        .await;
+        }) {
+            msgs.extend(
+                collect_until(&mut stream, Duration::from_secs(5), |msg| {
+                    matches!(
+                        msg,
+                        Message::Event {
+                            payload: EventPayload::FgExited { id, reason },
+                        } if id == &job_id && reason == "detached"
+                    )
+                })
+                .await,
+            );
+        }
         assert!(
             msgs.iter().any(|msg| matches!(
                 msg,
