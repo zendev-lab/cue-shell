@@ -65,6 +65,39 @@ pub enum RequestPayload {
         input: String,
     },
 
+    // Typed query/control APIs for non-interactive clients.
+    ListJobs {
+        limit: Option<usize>,
+    },
+    ListCrons {
+        limit: Option<usize>,
+    },
+    ListScopes {
+        limit: Option<usize>,
+    },
+    ShowLog {
+        id: Option<String>,
+        limit: Option<usize>,
+        tail_bytes: Option<usize>,
+    },
+    JobOutput {
+        id: String,
+        stdout_bytes: Option<usize>,
+        stderr_bytes: Option<usize>,
+    },
+    KillJob {
+        id: String,
+    },
+    RemoveCron {
+        id: String,
+    },
+    ShowEnv {
+        tail_bytes: Option<usize>,
+    },
+    ShowConfig {
+        tail_bytes: Option<usize>,
+    },
+
     // System
     Ping {},
     Shutdown {},
@@ -114,17 +147,39 @@ pub enum OkPayload {
 
     JobInfo(JobInfo),
     JobList(Vec<JobInfo>),
+    JobListPage {
+        jobs: Vec<JobInfo>,
+        page: PageInfo,
+    },
     CronList(Vec<CronInfo>),
+    CronListPage {
+        crons: Vec<CronInfo>,
+        page: PageInfo,
+    },
     ScopeInfo(ScopeInfo),
     ScopeList(Vec<ScopeInfo>),
+    ScopeListPage {
+        scopes: Vec<ScopeInfo>,
+        page: PageInfo,
+    },
     Output {
         id: String,
         data: String,
         truncated: bool,
     },
+    JobOutput {
+        id: String,
+        stdout: StreamText,
+        stderr: StreamText,
+        stderr_pty_merged: bool,
+    },
 
     EvalText {
         text: String,
+    },
+    TextOutput {
+        text: String,
+        truncated: bool,
     },
 
     CompletionList {
@@ -243,6 +298,20 @@ pub enum JobOpenHint {
 }
 
 // ── Info structs (shared by Response and queries) ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageInfo {
+    pub total: usize,
+    pub shown: usize,
+    pub limit: Option<usize>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamText {
+    pub data: String,
+    pub truncated: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
@@ -506,6 +575,61 @@ mod tests {
             ResponsePayload::ack(),
             ResponsePayload::Ok(OkPayload::Ack {})
         ));
+    }
+
+    #[test]
+    fn typed_query_payloads_roundtrip() {
+        let msg = Message::Request {
+            id: 7,
+            payload: RequestPayload::ShowLog {
+                id: Some("J1".into()),
+                limit: Some(20),
+                tail_bytes: Some(4096),
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Message::Request {
+                payload:
+                    RequestPayload::ShowLog {
+                        id,
+                        limit,
+                        tail_bytes,
+                    },
+                ..
+            } => {
+                assert_eq!(id.as_deref(), Some("J1"));
+                assert_eq!(limit, Some(20));
+                assert_eq!(tail_bytes, Some(4096));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn rich_output_payloads_roundtrip() {
+        let payload = ResponsePayload::Ok(OkPayload::JobOutput {
+            id: "J1".into(),
+            stdout: StreamText {
+                data: "out".into(),
+                truncated: false,
+            },
+            stderr: StreamText {
+                data: "err".into(),
+                truncated: true,
+            },
+            stderr_pty_merged: false,
+        });
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded: ResponsePayload = serde_json::from_str(&json).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::JobOutput { stderr, .. }) => {
+                assert_eq!(stderr.data, "err");
+                assert!(stderr.truncated);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

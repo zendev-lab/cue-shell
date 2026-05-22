@@ -309,7 +309,7 @@ async fn route_request(
                                 request_id,
                                 payload: ResponsePayload::err(
                                     error_code::INVALID_SYNTAX,
-                                    e.to_string(),
+                                    syntax_error_message(&input, &e.to_string()),
                                 ),
                             })
                             .await
@@ -323,13 +323,128 @@ async fn route_request(
                             request_id,
                             payload: ResponsePayload::err(
                                 error_code::INVALID_SYNTAX,
-                                e.to_string(),
+                                syntax_error_message(&input, &e.to_string()),
                             ),
                         })
                         .await
                         .context("send error response")?;
                 }
             }
+        }
+
+        RequestPayload::ListJobs { limit } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ListJobs { limit },
+                })
+                .await
+                .context("send list jobs to scheduler")?;
+        }
+
+        RequestPayload::ListCrons { limit } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ListCrons { limit },
+                })
+                .await
+                .context("send list crons to scheduler")?;
+        }
+
+        RequestPayload::ListScopes { limit } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ListScopes { limit },
+                })
+                .await
+                .context("send list scopes to scheduler")?;
+        }
+
+        RequestPayload::ShowLog {
+            id,
+            limit,
+            tail_bytes,
+        } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ShowLog {
+                        id,
+                        limit,
+                        tail_bytes,
+                    },
+                })
+                .await
+                .context("send show log to scheduler")?;
+        }
+
+        RequestPayload::JobOutput {
+            id,
+            stdout_bytes,
+            stderr_bytes,
+        } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::JobOutput {
+                        id,
+                        stdout_bytes,
+                        stderr_bytes,
+                    },
+                })
+                .await
+                .context("send job output to scheduler")?;
+        }
+
+        RequestPayload::KillJob { id } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::KillJob { id },
+                })
+                .await
+                .context("send kill job to scheduler")?;
+        }
+
+        RequestPayload::RemoveCron { id } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::RemoveCron { id },
+                })
+                .await
+                .context("send remove cron to scheduler")?;
+        }
+
+        RequestPayload::ShowEnv { tail_bytes } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ShowEnv { tail_bytes },
+                })
+                .await
+                .context("send show env to scheduler")?;
+        }
+
+        RequestPayload::ShowConfig { tail_bytes } => {
+            sys.scheduler
+                .send(SchedulerMsg::Eval {
+                    client_id,
+                    request_id,
+                    command: crate::parser::resolver::ResolvedCommand::ShowConfig { tail_bytes },
+                })
+                .await
+                .context("send show config to scheduler")?;
         }
 
         RequestPayload::Subscribe { channels } => {
@@ -503,6 +618,41 @@ async fn route_request(
     Ok(())
 }
 
+fn syntax_error_message(input: &str, base: &str) -> String {
+    let hints = bash_syntax_hints(input);
+    if hints.is_empty() {
+        base.to_string()
+    } else {
+        format!(
+            "{base}\n\nPossible bash syntax issue:\n- {}",
+            hints.join("\n- ")
+        )
+    }
+}
+
+fn bash_syntax_hints(input: &str) -> Vec<&'static str> {
+    let mut hints = Vec::new();
+    if input.contains(';') {
+        hints.push("cue-shell does not use ';' command separators; use a script submission or cue-shell chain operators such as '->' or '~>'");
+    }
+    if input.contains("$(") || input.contains('`') {
+        hints.push(
+            "command substitution is shell syntax; use an explicit helper command/script instead",
+        );
+    }
+    if input.contains("2>") || input.contains("1>") || input.contains(" >") || input.contains("<") {
+        hints.push("redirection is shell syntax; use cue-shell pipes '|>'/'|&>' or write/read files explicitly");
+    }
+    if input.contains(" | ")
+        && !input.contains("|>")
+        && !input.contains("|&>")
+        && !input.contains("|!>")
+    {
+        hints.push("bare '|' is shell syntax; use cue-shell '|>' for stdout pipes or '|&>' for stdout+stderr pipes");
+    }
+    hints
+}
+
 fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
     let prefix = input
         .get(..cursor.min(input.len()))
@@ -663,6 +813,14 @@ mod tests {
         let items = complete_input(":run(re", 7);
         assert!(items.iter().any(|item| item.label == "retry"));
         assert!(items.iter().any(|item| item.label == "retry_delay"));
+    }
+
+    #[test]
+    fn syntax_error_message_adds_bash_hints() {
+        let message = syntax_error_message("echo hi | wc -c > out.txt", "parse failed");
+        assert!(message.contains("Possible bash syntax issue"));
+        assert!(message.contains("bare '|' is shell syntax"));
+        assert!(message.contains("redirection is shell syntax"));
     }
 
     #[test]

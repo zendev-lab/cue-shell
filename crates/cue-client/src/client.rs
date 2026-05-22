@@ -283,6 +283,72 @@ impl MultiplexedClient {
         .await
     }
 
+    /// List jobs with optional server-side limit and pagination metadata.
+    pub async fn list_jobs(&self, limit: Option<usize>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ListJobs { limit }).await
+    }
+
+    /// List crons with optional server-side limit and pagination metadata.
+    pub async fn list_crons(&self, limit: Option<usize>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ListCrons { limit }).await
+    }
+
+    /// List scopes with optional server-side limit and pagination metadata.
+    pub async fn list_scopes(&self, limit: Option<usize>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ListScopes { limit }).await
+    }
+
+    /// Show log/history with optional target id, line limit, and byte tail.
+    pub async fn show_log(
+        &self,
+        id: Option<String>,
+        limit: Option<usize>,
+        tail_bytes: Option<usize>,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ShowLog {
+            id,
+            limit,
+            tail_bytes,
+        })
+        .await
+    }
+
+    /// Get stdout and stderr for one job with independent byte tails.
+    pub async fn job_output(
+        &self,
+        id: impl Into<String>,
+        stdout_bytes: Option<usize>,
+        stderr_bytes: Option<usize>,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::JobOutput {
+            id: id.into(),
+            stdout_bytes,
+            stderr_bytes,
+        })
+        .await
+    }
+
+    /// Kill a job ID only; cron IDs are rejected by the daemon.
+    pub async fn kill_job(&self, id: impl Into<String>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::KillJob { id: id.into() }).await
+    }
+
+    /// Remove a cron ID only; job IDs are rejected by the daemon.
+    pub async fn remove_cron(&self, id: impl Into<String>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::RemoveCron { id: id.into() })
+            .await
+    }
+
+    /// Show HEAD environment with an optional byte tail.
+    pub async fn show_env(&self, tail_bytes: Option<usize>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ShowEnv { tail_bytes }).await
+    }
+
+    /// Show cue-shell config with an optional byte tail.
+    pub async fn show_config(&self, tail_bytes: Option<usize>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::ShowConfig { tail_bytes }).await
+    }
+
     /// Receive the next pushed event from the daemon.
     pub async fn next_event(&self) -> Option<EventPayload> {
         self.events.lock().await.recv().await

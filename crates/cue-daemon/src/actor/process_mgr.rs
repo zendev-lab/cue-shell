@@ -22,8 +22,8 @@ use cue_core::pipeline::{JobPlan, command_prefers_foreground};
 use cue_core::scope::EnvSnapshot;
 
 use super::{
-    ActorSystem, EventBusMsg, GatewayMsg, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg,
-    StderrSnapshot,
+    ActorSystem, EventBusMsg, GatewayMsg, OutputSnapshot, ProcessMgrMsg, SchedulerMsg,
+    ScopeStoreMsg, StderrSnapshot,
 };
 use crate::ring_buffer::RingBuffer;
 use crate::runtime_env::effective_snapshot;
@@ -223,21 +223,32 @@ pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                 // Expose ring-buffer contents for live-tail queries.
                 ProcessMgrMsg::GetOutput { job_id, tail_bytes, reply } => {
-                    let result = children
-                        .get(&job_id.0)
-                        .map(|entry| entry.ring_buffer.lock().unwrap().tail(tail_bytes));
+                    let result = children.get(&job_id.0).map(|entry| {
+                        let (data, truncated) = entry
+                            .ring_buffer
+                            .lock()
+                            .unwrap()
+                            .tail_with_truncation(tail_bytes);
+                        OutputSnapshot { data, truncated }
+                    });
                     let _ = reply.send(result);
                 }
 
                 ProcessMgrMsg::GetStderr { job_id, tail_bytes, reply } => {
                     let result = children.get(&job_id.0).map(|entry| match &entry.stderr_ring {
-                        Some(ring) => StderrSnapshot {
-                            pty_merged: false,
-                            data: ring.lock().unwrap().tail(tail_bytes),
-                        },
+                        Some(ring) => {
+                            let (data, truncated) =
+                                ring.lock().unwrap().tail_with_truncation(tail_bytes);
+                            StderrSnapshot {
+                                pty_merged: false,
+                                data,
+                                truncated,
+                            }
+                        }
                         None => StderrSnapshot {
                             pty_merged: true,
                             data: Vec::new(),
+                            truncated: false,
                         },
                     });
                     let _ = reply.send(result);

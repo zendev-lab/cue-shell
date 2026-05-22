@@ -36,6 +36,10 @@ pub enum ResolvedCommand {
     },
     /// Kill a job/session.
     Kill { id: String },
+    /// Kill a job only.
+    KillJob { id: String },
+    /// Remove a cron only.
+    RemoveCron { id: String },
     /// Retry a failed job.
     Retry { id: String },
     /// View stdout.
@@ -45,6 +49,12 @@ pub enum ResolvedCommand {
     },
     /// View stderr.
     Err { id: String },
+    /// View stdout and stderr with independent limits.
+    JobOutput {
+        id: String,
+        stdout_bytes: Option<usize>,
+        stderr_bytes: Option<usize>,
+    },
     /// Foreground attach.
     Fg { id: String },
     /// Wait for job completion.
@@ -59,14 +69,28 @@ pub enum ResolvedCommand {
     Resume { id: String },
     /// View log.
     Log { id: Option<String> },
+    /// View log with pagination/tailing.
+    ShowLog {
+        id: Option<String>,
+        limit: Option<usize>,
+        tail_bytes: Option<usize>,
+    },
     /// List jobs.
     Jobs,
+    /// List jobs with pagination metadata.
+    ListJobs { limit: Option<usize> },
     /// List crons.
     Crons,
+    /// List crons with pagination metadata.
+    ListCrons { limit: Option<usize> },
     /// List scopes.
     Scopes,
+    /// List scopes with pagination metadata.
+    ListScopes { limit: Option<usize> },
     /// Environment operations.
     Env { subcommand: Option<String> },
+    /// Show HEAD environment with output limits.
+    ShowEnv { tail_bytes: Option<usize> },
     /// Change directory.
     Cd { path: String },
     /// Scope operations.
@@ -75,6 +99,8 @@ pub enum ResolvedCommand {
     Help { topic: Option<String> },
     /// Config operations.
     Config { subcommand: Option<String> },
+    /// Show config with output limits.
+    ShowConfig { tail_bytes: Option<usize> },
     /// Clear REPL.
     Clear,
     /// Quit.

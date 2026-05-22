@@ -94,7 +94,7 @@ pub enum ProcessMgrMsg {
     GetOutput {
         job_id: cue_core::JobId,
         tail_bytes: usize,
-        reply: tokio::sync::oneshot::Sender<Option<Vec<u8>>>,
+        reply: tokio::sync::oneshot::Sender<Option<OutputSnapshot>>,
     },
     /// Read the stderr tail of a running job.
     /// Returns `None` when the job is not in the live map (completed or unknown).
@@ -134,12 +134,22 @@ pub enum ProcessMgrMsg {
     Shutdown,
 }
 
+/// Snapshot of a job output stream, as returned by `ProcessMgrMsg::GetOutput`.
+pub struct OutputSnapshot {
+    /// Captured bytes (tail of the ring buffer, or empty).
+    pub data: Vec<u8>,
+    /// True when older bytes were omitted by ring-buffer overflow or tail limit.
+    pub truncated: bool,
+}
+
 /// Snapshot of a job's stderr, as returned by `ProcessMgrMsg::GetStderr`.
 pub struct StderrSnapshot {
     /// True when the job used a PTY (stdout and stderr are merged).
     pub pty_merged: bool,
     /// Captured bytes (tail of the ring buffer, or empty).
     pub data: Vec<u8>,
+    /// True when older bytes were omitted by ring-buffer overflow or tail limit.
+    pub truncated: bool,
 }
 
 /// Messages handled by the ScopeStore actor.

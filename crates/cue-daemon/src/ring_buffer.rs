@@ -13,6 +13,8 @@ pub struct RingBuffer {
     /// Number of valid bytes currently stored (≤ capacity).
     len: usize,
     capacity: usize,
+    /// Whether bytes have been dropped because writes exceeded capacity.
+    overflowed: bool,
 }
 
 impl RingBuffer {
@@ -23,6 +25,7 @@ impl RingBuffer {
             head: 0,
             len: 0,
             capacity,
+            overflowed: false,
         }
     }
 
@@ -43,6 +46,15 @@ impl RingBuffer {
     pub fn push(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
+        }
+
+        if self.capacity == 0 {
+            self.overflowed = true;
+            return;
+        }
+
+        if self.len.saturating_add(bytes.len()) > self.capacity {
+            self.overflowed = true;
         }
 
         // If bytes is larger than our entire capacity, skip to the tail.
@@ -81,12 +93,21 @@ impl RingBuffer {
 
     /// Return the last `n` bytes (or fewer if fewer are stored).
     pub fn tail(&self, n: usize) -> Vec<u8> {
+        self.tail_with_truncation(n).0
+    }
+
+    /// Return the last `n` bytes and whether older output was omitted.
+    pub fn tail_with_truncation(&self, n: usize) -> (Vec<u8>, bool) {
         let n = n.min(self.len);
         if n == 0 {
-            return Vec::new();
+            return (Vec::new(), self.overflowed || self.len > 0);
         }
         let all = self.as_bytes();
-        all[all.len() - n..].to_vec()
+        let truncated_by_limit = all.len() > n;
+        (
+            all[all.len() - n..].to_vec(),
+            self.overflowed || truncated_by_limit,
+        )
     }
 }
 
@@ -134,6 +155,18 @@ mod tests {
         let mut rb = RingBuffer::new(4);
         rb.push(b"ABCDEFGH"); // only last 4 kept
         assert_eq!(rb.as_bytes(), b"EFGH");
+    }
+
+    #[test]
+    fn tail_with_truncation_reports_limit_and_overflow() {
+        let mut rb = RingBuffer::new(6);
+        rb.push(b"abcd");
+        assert_eq!(rb.tail_with_truncation(4), (b"abcd".to_vec(), false));
+        assert_eq!(rb.tail_with_truncation(2), (b"cd".to_vec(), true));
+
+        rb.push(b"efgh");
+        assert_eq!(rb.as_bytes(), b"cdefgh");
+        assert_eq!(rb.tail_with_truncation(6), (b"cdefgh".to_vec(), true));
     }
 
     #[test]

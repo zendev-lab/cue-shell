@@ -17,8 +17,8 @@ use cue_core::cron::{
     CronPreset, CronSchedule, CronStatus, DayFilter, Weekday, parse_day_filter, parse_time_of_day,
 };
 use cue_core::ipc::{
-    ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload,
-    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptSubmitError, error_code,
+    ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, PageInfo,
+    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptSubmitError, StreamText, error_code,
 };
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::mode::Mode;
@@ -2593,6 +2593,77 @@ async fn handle_command(
             }
         }
 
+        ResolvedCommand::KillJob { id } => {
+            let Some(jid) = parse_job_id(&id) else {
+                return ResponsePayload::err(
+                    error_code::NOT_SUPPORTED,
+                    "KillJob only supports job IDs (J<n>)",
+                );
+            };
+            let status = state.jobs.get(&jid).map(|entry| entry.status.clone());
+            match status {
+                Some(JobStatus::Running) => {
+                    let _ = sys
+                        .process_mgr
+                        .send(ProcessMgrMsg::KillJob { job_id: jid })
+                        .await;
+                    info!(%jid, "scheduler: job killed");
+                    if let Some((chain_id, ready_queue, to_cancel)) = set_job_terminal_state(
+                        jid,
+                        TerminalStateUpdate {
+                            status: JobStatus::Killed,
+                            exit_code: -1,
+                            end_scope: None,
+                            advance_chain: true,
+                        },
+                        state,
+                        db,
+                        sys,
+                    )
+                    .await
+                    {
+                        let cwd_override = state
+                            .chains
+                            .get(&chain_id)
+                            .and_then(|c| c.cwd_override.clone());
+                        process_chain_advance(
+                            chain_id,
+                            ready_queue,
+                            &to_cancel,
+                            0,
+                            cwd_override,
+                            state,
+                            db,
+                            sys,
+                        )
+                        .await;
+                    }
+                    ResponsePayload::ack()
+                }
+                Some(_) => ResponsePayload::err(
+                    error_code::INVALID_STATE,
+                    format!("job {jid} is not running"),
+                ),
+                None => ResponsePayload::err(error_code::NOT_FOUND, format!("job {id} not found")),
+            }
+        }
+
+        ResolvedCommand::RemoveCron { id } => {
+            let Some(cid) = parse_cron_id(&id) else {
+                return ResponsePayload::err(
+                    error_code::NOT_SUPPORTED,
+                    "RemoveCron only supports cron IDs (C<n>)",
+                );
+            };
+            if state.crons.remove(&cid).is_some() {
+                remove_cron_from_db(db, cid);
+                info!(%cid, "scheduler: cron removed");
+                ResponsePayload::ack()
+            } else {
+                ResponsePayload::err(error_code::NOT_FOUND, format!("cron {id} not found"))
+            }
+        }
+
         ResolvedCommand::Cancel { id } => {
             if let Some(jid) = parse_job_id(&id) {
                 let status = state.jobs.get(&jid).map(|entry| entry.status.clone());
@@ -2700,27 +2771,30 @@ async fn handle_command(
         }
 
         ResolvedCommand::Jobs => {
-            let mut list: Vec<JobInfo> = state.jobs.values().map(job_info_from_entry).collect();
-            list.sort_by_key(|job| parse_job_id(&job.id).map(|id| id.0).unwrap_or(u32::MAX));
+            let list = sorted_job_list(state);
             ResponsePayload::Ok(OkPayload::JobList(list))
         }
 
+        ResolvedCommand::ListJobs { limit } => {
+            let list = sorted_job_list(state);
+            let (jobs, page) = page_items(list, limit);
+            ResponsePayload::Ok(OkPayload::JobListPage { jobs, page })
+        }
+
         ResolvedCommand::Crons => {
-            let mut list: Vec<CronInfo> = state
-                .crons
-                .values()
-                .map(|c| CronInfo {
-                    id: c.cron_id.to_string(),
-                    schedule: c.schedule_text.clone(),
-                    command: chain_to_text(&c.chain),
-                    status: c.status,
-                })
-                .collect();
-            list.sort_by_key(|cron| parse_cron_id(&cron.id).map(|id| id.0).unwrap_or(u32::MAX));
+            let list = sorted_cron_list(state);
             ResponsePayload::Ok(OkPayload::CronList(list))
         }
 
+        ResolvedCommand::ListCrons { limit } => {
+            let list = sorted_cron_list(state);
+            let (crons, page) = page_items(list, limit);
+            ResponsePayload::Ok(OkPayload::CronListPage { crons, page })
+        }
+
         ResolvedCommand::Scopes => handle_list_scopes(sys).await,
+
+        ResolvedCommand::ListScopes { limit } => handle_list_scopes_page(sys, limit).await,
 
         ResolvedCommand::Env { subcommand } => {
             let snapshot = match get_head_snapshot(sys).await {
@@ -2775,6 +2849,16 @@ async fn handle_command(
                 }
                 Err(message) => ResponsePayload::err(error_code::INVALID_SYNTAX, message),
             }
+        }
+
+        ResolvedCommand::ShowEnv { tail_bytes } => {
+            let snapshot = match get_head_snapshot(sys).await {
+                Ok(snapshot) => snapshot,
+                Err(response) => return response,
+            };
+            let text = format_snapshot_env(&snapshot);
+            let (text, truncated) = limit_text(text, None, tail_bytes);
+            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
         }
 
         ResolvedCommand::Help { topic } => {
@@ -2921,6 +3005,20 @@ async fn handle_command(
             read_job_stderr(sys, job_id, &id, crate::ring_buffer::DEFAULT_CAPACITY).await
         }
 
+        ResolvedCommand::JobOutput {
+            id,
+            stdout_bytes,
+            stderr_bytes,
+        } => {
+            let Some(job_id) = parse_job_id(&id) else {
+                return ResponsePayload::err(
+                    error_code::NOT_FOUND,
+                    format!("invalid job id: {id}"),
+                );
+            };
+            read_job_output_pair(sys, job_id, &id, stdout_bytes, stderr_bytes).await
+        }
+
         ResolvedCommand::Send { id, data } => {
             if let Some(job_id) = parse_job_id(&id) {
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3019,6 +3117,16 @@ async fn handle_command(
             ResponsePayload::Ok(OkPayload::EvalText { text })
         }
 
+        ResolvedCommand::ShowLog {
+            id,
+            limit,
+            tail_bytes,
+        } => {
+            let text = format_log_text(state, id.as_deref());
+            let (text, truncated) = limit_text(text, limit, tail_bytes);
+            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
+        }
+
         ResolvedCommand::Scope { subcommand } => {
             match subcommand.as_deref().map(str::trim).unwrap_or("list") {
                 "" | "list" => handle_list_scopes(sys).await,
@@ -3039,6 +3147,12 @@ async fn handle_command(
                     format!("`:config {other}` is not supported; try `:config` or `:config show`"),
                 ),
             }
+        }
+
+        ResolvedCommand::ShowConfig { tail_bytes } => {
+            let text = format_config_text(config);
+            let (text, truncated) = limit_text(text, None, tail_bytes);
+            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
         }
     }
 }
@@ -3406,6 +3520,40 @@ fn format_command_list<'a>(specs: impl IntoIterator<Item = &'a CommandSpec>) -> 
         .join("\n")
 }
 
+fn sorted_job_list(state: &SchedulerState) -> Vec<JobInfo> {
+    let mut list: Vec<JobInfo> = state.jobs.values().map(job_info_from_entry).collect();
+    list.sort_by_key(|job| parse_job_id(&job.id).map(|id| id.0).unwrap_or(u32::MAX));
+    list
+}
+
+fn sorted_cron_list(state: &SchedulerState) -> Vec<CronInfo> {
+    let mut list: Vec<CronInfo> = state
+        .crons
+        .values()
+        .map(|cron| CronInfo {
+            id: cron.cron_id.to_string(),
+            schedule: cron.schedule_text.clone(),
+            command: chain_to_text(&cron.chain),
+            status: cron.status,
+        })
+        .collect();
+    list.sort_by_key(|cron| parse_cron_id(&cron.id).map(|id| id.0).unwrap_or(u32::MAX));
+    list
+}
+
+fn page_items<T>(items: Vec<T>, limit: Option<usize>) -> (Vec<T>, PageInfo) {
+    let total = items.len();
+    let shown = limit.map_or(total, |limit| total.min(limit));
+    let truncated = shown < total;
+    let page = PageInfo {
+        total,
+        shown,
+        limit,
+        truncated,
+    };
+    (items.into_iter().take(shown).collect(), page)
+}
+
 /// Send `ListScopes` to the scope store and return a `ScopeList` response.
 async fn handle_list_scopes(sys: &ActorSystem) -> ResponsePayload {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3429,6 +3577,63 @@ async fn handle_list_scopes(sys: &ActorSystem) -> ResponsePayload {
         }
         Err(_) => ResponsePayload::err(error_code::INTERNAL, "scope_store reply dropped"),
     }
+}
+
+async fn handle_list_scopes_page(sys: &ActorSystem, limit: Option<usize>) -> ResponsePayload {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if sys
+        .scope_store
+        .send(ScopeStoreMsg::ListScopes { reply: tx })
+        .await
+        .is_err()
+    {
+        return ResponsePayload::err(error_code::INTERNAL, "scope_store unreachable");
+    }
+    match rx.await {
+        Ok((head, mut scopes)) => {
+            let head_str = head.to_string();
+            scopes.sort_by(|a, b| {
+                let a_head = a.hash == head_str;
+                let b_head = b.hash == head_str;
+                b_head.cmp(&a_head).then(a.hash.cmp(&b.hash))
+            });
+            let (scopes, page) = page_items(scopes, limit);
+            ResponsePayload::Ok(OkPayload::ScopeListPage { scopes, page })
+        }
+        Err(_) => ResponsePayload::err(error_code::INTERNAL, "scope_store reply dropped"),
+    }
+}
+
+fn limit_text(
+    text: String,
+    line_limit: Option<usize>,
+    tail_bytes: Option<usize>,
+) -> (String, bool) {
+    let (text, byte_truncated) = if let Some(max) = tail_bytes {
+        tail_utf8(&text, max)
+    } else {
+        (text, false)
+    };
+    let Some(limit) = line_limit else {
+        return (text, byte_truncated);
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= limit {
+        return (text, byte_truncated);
+    }
+    let start = lines.len().saturating_sub(limit);
+    (lines[start..].join("\n"), true)
+}
+
+fn tail_utf8(text: &str, max_bytes: usize) -> (String, bool) {
+    if max_bytes == 0 || text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    (text[start..].to_string(), true)
 }
 
 /// Build a human-readable log of jobs and crons.
@@ -3526,13 +3731,12 @@ async fn read_job_output(
     }
 
     match rx.await {
-        Ok(Some(data)) => {
-            let truncated = data.len() >= tail_bytes;
-            let text = String::from_utf8_lossy(&data).into_owned();
+        Ok(Some(snapshot)) => {
+            let text = String::from_utf8_lossy(&snapshot.data).into_owned();
             ResponsePayload::Ok(OkPayload::Output {
                 id,
                 data: text,
-                truncated,
+                truncated: snapshot.truncated,
             })
         }
         Ok(None) => read_output_from_log(job_id, &id, tail_bytes).await,
@@ -3577,6 +3781,38 @@ async fn read_output_from_log(
     }
 }
 
+async fn read_job_output_pair(
+    sys: &ActorSystem,
+    job_id: JobId,
+    display_id: &str,
+    stdout_bytes: Option<usize>,
+    stderr_bytes: Option<usize>,
+) -> ResponsePayload {
+    let stdout_limit = stdout_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
+    let stderr_limit = stderr_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
+    let stdout = match read_job_output(sys, job_id, display_id, stdout_limit).await {
+        ResponsePayload::Ok(OkPayload::Output {
+            data, truncated, ..
+        }) => StreamText { data, truncated },
+        error => return error,
+    };
+    let stderr = match read_job_stderr(sys, job_id, display_id, stderr_limit).await {
+        ResponsePayload::Ok(OkPayload::Output {
+            data, truncated, ..
+        }) => StreamText { data, truncated },
+        error => return error,
+    };
+    let stderr_pty_merged = stderr
+        .data
+        .starts_with("[PTY: stdout and stderr are merged]");
+    ResponsePayload::Ok(OkPayload::JobOutput {
+        id: display_id.to_string(),
+        stdout,
+        stderr,
+        stderr_pty_merged,
+    })
+}
+
 /// Return stderr for a job — real pipe-mode bytes, or merged PTY output with a notice.
 async fn read_job_stderr(
     sys: &ActorSystem,
@@ -3603,8 +3839,8 @@ async fn read_job_stderr(
         Ok(Some(StderrSnapshot {
             pty_merged: false,
             data,
+            truncated,
         })) => {
-            let truncated = data.len() >= tail_bytes;
             let text = String::from_utf8_lossy(&data).into_owned();
             ResponsePayload::Ok(OkPayload::Output {
                 id,
@@ -3776,7 +4012,61 @@ mod tests {
                         let child = cue_core::scope::Scope::fork(base, &snapshot, delta);
                         let _ = reply.send(Ok(child.hash));
                     }
+                    ScopeStoreMsg::ListScopes { reply } => {
+                        let cwd = std::env::current_dir()
+                            .expect("current dir")
+                            .display()
+                            .to_string();
+                        let _ = reply.send((
+                            ScopeHash([0u8; 32]),
+                            vec![
+                                cue_core::ipc::ScopeInfo {
+                                    hash: ScopeHash([0u8; 32]).to_string(),
+                                    parent: None,
+                                    cwd: cwd.clone(),
+                                    env_count: 0,
+                                },
+                                cue_core::ipc::ScopeInfo {
+                                    hash: ScopeHash([1u8; 32]).to_string(),
+                                    parent: None,
+                                    cwd,
+                                    env_count: 0,
+                                },
+                            ],
+                        ));
+                    }
                     ScopeStoreMsg::Shutdown => break,
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    fn spawn_fake_process_mgr(mut rx: mpsc::Receiver<ProcessMgrMsg>) {
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    ProcessMgrMsg::GetOutput {
+                        tail_bytes, reply, ..
+                    } => {
+                        let data = b"stdout-data";
+                        let shown = data.len().min(tail_bytes);
+                        let _ = reply.send(Some(crate::actor::OutputSnapshot {
+                            data: data[data.len() - shown..].to_vec(),
+                            truncated: shown < data.len(),
+                        }));
+                    }
+                    ProcessMgrMsg::GetStderr {
+                        tail_bytes, reply, ..
+                    } => {
+                        let data = b"stderr-data";
+                        let shown = data.len().min(tail_bytes);
+                        let _ = reply.send(Some(StderrSnapshot {
+                            pty_merged: false,
+                            data: data[data.len() - shown..].to_vec(),
+                            truncated: shown < data.len(),
+                        }));
+                    }
                     _ => {}
                 }
             }
@@ -4337,6 +4627,173 @@ mod tests {
         } else {
             panic!("expected JobList");
         }
+    }
+
+    #[tokio::test]
+    async fn typed_list_jobs_returns_page_metadata() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        for command in ["echo one", "echo two"] {
+            let _ = spawn_chain(
+                leaf(command),
+                ScopeHash([0; 32]),
+                1,
+                1,
+                None,
+                false,
+                false,
+                true,
+                0,
+                None,
+                &mut state,
+                &conn,
+                &sys,
+                Vec::new(),
+            )
+            .await;
+        }
+        let _ = drain_spawn_jobs(&mut pm_rx).await;
+
+        let resp = handle_command(
+            ResolvedCommand::ListJobs { limit: Some(1) },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::JobListPage { jobs, page }) => {
+                assert_eq!(jobs.len(), 1);
+                assert_eq!(page.total, 2);
+                assert_eq!(page.shown, 1);
+                assert_eq!(page.limit, Some(1));
+                assert!(page.truncated);
+            }
+            other => panic!("expected paged job list, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_list_scopes_returns_page_metadata() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let resp = handle_list_scopes_page(&sys, Some(1)).await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::ScopeListPage { scopes, page }) => {
+                assert_eq!(scopes.len(), 1);
+                assert_eq!(page.total, 2);
+                assert_eq!(page.shown, 1);
+                assert_eq!(page.limit, Some(1));
+                assert!(page.truncated);
+            }
+            other => panic!("expected paged scope list, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_cron_remove_is_separate_from_job_kill() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let cmd = ResolvedCommand::Cron {
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
+            chain: leaf("backup.sh"),
+            params: cue_core::command::ModeParams::new(),
+        };
+        let _ = handle_command(cmd, 0, &mut state, &conn, &config, &sys).await;
+        let list_resp = handle_command(
+            ResolvedCommand::ListCrons { limit: Some(1) },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match list_resp {
+            ResponsePayload::Ok(OkPayload::CronListPage { crons, page }) => {
+                assert_eq!(crons.len(), 1);
+                assert_eq!(page.total, 1);
+                assert!(!page.truncated);
+            }
+            other => panic!("expected paged cron list, got {other:?}"),
+        }
+
+        let wrong_kind = handle_command(
+            ResolvedCommand::KillJob { id: "C1".into() },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(
+            matches!(wrong_kind, ResponsePayload::Err { code, .. } if code == error_code::NOT_SUPPORTED)
+        );
+        assert_eq!(state.crons.len(), 1);
+
+        let removed = handle_command(
+            ResolvedCommand::RemoveCron { id: "C1".into() },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(removed, ResponsePayload::Ok(OkPayload::Ack {})));
+        assert!(state.crons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn typed_job_output_uses_independent_stdout_stderr_limits() {
+        let (sys, _gw_rx, _sched_rx, pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        spawn_fake_process_mgr(pm_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let resp = handle_command(
+            ResolvedCommand::JobOutput {
+                id: "J1".into(),
+                stdout_bytes: Some(4),
+                stderr_bytes: Some(6),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::JobOutput { stdout, stderr, .. }) => {
+                assert_eq!(stdout.data, "data");
+                assert!(stdout.truncated);
+                assert_eq!(stderr.data, "r-data");
+                assert!(stderr.truncated);
+            }
+            other => panic!("expected job output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_text_limit_applies_tail_then_line_limit() {
+        let (text, truncated) = limit_text("a\nb\nc\nd".to_string(), Some(2), Some(5));
+        assert_eq!(text, "c\nd");
+        assert!(truncated);
     }
 
     #[test]
