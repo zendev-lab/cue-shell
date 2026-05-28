@@ -161,7 +161,7 @@ pub enum ScopeStoreMsg {
     /// Get a scope by hash.
     GetScope {
         hash: ScopeHash,
-        reply: tokio::sync::oneshot::Sender<Option<Scope>>,
+        reply: tokio::sync::oneshot::Sender<Result<Option<Scope>>>,
     },
     /// Get the current HEAD snapshot.
     GetHeadSnapshot {
@@ -170,7 +170,7 @@ pub enum ScopeStoreMsg {
     /// Create a root scope from a full snapshot.
     CreateRoot {
         snapshot: EnvSnapshot,
-        reply: tokio::sync::oneshot::Sender<ScopeHash>,
+        reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
     },
     /// Fork a child scope from the current HEAD.
     Fork {

@@ -50,8 +50,14 @@ enum Message {
 // Response (error)
 {"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "cue chain operator `|?|` must be surrounded by whitespace"}}}
 
-// Response (success — Eval resolved to a multiline script submission)
-{"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
+// Request: RunScript (file-script body loaded by cue-cli)
+{"type": "request", "id": 4, "payload": {"RunScript": {"path": "scripts/build.cue", "input": ":run cargo test\n:run cargo fmt -> cargo clippy", "mode": "Job"}}}
+
+// Response (success — file script submission created)
+{"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "source": {"kind": "file", "path": "scripts/build.cue"}, "items": [{"index": 0, "source": ":run cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": ":run cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
+
+// Event (script terminal aggregate status; emitted by synchronous script runner)
+{"type": "event", "payload": {"ScriptFinished": {"script_id": "R7", "status": "done", "exit_code": 0, "failed_item_index": null}}}
 
 // Request: Subscribe (protocol command)
 {"type": "request", "id": 2, "payload": {"Subscribe": {"channels": ["jobs", "crons", "output:J1"]}}}
@@ -102,9 +108,10 @@ TUI default subscription on connect: `["jobs", "crons", "system"]`
 
 ### Design: Eval-centric
 
-All user commands go through a single `Eval` request. cued owns the full parser
-(Tokenizer → Parser → Resolver). Structured requests are only used for
-protocol-level operations that don't correspond to user-typed commands.
+Interactive user commands go through `Eval`. File scripts use the structured
+`RunScript` request so the client can attach source-path metadata while cued
+still owns parsing (Tokenizer → Parser → Resolver). Other structured requests
+are protocol-level operations that don't correspond to user-typed commands.
 
 ```rust
 enum RequestPayload {
@@ -113,6 +120,11 @@ enum RequestPayload {
     // input: raw user input, e.g. ":run(retry=3) cargo test -> cargo build"
     //        or bare input "cargo test" (cued applies mode default)
     // mode: current TUI mode (JOB/CRON) for bare input resolution
+
+    RunScript { path: String, input: String, mode: Mode },
+    // path: user-facing .cue file path, used as script source metadata
+    // input: file contents already loaded by cue-cli
+    // mode: default mode used for bare items inside the file
 
     // === Protocol commands (structured, not user-typed) ===
 
@@ -161,9 +173,16 @@ enum OkPayload {
     Ack {},  // generic success (Subscribe, Kill, FgDetach, etc.)
     ScriptCreated {
         script_id: String,
+        source: ScriptSource,  // Inline or File { path }
         items: Vec<ScriptItemInfo>,
         submit_error: Option<ScriptSubmitError>,
-    },  // one multiline submission; items are ack-ordered during creation but run asynchronously after creation
+    },
+    ScriptFinished {
+        script_id: String,
+        status: ScriptRunStatus,  // Done | Failed
+        exit_code: i32,
+        failed_item_index: Option<usize>,
+    },
     JobCreated {
         job_id: String,
         start_scope: Option<String>,
@@ -196,7 +215,7 @@ enum OkPayload {
     HighlightResult { spans: Vec<HighlightSpan> },
 
     FgAttached { id: String },  // J<n> = live PTY attach
-    Pong {},
+    Pong { version: Option<String> },  // `version` reports cued's build version; `None` from older daemons
 }
 
 struct PageInfo {
@@ -249,6 +268,12 @@ enum EventPayload {
         chain_total: Option<usize>,
     },
     ChainProgress { chain: ChainInfo },
+    ScriptFinished {
+        script_id: String,
+        status: ScriptRunStatus,
+        exit_code: i32,
+        failed_item_index: Option<usize>,
+    },
     JobRemoved { job_id: String },
 
     // Cron events (channel: "crons")
@@ -299,6 +324,16 @@ struct ScriptItemInfo {
     index: usize,
     source: String,
     result: ScriptItemResult,
+}
+
+enum ScriptSource {
+    Inline,
+    File { path: String },
+}
+
+enum ScriptRunStatus {
+    Done,
+    Failed,
 }
 
 enum ScriptItemResult {

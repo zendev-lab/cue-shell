@@ -15,10 +15,13 @@
 //! where `{os}` is `macos` or `linux` and `{arch}` is `aarch64` or `x86_64`.
 //! The tarball must contain a top-level (or one-level-deep) file named `cued`.
 
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+
+use crate::command_util::CommandSpec;
 
 const REPO: &str = "zrr1999/cue-shell";
 const API_URL: &str = "https://api.github.com/repos/zrr1999/cue-shell/releases/latest";
@@ -93,7 +96,12 @@ pub fn run_upgrade() -> Result<()> {
         &tmp_dir,
         &current_exe,
     );
-    std::fs::remove_dir_all(&tmp_dir).ok();
+    if let Err(error) = remove_temp_dir(&tmp_dir) {
+        eprintln!(
+            "cued upgrade: warning: failed to remove temp dir {}: {error:#}",
+            tmp_dir.display()
+        );
+    }
     result?;
 
     println!("cued upgrade: updated to {tag} ✓");
@@ -111,15 +119,10 @@ pub fn run_upgrade() -> Result<()> {
 
 // ── Download + replace ───────────────────────────────────────────────────────
 
-fn download_and_replace(
-    url: &str,
-    asset_name: &str,
-    tmp_dir: &std::path::Path,
-    target: &std::path::Path,
-) -> Result<()> {
+fn download_and_replace(url: &str, asset_name: &str, tmp_dir: &Path, target: &Path) -> Result<()> {
     let archive_path = tmp_dir.join(asset_name);
 
-    let ok = std::process::Command::new("curl")
+    let download_cmd = CommandSpec::new("curl")
         .args([
             "--fail",
             "--location",
@@ -128,25 +131,27 @@ fn download_and_replace(
             "--output",
         ])
         .arg(&archive_path)
-        .arg(url)
-        .status()
-        .context("run curl for download")?
-        .success();
-    if !ok {
-        bail!("curl download failed for {url}");
+        .arg(url);
+    let download = download_cmd.output().context("download release asset")?;
+    if !download.status.success() {
+        bail!(
+            "download release asset failed\n{}",
+            download_cmd.failure_summary(&download)
+        );
     }
 
     let binary_path = if asset_name.ends_with(".tar.gz") || asset_name.ends_with(".tgz") {
-        let ok = std::process::Command::new("tar")
+        let extract_cmd = CommandSpec::new("tar")
             .args(["xzf"])
             .arg(&archive_path)
             .arg("-C")
-            .arg(tmp_dir)
-            .status()
-            .context("tar xzf archive")?
-            .success();
-        if !ok {
-            bail!("failed to extract {}", archive_path.display());
+            .arg(tmp_dir);
+        let extract = extract_cmd.output().context("extract release archive")?;
+        if !extract.status.success() {
+            bail!(
+                "extract release archive failed\n{}",
+                extract_cmd.failure_summary(&extract)
+            );
         }
         find_binary_in_dir(tmp_dir)?
     } else {
@@ -190,6 +195,14 @@ fn find_binary_in_dir(dir: &std::path::Path) -> Result<PathBuf> {
     )
 }
 
+fn remove_temp_dir(path: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove temp dir {}", path.display())),
+    }
+}
+
 #[cfg(unix)]
 fn make_executable(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -208,23 +221,20 @@ fn make_executable(_path: &std::path::Path) -> Result<()> {
 // ── HTTP helper ──────────────────────────────────────────────────────────────
 
 fn curl_get(url: &str) -> Result<String> {
-    let output = std::process::Command::new("curl")
-        .args([
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--location",
-            "--header",
-            "Accept: application/vnd.github.v3+json",
-            "--header",
-            "User-Agent: cued-upgrade/1.0",
-            url,
-        ])
-        .output()
-        .context("run curl")?;
+    let command = CommandSpec::new("curl").args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--header",
+        "Accept: application/vnd.github.v3+json",
+        "--header",
+        "User-Agent: cued-upgrade/1.0",
+        url,
+    ]);
+    let output = command.output().context("fetch GitHub release metadata")?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("curl failed: {stderr}");
+        bail!("{}", command.failure_summary(&output));
     }
     String::from_utf8(output.stdout).context("parse curl output as UTF-8")
 }
@@ -247,4 +257,45 @@ fn platform_arch() -> &'static str {
     return "x86_64";
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     return "unknown";
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn temp_dir_cleanup_removes_existing_directory() {
+        let dir = unique_temp_path("existing");
+        std::fs::create_dir_all(dir.join("nested")).expect("create temp dir");
+        std::fs::write(dir.join("nested/file"), b"tmp").expect("write temp file");
+
+        remove_temp_dir(&dir).expect("remove temp dir");
+
+        assert!(!dir.exists(), "temp dir should be removed");
+    }
+
+    #[test]
+    fn temp_dir_cleanup_allows_missing_directory() {
+        let dir = unique_temp_path("missing");
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => panic!("remove stale test dir {}: {error}", dir.display()),
+        }
+
+        remove_temp_dir(&dir).expect("missing temp dir is already clean");
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cued-upgrade-{name}-{}-{suffix}",
+            std::process::id()
+        ))
+    }
 }

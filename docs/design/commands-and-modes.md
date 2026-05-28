@@ -105,18 +105,13 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
-`cue-shell` 现在也支持 **multiline script**：
+`cue-shell` 的文件脚本模式使用统一的 `.cue` 后缀，并通过显式 CLI 入口运行：
 
 ```text
-cat _typos.toml |> rg files
-||| cat Cargo.toml |> rg author
+cue run path/to/file.cue
 ```
 
-- JOB 模式下，多行输入默认视为一次 script 提交；显式 `:run` 也可承载同样的多行 body
-- 一个 script 会分配新的 `R<n>`，其下每个顶层 item 继续按原有语义解析成 chain / job / cron
-- 调度是 **异步提交、按 ack 排序**：item N 创建成功后，才继续发 item N+1；但已经创建的 chain/job 仍按各自异步生命周期运行
-- 输出归属不变：脚本卡片只负责展示 `R -> C -> J` 映射，真正 stdout/stderr 仍由 `J<n>` 持有
-- 顶层换行只在 **top-level** 作为 script item 分隔；如果当前 chain 明显未结束，则换行继续作为同一条 chain 的格式化空白
+JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 item 时，应写入 `.cue` 文件后用 `cue run` 执行。脚本运行仍分配 `R<n>`，并复用 `ScriptCreated` / `script_runs` 这套运行元数据抽象。完整契约见 [cue-script.md](cue-script.md)。
 
 另外，`cue-shell` 现在把两类输入当作**原生 scope-transform job** 处理，而不是交给外部 shell：
 
@@ -273,9 +268,8 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 | 命令 | 可用参数 |
 |------|---------|
-| `:run()` | `cwd`, `retry`, `retry_delay` |
-| `:cron()` | `cwd` |
-| `:scope new()` | `profile` |
+| `:run()` | `cwd`, `retry`, `retry_delay`, `timeout`, `wrapper`, `scope`, `pty` |
+| `:cron()` | `cwd`, `retry`, `retry_delay`, `timeout`, `wrapper`, `scope`, `pty` |
 
 其他命令只有位置/标志参数，无 `()` 语法。
 

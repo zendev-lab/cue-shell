@@ -12,6 +12,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+use crate::command_util::CommandSpec;
+
 #[cfg(target_os = "macos")]
 const SERVICE_LABEL: &str = "com.cue-shell.cued";
 
@@ -59,6 +61,16 @@ pub fn uninstall() -> Result<()> {
 /// Restart the managed service (e.g., after a binary upgrade).
 pub fn restart() -> Result<()> {
     restart_service()
+}
+
+fn warn_deactivate_failures(failures: Vec<String>) {
+    if failures.is_empty() {
+        return;
+    }
+    eprintln!(
+        "cued: warning: service manager did not confirm deactivation; removing the service file anyway\n{}",
+        failures.join("\n")
+    );
 }
 
 // ── macOS (launchd) ─────────────────────────────────────────────────────────
@@ -114,25 +126,22 @@ fn activate(plist: &Path) -> Result<()> {
     let plist_str = plist.to_string_lossy();
 
     // Try modern `bootstrap` (macOS 10.15+), fall back to legacy `load`.
-    let ok = std::process::Command::new("launchctl")
-        .args(["bootstrap", &target, plist_str.as_ref()])
-        .status()
-        .context("run launchctl bootstrap")?
-        .success();
-    if ok {
+    let bootstrap_cmd =
+        CommandSpec::new("launchctl").args(["bootstrap", target.as_str(), plist_str.as_ref()]);
+    let bootstrap = bootstrap_cmd.output()?;
+    if bootstrap.status.success() {
         return Ok(());
     }
 
-    let ok2 = std::process::Command::new("launchctl")
-        .args(["load", "-w", plist_str.as_ref()])
-        .status()
-        .context("run launchctl load")?
-        .success();
-    if !ok2 {
+    let load_cmd = CommandSpec::new("launchctl").args(["load", "-w", plist_str.as_ref()]);
+    let load = load_cmd.output()?;
+    if !load.status.success() {
         bail!(
             "launchctl bootstrap and launchctl load both failed — \
-             check the plist at {}",
-            plist.display()
+             check the plist at {}\n{}\n{}",
+            plist.display(),
+            bootstrap_cmd.failure_summary(&bootstrap),
+            load_cmd.failure_summary(&load)
         );
     }
     Ok(())
@@ -143,13 +152,33 @@ fn deactivate(plist: &Path) -> Result<()> {
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}");
     let plist_str = plist.to_string_lossy();
-    // Best-effort: try both modern and legacy forms.
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootout", &target, plist_str.as_ref()])
-        .status();
-    let _ = std::process::Command::new("launchctl")
-        .args(["unload", "-w", plist_str.as_ref()])
-        .status();
+    let mut failures = Vec::new();
+
+    // Try both modern and legacy forms. A missing/unloaded service should not
+    // prevent removing the stale plist, but the service manager diagnostics
+    // should still be visible to the user.
+    let bootout_cmd =
+        CommandSpec::new("launchctl").args(["bootout", target.as_str(), plist_str.as_ref()]);
+    match bootout_cmd.output() {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => failures.push(bootout_cmd.failure_summary(&output)),
+        Err(error) => failures.push(format!(
+            "`{}` failed to run: {error:#}",
+            bootout_cmd.display()
+        )),
+    }
+
+    let unload_cmd = CommandSpec::new("launchctl").args(["unload", "-w", plist_str.as_ref()]);
+    match unload_cmd.output() {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => failures.push(unload_cmd.failure_summary(&output)),
+        Err(error) => failures.push(format!(
+            "`{}` failed to run: {error:#}",
+            unload_cmd.display()
+        )),
+    }
+
+    warn_deactivate_failures(failures);
     Ok(())
 }
 
@@ -157,13 +186,10 @@ fn deactivate(plist: &Path) -> Result<()> {
 fn restart_service() -> Result<()> {
     let uid = unsafe { libc::getuid() };
     let service = format!("gui/{uid}/{SERVICE_LABEL}");
-    let ok = std::process::Command::new("launchctl")
-        .args(["kickstart", "-k", &service])
-        .status()
-        .context("run launchctl kickstart")?
-        .success();
-    if !ok {
-        bail!("launchctl kickstart -k {service} failed");
+    let command = CommandSpec::new("launchctl").args(["kickstart", "-k", service.as_str()]);
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!("{}", command.failure_summary(&output));
     }
     Ok(())
 }
@@ -199,46 +225,53 @@ fn service_file_content(exe_path: &Path, _log_path: &Path) -> Result<String> {
 
 #[cfg(target_os = "linux")]
 fn activate(_unit: &Path) -> Result<()> {
-    let ok = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status()
-        .context("systemctl daemon-reload")?
-        .success();
-    if !ok {
-        bail!("systemctl --user daemon-reload failed");
+    let reload_cmd = CommandSpec::new("systemctl").args(["--user", "daemon-reload"]);
+    let reload = reload_cmd.output()?;
+    if !reload.status.success() {
+        bail!("{}", reload_cmd.failure_summary(&reload));
     }
-    let ok2 = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", "cued"])
-        .status()
-        .context("systemctl enable --now cued")?
-        .success();
-    if !ok2 {
-        bail!("systemctl --user enable --now cued failed");
+    let enable_cmd = CommandSpec::new("systemctl").args(["--user", "enable", "--now", "cued"]);
+    let enable = enable_cmd.output()?;
+    if !enable.status.success() {
+        bail!("{}", enable_cmd.failure_summary(&enable));
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn deactivate(_unit: &Path) -> Result<()> {
-    // Best-effort.
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "--now", "cued"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
+    let mut failures = Vec::new();
+
+    let disable_cmd = CommandSpec::new("systemctl").args(["--user", "disable", "--now", "cued"]);
+    match disable_cmd.output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => failures.push(disable_cmd.failure_summary(&output)),
+        Err(error) => failures.push(format!(
+            "`{}` failed to run: {error:#}",
+            disable_cmd.display()
+        )),
+    }
+
+    let reload_cmd = CommandSpec::new("systemctl").args(["--user", "daemon-reload"]);
+    match reload_cmd.output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => failures.push(reload_cmd.failure_summary(&output)),
+        Err(error) => failures.push(format!(
+            "`{}` failed to run: {error:#}",
+            reload_cmd.display()
+        )),
+    }
+
+    warn_deactivate_failures(failures);
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn restart_service() -> Result<()> {
-    let ok = std::process::Command::new("systemctl")
-        .args(["--user", "restart", "cued"])
-        .status()
-        .context("systemctl --user restart cued")?
-        .success();
-    if !ok {
-        bail!("systemctl --user restart cued failed");
+    let command = CommandSpec::new("systemctl").args(["--user", "restart", "cued"]);
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!("{}", command.failure_summary(&output));
     }
     Ok(())
 }

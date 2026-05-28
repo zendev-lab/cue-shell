@@ -60,6 +60,7 @@ pub const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(3);
 pub enum ConnectionEvent {
     Incoming(Message),
     Disconnected,
+    ReconnectFailed { message: String },
     Reconnected { writer: WriterHandle },
 }
 
@@ -205,6 +206,7 @@ pub async fn run_connection_manager_with_delay(
             }
         }
 
+        let mut failure_reported = false;
         loop {
             tokio::time::sleep(reconnect_delay).await;
 
@@ -218,7 +220,14 @@ pub async fn run_connection_manager_with_delay(
                     reader_opt = Some(reader);
                     break;
                 }
-                Err(_) => continue,
+                Err(error) => {
+                    if !failure_reported {
+                        if send_reconnect_failed(&tx, error).is_err() {
+                            return;
+                        }
+                        failure_reported = true;
+                    }
+                }
             }
         }
     }
@@ -267,13 +276,20 @@ async fn run_controllable_connection_manager(
                                 }
                                 // Attempt immediate connection before falling back
                                 // to the periodic retry loop.
-                                if let Ok(client) = connector.connect().await {
-                                    let (new_reader, writer) = client.into_split();
-                                    let writer = spawn_writer_task(writer);
-                                    if tx.send(ConnectionEvent::Reconnected { writer }).is_err() {
-                                        return;
+                                match connector.connect().await {
+                                    Ok(client) => {
+                                        let (new_reader, writer) = client.into_split();
+                                        let writer = spawn_writer_task(writer);
+                                        if tx.send(ConnectionEvent::Reconnected { writer }).is_err() {
+                                            return;
+                                        }
+                                        reader_opt = Some(new_reader);
                                     }
-                                    reader_opt = Some(new_reader);
+                                    Err(error) => {
+                                        if send_reconnect_failed(&tx, error).is_err() {
+                                            return;
+                                        }
+                                    }
                                 }
                                 continue 'outer;
                             }
@@ -285,6 +301,7 @@ async fn run_controllable_connection_manager(
         }
 
         // ── Reconnect phase ────────────────────────────────────────────────
+        let mut failure_reported = false;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(reconnect_delay) => {
@@ -298,7 +315,14 @@ async fn run_controllable_connection_manager(
                             reader_opt = Some(new_reader);
                             continue 'outer;
                         }
-                        Err(_) => continue,
+                        Err(error) => {
+                            if !failure_reported {
+                                if send_reconnect_failed(&tx, error).is_err() {
+                                    return;
+                                }
+                                failure_reported = true;
+                            }
+                        }
                     }
                 }
                 cmd = cmd_rx.recv() => {
@@ -316,7 +340,12 @@ async fn run_controllable_connection_manager(
                                     reader_opt = Some(new_reader);
                                     continue 'outer;
                                 }
-                                Err(_) => continue,
+                                Err(error) => {
+                                    if send_reconnect_failed(&tx, error).is_err() {
+                                        return;
+                                    }
+                                    failure_reported = true;
+                                }
                             }
                         }
                         Some(ReconnectCmd::Shutdown) | None => return,
@@ -325,6 +354,16 @@ async fn run_controllable_connection_manager(
             }
         }
     }
+}
+
+fn send_reconnect_failed(
+    tx: &mpsc::UnboundedSender<ConnectionEvent>,
+    error: anyhow::Error,
+) -> Result<(), ()> {
+    tx.send(ConnectionEvent::ReconnectFailed {
+        message: format!("{error:#}"),
+    })
+    .map_err(|_| ())
 }
 
 async fn read_until_disconnect(
@@ -487,6 +526,80 @@ mod tests {
             .expect("new daemon stream not received");
 
         // Drop the initial daemon stream (already detached after SwitchTarget).
+        drop(initial_daemon_stream);
+    }
+
+    #[tokio::test]
+    async fn switch_target_reports_failed_attempt_and_keeps_retrying() {
+        let (initial_client_stream, initial_daemon_stream) = duplex(256);
+        let initial_client = CuedClient::from_stream(initial_client_stream);
+        let (initial_reader, _initial_writer) = initial_client.into_split();
+
+        let (new_daemon_tx, mut new_daemon_rx) = mpsc::unbounded_channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let new_connector = ClientConnector::new({
+            let attempts = attempts.clone();
+            let new_daemon_tx = new_daemon_tx.clone();
+            move || {
+                let attempts = attempts.clone();
+                let new_daemon_tx = new_daemon_tx.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::Relaxed) == 0 {
+                        anyhow::bail!("dial failed");
+                    }
+                    let (client_stream, daemon_stream) = duplex(256);
+                    new_daemon_tx
+                        .send(daemon_stream)
+                        .expect("send daemon stream");
+                    Ok(CuedClient::from_stream(client_stream))
+                }
+            }
+        });
+
+        let initial_connector = ClientConnector::new(move || async move {
+            let (client_stream, _daemon) = duplex(256);
+            Ok(CuedClient::from_stream(client_stream))
+        });
+
+        let (mut event_rx, cmd_tx) = spawn_connection_manager_controllable_with_delay(
+            Some(initial_reader),
+            initial_connector,
+            Duration::from_millis(10),
+        );
+
+        cmd_tx
+            .send(ReconnectCmd::SwitchTarget(new_connector))
+            .await
+            .expect("send SwitchTarget");
+
+        let disconnected = timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout waiting for Disconnected")
+            .expect("channel closed");
+        assert!(matches!(disconnected, ConnectionEvent::Disconnected));
+
+        let failed = timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout waiting for ReconnectFailed")
+            .expect("channel closed");
+        match failed {
+            ConnectionEvent::ReconnectFailed { message } => {
+                assert!(message.contains("dial failed"), "{message}");
+            }
+            _ => panic!("expected ReconnectFailed"),
+        }
+
+        let reconnected = timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("timeout waiting for Reconnected")
+            .expect("channel closed");
+        assert!(matches!(reconnected, ConnectionEvent::Reconnected { .. }));
+        let _new_daemon_stream = new_daemon_rx
+            .recv()
+            .await
+            .expect("new daemon stream not received");
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
         drop(initial_daemon_stream);
     }
 }

@@ -72,6 +72,7 @@ pub fn spawn_event_loop(
                     Message::Request { .. } => continue,
                 },
                 ConnectionEvent::Disconnected => AppMsg::Disconnected,
+                ConnectionEvent::ReconnectFailed { message } => AppMsg::ReconnectFailed { message },
                 ConnectionEvent::Reconnected { writer } => AppMsg::Reconnected { writer },
             };
             if tx_sock.send(msg).is_err() {

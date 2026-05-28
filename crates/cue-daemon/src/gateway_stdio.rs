@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::task::JoinHandle;
+use tracing::warn;
 
 /// Connect to the local gateway socket and relay raw IPC bytes over stdio.
 pub async fn run(socket_path: PathBuf) -> Result<()> {
@@ -58,15 +60,28 @@ where
     tokio::select! {
         result = &mut stdin_task => {
             let result = result.context("join stdin relay task")?;
-            stdout_task.abort();
-            let _ = stdout_task.await;
+            abort_peer_task(stdout_task, "stdout").await;
             normalize_disconnect(result)
         }
         result = &mut stdout_task => {
             let result = result.context("join stdout relay task")?;
-            stdin_task.abort();
-            let _ = stdin_task.await;
+            abort_peer_task(stdin_task, "stdin").await;
             normalize_disconnect(result)
+        }
+    }
+}
+
+async fn abort_peer_task(task: JoinHandle<Result<()>>, direction: &'static str) {
+    task.abort();
+    match task.await {
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => {
+            warn!(direction, err = %error, "gateway stdio peer relay task failed");
+        }
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if is_disconnect_error(&error) => {}
+        Ok(Err(error)) => {
+            warn!(direction, err = %error, "gateway stdio peer relay returned an error");
         }
     }
 }
@@ -97,11 +112,34 @@ fn is_disconnect_error(err: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
     use cue_core::ipc::{Message, OkPayload, RequestPayload, ResponsePayload, encode_message};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, duplex};
     use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Err(std::io::Error::other("stdout sink failed")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[tokio::test]
     async fn relays_ipc_bytes_in_both_directions() {
@@ -127,7 +165,7 @@ mod tests {
 
         let response = encode_message(&Message::Response {
             id: 7,
-            payload: ResponsePayload::Ok(OkPayload::Pong {}),
+            payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
         })
         .unwrap();
         daemon_socket.write_all(&response).await.unwrap();
@@ -162,5 +200,26 @@ mod tests {
         .await
         .expect("bridge timed out")
         .expect("bridge failed");
+    }
+
+    #[tokio::test]
+    async fn propagates_stdout_write_errors() {
+        let (_client_input, relay_input) = duplex(64);
+        let (relay_socket, mut daemon_socket) = duplex(64);
+
+        let bridge = tokio::spawn(relay(relay_input, FailingWriter, relay_socket));
+
+        daemon_socket.write_all(b"reply bytes").await.unwrap();
+
+        let error = timeout(Duration::from_secs(1), bridge)
+            .await
+            .expect("bridge timed out")
+            .expect("bridge task panicked")
+            .expect_err("bridge should fail when stdout write fails");
+        assert!(
+            error.to_string().contains("relay socket to stdout"),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("stdout sink failed"));
     }
 }

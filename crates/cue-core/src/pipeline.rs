@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 // ── Job-internal execution plan ──
@@ -99,6 +101,71 @@ impl Pipeline {
                 command,
                 pipe_to_next: None,
             }],
+        }
+    }
+}
+
+impl fmt::Display for PipeOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Stdout => "|>",
+            Self::StdoutStderr => "|&>",
+            Self::StderrOnly => "|!>",
+        })
+    }
+}
+
+impl fmt::Display for SerialOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Then => "->",
+            Self::Always => "~>",
+        })
+    }
+}
+
+impl fmt::Display for ParallelOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::All => "|||",
+            Self::Race => "|?|",
+        })
+    }
+}
+
+impl fmt::Display for Pipeline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (idx, segment) in self.segments.iter().enumerate() {
+            if idx > 0 {
+                f.write_str(" ")?;
+            }
+
+            let cmd = segment.command.join(" ");
+            match segment.pipe_to_next {
+                Some(op) => write!(f, "{cmd} {op}")?,
+                None => f.write_str(&cmd)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for JobPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pipeline(pipeline) => write!(f, "{pipeline}"),
+            Self::And { left, right } => write!(f, "{left} && {right}"),
+            Self::Or { left, right } => write!(f, "{left} || {right}"),
+        }
+    }
+}
+
+impl fmt::Display for ChainNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Leaf(plan) => write!(f, "{plan}"),
+            Self::Serial { left, op, right } => write!(f, "{left} {op} {right}"),
+            Self::Parallel { left, op, right } => write!(f, "{left} {op} {right}"),
         }
     }
 }
@@ -230,5 +297,43 @@ mod tests {
             "python".into(),
             "script.py".into(),
         ]));
+    }
+
+    #[test]
+    fn display_pipeline_job_plan_and_chain() {
+        let pipeline = Pipeline {
+            segments: vec![
+                PipeSegment {
+                    command: vec!["printf".into(), "hi".into()],
+                    pipe_to_next: Some(PipeOp::Stdout),
+                },
+                PipeSegment {
+                    command: vec!["grep".into(), "h".into()],
+                    pipe_to_next: Some(PipeOp::StderrOnly),
+                },
+                PipeSegment {
+                    command: vec!["wc".into(), "-l".into()],
+                    pipe_to_next: None,
+                },
+            ],
+        };
+        assert_eq!(pipeline.to_string(), "printf hi |> grep h |!> wc -l");
+
+        let plan = JobPlan::And {
+            left: Box::new(JobPlan::simple(vec!["cargo".into(), "test".into()])),
+            right: Box::new(JobPlan::simple(vec!["cargo".into(), "clippy".into()])),
+        };
+        assert_eq!(plan.to_string(), "cargo test && cargo clippy");
+
+        let chain = ChainNode::Serial {
+            left: Box::new(ChainNode::Leaf(JobPlan::simple(vec!["build".into()]))),
+            op: SerialOp::Then,
+            right: Box::new(ChainNode::Parallel {
+                left: Box::new(ChainNode::Leaf(JobPlan::simple(vec!["test".into()]))),
+                op: ParallelOp::All,
+                right: Box::new(ChainNode::Leaf(JobPlan::simple(vec!["lint".into()]))),
+            }),
+        };
+        assert_eq!(chain.to_string(), "build -> test ||| lint");
     }
 }

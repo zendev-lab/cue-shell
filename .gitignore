@@ -24,3 +24,4 @@
 lcov.info
 *.profraw
 *.profdata
+.spark/

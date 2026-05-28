@@ -292,6 +292,23 @@ async fn route_request(
             match Parser::parse(&input) {
                 Ok(ast) => match Resolver::resolve(ast, mode) {
                     Ok(command) => {
+                        if matches!(
+                            command,
+                            crate::parser::resolver::ResolvedCommand::Script {
+                                source: cue_core::ipc::ScriptSource::Inline,
+                                ..
+                            }
+                        ) {
+                            sys.gateway
+                                .send(GatewayMsg::SendResponse {
+                                    client_id,
+                                    request_id,
+                                    payload: inline_script_disabled_response(),
+                                })
+                                .await
+                                .context("send inline script rejection")?;
+                            return Ok(());
+                        }
                         sys.scheduler
                             .send(SchedulerMsg::Eval {
                                 client_id,
@@ -303,6 +320,54 @@ async fn route_request(
                     }
                     Err(e) => {
                         // Parse/resolve error → respond immediately.
+                        sys.gateway
+                            .send(GatewayMsg::SendResponse {
+                                client_id,
+                                request_id,
+                                payload: ResponsePayload::err(
+                                    error_code::INVALID_SYNTAX,
+                                    syntax_error_message(&input, &e.to_string()),
+                                ),
+                            })
+                            .await
+                            .context("send error response")?;
+                    }
+                },
+                Err(e) => {
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: ResponsePayload::err(
+                                error_code::INVALID_SYNTAX,
+                                syntax_error_message(&input, &e.to_string()),
+                            ),
+                        })
+                        .await
+                        .context("send error response")?;
+                }
+            }
+        }
+
+        RequestPayload::RunScript { path, input, mode } => {
+            match Parser::parse_file_script(&input) {
+                Ok(ast) => match Resolver::resolve(ast, mode) {
+                    Ok(mut command) => {
+                        if let crate::parser::resolver::ResolvedCommand::Script { source, .. } =
+                            &mut command
+                        {
+                            *source = cue_core::ipc::ScriptSource::File { path };
+                        }
+                        sys.scheduler
+                            .send(SchedulerMsg::Eval {
+                                client_id,
+                                request_id,
+                                command,
+                            })
+                            .await
+                            .context("send script to scheduler")?;
+                    }
+                    Err(e) => {
                         sys.gateway
                             .send(GatewayMsg::SendResponse {
                                 client_id,
@@ -594,7 +659,9 @@ async fn route_request(
                 .send(GatewayMsg::SendResponse {
                     client_id,
                     request_id,
-                    payload: ResponsePayload::Ok(OkPayload::Pong {}),
+                    payload: ResponsePayload::Ok(OkPayload::Pong {
+                        version: Some(crate::version().to_string()),
+                    }),
                 })
                 .await?;
         }
@@ -616,6 +683,13 @@ async fn route_request(
     }
 
     Ok(())
+}
+
+fn inline_script_disabled_response() -> ResponsePayload {
+    ResponsePayload::err(
+        error_code::NOT_SUPPORTED,
+        "interactive multiline script submissions have been removed; write the items to a .cue file and run `cue run path/to/file.cue`",
+    )
 }
 
 fn syntax_error_message(input: &str, base: &str) -> String {
@@ -789,7 +863,7 @@ mod tests {
         let (mut a, mut b) = UnixStream::pair().unwrap();
         let msg = Message::Response {
             id: 1,
-            payload: ResponsePayload::Ok(OkPayload::Pong {}),
+            payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
         };
         write_message(&mut a, &msg).await.unwrap();
         let decoded = read_message(&mut b).await.unwrap();
@@ -797,7 +871,7 @@ mod tests {
             decoded,
             Message::Response {
                 id: 1,
-                payload: ResponsePayload::Ok(OkPayload::Pong {}),
+                payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
             }
         ));
     }
@@ -813,6 +887,27 @@ mod tests {
         let items = complete_input(":run(re", 7);
         assert!(items.iter().any(|item| item.label == "retry"));
         assert!(items.iter().any(|item| item.label == "retry_delay"));
+    }
+
+    #[test]
+    fn inline_multiline_script_rejection_points_to_cue_run() {
+        let ast = Parser::parse("cargo test\n:run cargo clippy").unwrap();
+        let command = Resolver::resolve(ast, cue_core::Mode::Job).unwrap();
+        assert!(matches!(
+            command,
+            crate::parser::resolver::ResolvedCommand::Script {
+                source: cue_core::ipc::ScriptSource::Inline,
+                ..
+            }
+        ));
+        let response = inline_script_disabled_response();
+        match response {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, error_code::NOT_SUPPORTED);
+                assert!(message.contains("cue run path/to/file.cue"));
+            }
+            _ => panic!("expected error response"),
+        }
     }
 
     #[test]

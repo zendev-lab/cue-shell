@@ -41,40 +41,61 @@ pub struct CommandSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeParamSpec {
     pub name: &'static str,
+    pub value_kind: ModeParamValueKind,
     pub value_hint: &'static str,
     pub detail: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeParamValueKind {
+    String,
+    NonNegativeInt,
+    Duration,
+    Bool,
 }
 
 pub const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
     ModeParamSpec {
         name: "cwd",
+        value_kind: ModeParamValueKind::String,
         value_hint: "/path",
         detail: "Run from this working directory without moving HEAD",
     },
     ModeParamSpec {
         name: "retry",
+        value_kind: ModeParamValueKind::NonNegativeInt,
         value_hint: "3",
         detail: "Retry failed jobs up to this count",
     },
     ModeParamSpec {
         name: "retry_delay",
+        value_kind: ModeParamValueKind::Duration,
         value_hint: "5s",
         detail: "Delay between retry attempts",
     },
     ModeParamSpec {
         name: "timeout",
+        value_kind: ModeParamValueKind::Duration,
         value_hint: "30s",
         detail: "Fail the job after this duration",
     },
     ModeParamSpec {
         name: "wrapper",
+        value_kind: ModeParamValueKind::Bool,
         value_hint: "true",
         detail: "Override the runtime wrapper for this invocation",
     },
     ModeParamSpec {
         name: "scope",
+        value_kind: ModeParamValueKind::Bool,
         value_hint: "true",
         detail: "Allow run jobs to update the chain scope",
+    },
+    ModeParamSpec {
+        name: "pty",
+        value_kind: ModeParamValueKind::Bool,
+        value_hint: "false",
+        detail: "Run the job without allocating a PTY",
     },
 ];
 
@@ -256,7 +277,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         arg_kind: CommandArgKind::OptionalText,
         usage: ":scope [subcommand]",
         detail: "Inspect or manage scope snapshots",
-        accepts_mode_params: true,
+        accepts_mode_params: false,
         documented: true,
     },
     CommandSpec {
@@ -319,6 +340,10 @@ pub fn command_spec(name: &str) -> Option<&'static CommandSpec> {
     COMMAND_SPECS.iter().find(|spec| spec.name == name)
 }
 
+pub fn mode_param_spec(name: &str) -> Option<&'static ModeParamSpec> {
+    MODE_PARAM_SPECS.iter().find(|spec| spec.name == name)
+}
+
 pub fn command_names() -> impl Iterator<Item = &'static str> {
     COMMAND_SPECS.iter().map(|spec| spec.name)
 }
@@ -363,6 +388,18 @@ mod tests {
         let mut names = std::collections::BTreeSet::new();
         for spec in COMMAND_SPECS {
             assert!(names.insert(spec.name), "duplicate command `{}`", spec.name);
+        }
+    }
+
+    #[test]
+    fn mode_param_names_are_unique() {
+        let mut names = std::collections::BTreeSet::new();
+        for spec in MODE_PARAM_SPECS {
+            assert!(
+                names.insert(spec.name),
+                "duplicate mode parameter `{}`",
+                spec.name
+            );
         }
     }
 

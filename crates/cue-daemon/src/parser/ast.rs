@@ -9,7 +9,7 @@ use super::token::{IdKind, Span, Value};
 /// Top-level parsed input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ast {
-    /// Multiline script input containing multiple top-level statements.
+    /// File-script body containing one or more top-level statements.
     Script {
         items: Vec<ScriptItemAst>,
         span: Span,

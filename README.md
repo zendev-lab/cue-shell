@@ -14,7 +14,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 - **Three-layer architecture**: Process substrate (`cued` daemon) → Core model → Frontends (TUI/MCP/API)
 - **Primary interaction modes**: JOB ⚡ · CRON ⏰ — switch with `Shift+Tab`
 - **`:` prefix commands**: Vim-style builtin access (`:run`, `:kill`, `:jobs`, `:cron`, ...)
-- **Multiline script submission**: multiline JOB input submits one `R<n>` script that fans out into async chains/jobs
+- **`.cue` file scripts**: `cue run <file.cue>` submits one `R<n>` script with fail-fast execution
 - **Foreground PTY attach**: `:fg J<n>` proxies a real terminal session with input, paste, and resize support
 - **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
@@ -93,6 +93,7 @@ See [`docs/design/README.md`](docs/design/README.md) for the design index:
 - **Design overview** — Three-layer architecture, crates, primitives, IPC summary
 - **conceptual-model.md** — Jobs/scopes indexing, sequential composition, atomic tool surface
 - **commands-and-modes.md** — Command reference, mode system, `:cron` syntax
+- **cue-script.md** — `.cue` file script contract for `cue run <file.cue>`
 
 ## Client + server config
 
@@ -105,22 +106,23 @@ During migration, cue-shell still falls back to the legacy combined
 `config.toml`. If you keep using that file for now, put client transport under
 `[transport]`.
 
-### Multiline script mode
+### `.cue` file script mode
 
-In JOB mode, multiline input is treated as one script submission. Each top-level
-line becomes one chain submission, and cue returns a stable `R -> C -> J`
-mapping:
+Scripts are `.cue` files executed through the explicit CLI entry:
 
 ```text
-cat _typos.toml |> rg files
-||| cat Cargo.toml |> rg author
+cue run examples/hello.cue
 ```
 
-- the submission gets a script id such as `R12`
-- items are dispatched asynchronously, but cue waits for item `N`'s creation ack
-  before submitting item `N+1`
-- canonical output still belongs to jobs (`:out J<n>`, `:tail J<n>`, `:err J<n>`)
-- the TUI shows one script card summarizing the `R -> C -> J` mapping
+A script run gets an id such as `R12`. Top-level items run in file order with
+fail-fast semantics: if one item exits non-zero, later items are not submitted
+and `cue run` exits with that code. Output still belongs canonically to jobs,
+while `cue run` subscribes to live output and mirrors stdout/stderr to the
+calling terminal.
+
+Interactive JOB multiline input is not a script entry point; put multi-item
+workflows in a `.cue` file. See [`docs/design/cue-script.md`](docs/design/cue-script.md)
+and [`examples/`](examples/).
 
 ### Client transport and extension config
 

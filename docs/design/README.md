@@ -36,7 +36,7 @@ the tool surface stays “atomic”, see [conceptual-model.md](conceptual-model.
 | **cue-core** | Shared types, parser, protocol definitions |
 | **cued** | Background daemon — process substrate, scheduler, process manager, scope store |
 | **cue-tui** | Interactive TUI client (ratatui + crossterm) |
-| **cue-cli** | Headless CLI client for scripting |
+| **cue-cli** | Headless CLI client for `cue run <file.cue>` and extension dispatch |
 
 ## Core Primitives
 
@@ -115,6 +115,7 @@ Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default sc
 |---|---|
 | [conceptual-model.md](conceptual-model.md) | Formal-ish model: jobs, scopes, indexing, composition, tool atoms |
 | [commands-and-modes.md](commands-and-modes.md) | Complete command reference, modes, cron syntax |
+| [cue-script.md](cue-script.md) | `.cue` file-script mode — `cue run`, syntax, scope, exit semantics |
 | [core-types.md](core-types.md) | Rust type definitions — Scope, Job, Cron, Pipeline, Chain |
 | [tui.md](tui.md) | TUI architecture, layout, interaction design |
 | [ipc-protocol.md](ipc-protocol.md) | cued ↔ client protocol specification |

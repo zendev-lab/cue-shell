@@ -9,6 +9,7 @@
 //! ```
 
 pub mod ast;
+mod duration;
 pub mod parse;
 pub mod resolver;
 pub mod token;

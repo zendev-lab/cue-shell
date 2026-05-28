@@ -1,5 +1,6 @@
 use anyhow::bail;
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 #[cfg(feature = "extensions")]
 use anyhow::Context;
@@ -13,6 +14,7 @@ enum CueCommand {
     Help,
     Tui,
     Version,
+    Run { path: PathBuf },
     Extension { name: String, args: Vec<OsString> },
 }
 
@@ -27,6 +29,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         CueCommand::Tui => run_tui(),
+        CueCommand::Run { path } => run_script(path),
         CueCommand::Extension { name, args } => run_extension(&name, &args),
     }
 }
@@ -54,6 +57,19 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
             }
             Ok(CueCommand::Tui)
         }
+        Some("run") => {
+            let Some(path) = args.next() else {
+                bail!("`cue run` expects a .cue file path");
+            };
+            if args.next().is_some() {
+                bail!("`cue run` accepts exactly one .cue file path");
+            }
+            let path = PathBuf::from(path);
+            if path.extension().and_then(|ext| ext.to_str()) != Some("cue") {
+                bail!("`cue run` only accepts files with the .cue extension");
+            }
+            Ok(CueCommand::Run { path })
+        }
         Some(other) => Ok(CueCommand::Extension {
             name: other.to_string(),
             args: args.collect(),
@@ -69,6 +85,17 @@ fn run_tui() -> anyhow::Result<()> {
 #[cfg(not(feature = "tui"))]
 fn run_tui() -> anyhow::Result<()> {
     bail!("`cue tui` is unavailable because cue-cli was built without the `tui` feature")
+}
+
+#[cfg(feature = "tui")]
+fn run_script(path: PathBuf) -> anyhow::Result<()> {
+    let code = cue_cli::run_script(path)?;
+    std::process::exit(code);
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_script(_path: PathBuf) -> anyhow::Result<()> {
+    bail!("`cue run` is unavailable because cue-cli was built without the `tui` feature")
 }
 
 #[cfg(feature = "extensions")]
@@ -138,16 +165,16 @@ fn help_text() -> String {
     };
 
     format!(
-        "cue {}\n\nUsage: cue [tui]{extension_usage}\n       cue --version\n\nCommands:\n{tui_help}{extension_help}\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        "cue {}\n\nUsage: cue [tui]{extension_usage}\n       cue run <file.cue>\n       cue --version\n\nCommands:\n{tui_help}\n  run        Run a .cue script file{extension_help}\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
         env!("CARGO_PKG_VERSION"),
     )
 }
 
 fn supported_subcommands() -> &'static str {
     if cfg!(feature = "tui") {
-        "tui, help, version"
+        "tui, run, help, version"
     } else {
-        "help, version"
+        "run, help, version"
     }
 }
 
@@ -195,6 +222,45 @@ mod tests {
         .expect_err("extra tui args should fail");
 
         assert!(format!("{error:#}").contains("`cue tui` does not accept extra arguments"));
+    }
+
+    #[test]
+    fn parse_command_accepts_run_cue_file() {
+        assert_eq!(
+            parse_command([
+                OsString::from("cue"),
+                OsString::from("run"),
+                OsString::from("build.cue")
+            ])
+            .expect("parse command"),
+            CueCommand::Run {
+                path: PathBuf::from("build.cue"),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_command_rejects_invalid_run_args() {
+        let missing = parse_command([OsString::from("cue"), OsString::from("run")])
+            .expect_err("missing path should fail");
+        assert!(format!("{missing:#}").contains("expects a .cue file path"));
+
+        let non_cue = parse_command([
+            OsString::from("cue"),
+            OsString::from("run"),
+            OsString::from("build.sh"),
+        ])
+        .expect_err("non-.cue path should fail");
+        assert!(format!("{non_cue:#}").contains(".cue extension"));
+
+        let extra = parse_command([
+            OsString::from("cue"),
+            OsString::from("run"),
+            OsString::from("build.cue"),
+            OsString::from("extra"),
+        ])
+        .expect_err("extra args should fail");
+        assert!(format!("{extra:#}").contains("exactly one .cue file path"));
     }
 
     #[test]

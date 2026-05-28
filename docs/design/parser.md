@@ -11,10 +11,14 @@ Raw input (String)
   → Resolver   → ResolvedCommand (validated, ready for execution)
 ```
 
-Client sends `Eval { input }` over IPC; cued runs the full pipeline.
+Interactive clients send `Eval { input }` over IPC; cued runs the full pipeline.
+File scripts are loaded through `cue run <file.cue>` and use the same parser with
+a file-script source mode.
 
-Multiline input is parsed as a **top-level script**: newline separates items only
-at top level, and only when the current chain is already syntactically complete.
+File-script bodies are parsed as a **top-level script**: newline separates items
+only at top level, and only when the current chain is already syntactically
+complete. Interactive JOB multiline input is not a script-mode entry point; see
+[cue-script.md](cue-script.md).
 
 ## 2. Implementation
 
@@ -189,7 +193,7 @@ schedule    = "every" DURATION
 
 Notes:
 
-- newline is a script-item separator only at the top level
+- in file-script source mode, newline is a script-item separator only at the top level
 - newline inside an unfinished chain behaves like whitespace, so operators can be
   wrapped across lines naturally
 - resolver can therefore return either one normal command or one script command
@@ -290,8 +294,8 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, retry, retry_delay, timeout, wrapper) |
+| `:run` | Chain | ✓ (cwd, retry, retry_delay, timeout, wrapper, scope, pty) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, retry, retry_delay, timeout, wrapper, scope, pty) |
 | `:kill` | IdRef | ✗ |
 | `:retry` | IdRef | ✗ |
 | `:out` | IdRef | ✗ |

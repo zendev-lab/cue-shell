@@ -19,7 +19,7 @@ use cue_core::command_spec::command_names;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
-    ScriptItemInfo, ScriptItemResult, ScriptSubmitError, Stream,
+    ScriptItemInfo, ScriptItemResult, ScriptRunStatus, ScriptSource, ScriptSubmitError, Stream,
 };
 use cue_core::job::JobStatus;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -97,6 +97,7 @@ pub enum AppMsg {
     // Socket lifecycle
     Connected,
     Disconnected,
+    ReconnectFailed { message: String },
     Reconnected { writer: WriterHandle },
     Response { id: u32, payload: ResponsePayload },
     ServerEvent(EventPayload),
@@ -333,6 +334,8 @@ pub struct AppState {
     cron_job_cards: HashMap<String, (String, usize)>,
     /// Maps chain_id → card_index for chain cards.
     chain_cards: HashMap<String, usize>,
+    /// Maps script_id → card_index for script summary cards.
+    script_cards: HashMap<String, usize>,
     fg_session: Option<FgSession>,
     display_tabs: Vec<DisplayTab>,
     active_display_tab: Option<usize>,
@@ -371,6 +374,7 @@ impl AppState {
             job_cards: HashMap::new(),
             cron_job_cards: HashMap::new(),
             chain_cards: HashMap::new(),
+            script_cards: HashMap::new(),
             fg_session: None,
             display_tabs: Vec::new(),
             active_display_tab: None,
@@ -455,7 +459,17 @@ impl AppState {
     }
 
     pub fn target_settings_can_save(&self) -> bool {
-        self.target_settings.is_some()
+        self.target_settings
+            .as_ref()
+            .and_then(|state| {
+                let selected = state.selected_profile_name()?;
+                state
+                    .snapshot
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.name == selected)
+            })
+            .is_some_and(target_profile_can_be_saved)
     }
 
     pub fn footer_text(&self) -> String {
@@ -1161,6 +1175,17 @@ impl AppState {
         }) else {
             return;
         };
+
+        let selected_profile = snapshot.profiles.iter().find(|p| p.name == profile_name);
+        if selected_profile.is_some_and(|profile| !target_profile_can_be_saved(profile)) {
+            if let Some(state) = self.target_settings.as_mut() {
+                state.notice = Some(format!(
+                    "`{profile_name}` is not a usable target profile; fix the config and reload"
+                ));
+                state.pending_reconnect_profile = None;
+            }
+            return;
+        }
 
         if snapshot.default_profile == profile_name {
             if let Some(state) = self.target_settings.as_mut() {
@@ -1877,6 +1902,7 @@ impl AppState {
                     self.clear_display_pane();
                     self.job_cards.clear();
                     self.chain_cards.clear();
+                    self.script_cards.clear();
                     self.refresh_clear_action();
                 }
             }
@@ -1974,6 +2000,20 @@ impl AppState {
                 self.status_bar.update(StatusBarMsg::SetConnected(false));
             }
 
+            AppMsg::ReconnectFailed { message } => {
+                self.connected = false;
+                self.writer = None;
+                self.status_bar.update(StatusBarMsg::SetConnected(false));
+                if let Some(state) = self.target_settings.as_mut() {
+                    state.notice = Some(match self.pending_reconnect_profile_name.as_deref() {
+                        Some(profile) => {
+                            format!("reconnect to `{profile}` failed: {message}; retrying")
+                        }
+                        None => format!("reconnect failed: {message}; retrying"),
+                    });
+                }
+            }
+
             AppMsg::Reconnected { writer } => {
                 self.writer = Some(writer);
                 self.connected = true;
@@ -2013,6 +2053,7 @@ impl AppState {
                         }
                         OkPayload::ScriptCreated {
                             script_id,
+                            source,
                             items,
                             submit_error,
                         } => {
@@ -2068,16 +2109,21 @@ impl AppState {
                             if let Some(pending) = pending.as_ref()
                                 && !pending.silent
                             {
-                                self.show_submission_result(
+                                let card_index = self.show_submission_result(
                                     pending,
-                                    format_script_submission(&items, submit_error.as_ref()),
+                                    format_script_submission(
+                                        &source,
+                                        &items,
+                                        submit_error.as_ref(),
+                                    ),
                                     if submit_error.is_some() {
                                         CardStatus::Error
                                     } else {
-                                        CardStatus::Success
+                                        CardStatus::Streaming
                                     },
-                                    Some(script_id),
+                                    Some(script_id.clone()),
                                 );
+                                self.script_cards.insert(script_id, card_index);
                             }
                         }
                         OkPayload::JobCreated {
@@ -2235,8 +2281,8 @@ impl AppState {
                                 );
                             }
                         }
-                        OkPayload::Pong {} => {
-                            tracing::debug!("pong received");
+                        OkPayload::Pong { version } => {
+                            tracing::debug!(?version, "pong received");
                         }
                         OkPayload::Output {
                             id,
@@ -2402,6 +2448,27 @@ impl AppState {
                             CardStatus::Error
                         };
                         self.main_view.set_card_status(card_index, status);
+                    }
+                }
+                EventPayload::ScriptFinished {
+                    script_id,
+                    status,
+                    exit_code,
+                    failed_item_index,
+                } => {
+                    if let Some(&card_index) = self.script_cards.get(&script_id) {
+                        self.main_view.append_card_output(
+                            card_index,
+                            &format_script_finished(status, exit_code, failed_item_index),
+                        );
+                        self.main_view.set_card_status(
+                            card_index,
+                            if status == ScriptRunStatus::Done {
+                                CardStatus::Success
+                            } else {
+                                CardStatus::Error
+                            },
+                        );
                     }
                 }
                 EventPayload::FgOutput { data } => {
@@ -2769,10 +2836,14 @@ fn truncate_display_text(text: &str, max_chars: usize) -> String {
 }
 
 fn format_script_submission(
+    source: &ScriptSource,
     items: &[ScriptItemInfo],
     submit_error: Option<&ScriptSubmitError>,
 ) -> String {
     let mut lines = vec![format!("submitted {} item(s)", items.len())];
+    if let ScriptSource::File { path } = source {
+        lines.push(format!("source: {path}"));
+    }
     for item in items {
         lines.push(format!(
             "{}. {} -> {}",
@@ -2792,6 +2863,18 @@ fn format_script_submission(
         ));
     }
     lines.join("\n")
+}
+
+fn format_script_finished(
+    status: ScriptRunStatus,
+    exit_code: i32,
+    failed_item_index: Option<usize>,
+) -> String {
+    let mut text = format!("\nscript finished: {status:?}, exit={exit_code}");
+    if let Some(index) = failed_item_index {
+        text.push_str(&format!(" (failed at item {})", index + 1));
+    }
+    text
 }
 
 fn format_script_item_result(result: &ScriptItemResult) -> String {
@@ -3238,6 +3321,10 @@ fn target_profile_supports_live_reconnect(
     profile.transport == "unix"
 }
 
+fn target_profile_can_be_saved(profile: &crate::target_config::TargetProfileSummary) -> bool {
+    profile.is_usable_target()
+}
+
 fn format_job_record(
     job_id: &str,
     status: &JobStatus,
@@ -3577,6 +3664,26 @@ mod tests {
 
     fn queue_pending(state: &mut AppState, id: u32, pending: PendingSubmission) {
         state.track_pending_submission(id, pending);
+    }
+
+    #[test]
+    fn script_submission_format_includes_file_source() {
+        let text = format_script_submission(
+            &ScriptSource::File {
+                path: "scripts/build.cue".into(),
+            },
+            &[],
+            None,
+        );
+        assert!(text.contains("submitted 0 item(s)"));
+        assert!(text.contains("source: scripts/build.cue"));
+    }
+
+    #[test]
+    fn script_finished_format_includes_exit_and_failed_item() {
+        let text = format_script_finished(ScriptRunStatus::Failed, 2, Some(1));
+        assert!(text.contains("exit=2"));
+        assert!(text.contains("failed at item 2"));
     }
 
     fn test_target_profile(
@@ -4363,6 +4470,39 @@ destination = "devbox"
     }
 
     #[test]
+    fn reconnect_failure_notice_keeps_pending_profile_for_retry() {
+        let mut state = AppState::new();
+        state.pending_reconnect_profile_name = Some("alt".into());
+        state.connected = true;
+        state.status_bar.update(StatusBarMsg::SetConnected(true));
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "alt",
+            vec![test_target_profile(
+                "alt",
+                "unix",
+                "socket: /tmp/alt.sock",
+                TargetProfileSource::Configured,
+            )],
+        )));
+
+        state.update(AppMsg::ReconnectFailed {
+            message: "dial failed".into(),
+        });
+
+        assert!(!state.connected);
+        assert_eq!(state.pending_reconnect_profile_name.as_deref(), Some("alt"));
+        let notice = state
+            .target_settings
+            .as_ref()
+            .and_then(|state| state.notice.as_deref())
+            .expect("reconnect failure notice");
+        assert!(notice.contains("alt"), "{notice}");
+        assert!(notice.contains("dial failed"), "{notice}");
+        assert!(notice.contains("retrying"), "{notice}");
+    }
+
+    #[test]
     fn target_settings_mouse_click_selects_profile() {
         let mut state = AppState::new();
         state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
@@ -4445,6 +4585,36 @@ destination = "devbox"
         let view = format_target_settings_view(&state, Some("local"));
 
         assert!(view.content.contains("[default, selected, missing]"));
+    }
+
+    #[test]
+    fn target_settings_does_not_save_missing_profile() {
+        let mut state = AppState::new();
+        state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
+            "/tmp/client.toml",
+            "remote",
+            vec![test_target_profile(
+                "remote",
+                "missing",
+                "profile is referenced by default_profile but not defined",
+                TargetProfileSource::Missing,
+            )],
+        )));
+
+        assert!(!state.target_settings_can_save());
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        assert!(
+            state
+                .target_settings
+                .as_ref()
+                .and_then(|state| state.notice.as_deref())
+                .is_some_and(|notice| notice.contains("not a usable target profile"))
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -177,6 +177,10 @@ pub fn run() {
 // ── Start ──
 
 fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<()> {
+    let socket_path = socket_override
+        .clone()
+        .unwrap_or_else(crate::dirs::socket_path);
+
     if force {
         // When the service manager owns cued, delegate restart to it rather than
         // sending a raw SIGTERM (which would fight launchd/systemd's KeepAlive).
@@ -186,9 +190,9 @@ fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<
             println!("cued: daemon restarted");
             return Ok(());
         }
-        force_stop_if_running()?;
+        force_stop_if_running(&socket_path)?;
     } else {
-        ensure_not_running()?;
+        ensure_not_running(&socket_path)?;
     }
 
     if fg {
@@ -274,7 +278,7 @@ fn run_start_foreground(socket_override: Option<PathBuf>) -> Result<()> {
         .with_context(|| format!("write PID file {}", pid_path.display()))?;
 
     info!(
-        version = cue_core::version(),
+        version = crate::version(),
         pid = process::id(),
         socket = %socket_path.display(),
         "cued starting"
@@ -328,9 +332,9 @@ async fn async_main(socket_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cleanup(pid_path: &PathBuf, socket_path: &PathBuf) {
-    std::fs::remove_file(pid_path).ok();
-    std::fs::remove_file(socket_path).ok();
+fn cleanup(pid_path: &Path, socket_path: &Path) {
+    cleanup_runtime_file(pid_path, "PID file");
+    cleanup_runtime_file(socket_path, "socket");
 }
 
 // ── Stop ──
@@ -487,27 +491,27 @@ fn implicit_start_args_only(args: &[OsString]) -> bool {
 }
 
 /// Kill any running daemon and wait for it to exit (used by `--force`).
-fn force_stop_if_running() -> Result<()> {
+fn force_stop_if_running(socket_path: &Path) -> Result<()> {
     let pid_path = crate::dirs::pid_path();
-    let socket_path = crate::dirs::socket_path();
 
     if !pid_path.exists() {
+        ensure_socket_not_live(socket_path, "PID file is missing")?;
+        remove_runtime_file(socket_path, "stale socket")?;
         return Ok(());
     }
 
     let Ok(content) = std::fs::read_to_string(&pid_path) else {
-        std::fs::remove_file(&pid_path).ok();
+        remove_stale_daemon_markers(&pid_path, socket_path, "PID file is unreadable")?;
         return Ok(());
     };
 
     let Ok(pid) = content.trim().parse::<u32>() else {
-        std::fs::remove_file(&pid_path).ok();
+        remove_stale_daemon_markers(&pid_path, socket_path, "PID file is malformed")?;
         return Ok(());
     };
 
     if !is_process_alive(pid) {
-        std::fs::remove_file(&pid_path).ok();
-        std::fs::remove_file(&socket_path).ok();
+        remove_stale_daemon_markers(&pid_path, socket_path, "PID file points to a dead process")?;
         return Ok(());
     }
 
@@ -523,8 +527,7 @@ fn force_stop_if_running() -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
         if !is_process_alive(pid) {
             println!("cued: previous daemon stopped");
-            std::fs::remove_file(&pid_path).ok();
-            std::fs::remove_file(&socket_path).ok();
+            remove_daemon_markers(&pid_path, socket_path)?;
             return Ok(());
         }
     }
@@ -534,33 +537,93 @@ fn force_stop_if_running() -> Result<()> {
     );
 }
 
-fn ensure_not_running() -> Result<()> {
+fn ensure_not_running(socket_path: &Path) -> Result<()> {
     let pid_path = crate::dirs::pid_path();
-    if !pid_path.exists() {
-        return Ok(());
+
+    if pid_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = content.trim().parse::<u32>()
+            && is_process_alive(pid)
+        {
+            anyhow::bail!(
+                "cued already running (pid {pid}). If stale, remove {} and retry.",
+                pid_path.display()
+            );
+        }
+
+        remove_runtime_file(&pid_path, "stale PID file")?;
     }
 
-    if let Ok(content) = std::fs::read_to_string(&pid_path)
-        && let Ok(pid) = content.trim().parse::<u32>()
-        && is_process_alive(pid)
-    {
-        anyhow::bail!(
-            "cued already running (pid {pid}). If stale, remove {} and retry.",
-            pid_path.display()
-        );
+    if daemon_ready(socket_path) {
+        anyhow::bail!("cued already running on socket {}", socket_path.display());
     }
 
-    std::fs::remove_file(&pid_path).ok();
+    remove_runtime_file(socket_path, "stale socket")?;
     Ok(())
 }
 
-fn daemon_ready(socket_path: &PathBuf) -> bool {
+fn remove_daemon_markers(pid_path: &Path, socket_path: &Path) -> Result<()> {
+    remove_runtime_file(pid_path, "stale PID file")?;
+    remove_runtime_file(socket_path, "stale socket")?;
+    Ok(())
+}
+
+fn remove_stale_daemon_markers(pid_path: &Path, socket_path: &Path, reason: &str) -> Result<()> {
+    ensure_socket_not_live(socket_path, reason)?;
+    remove_daemon_markers(pid_path, socket_path)
+}
+
+fn ensure_socket_not_live(socket_path: &Path, reason: &str) -> Result<()> {
+    if daemon_ready(socket_path) {
+        anyhow::bail!(
+            "cued socket {} is reachable but {reason}; run `cued stop --socket {}` first",
+            socket_path.display(),
+            socket_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_runtime_file(path: &Path, label: &str) {
+    if let Err(error) = remove_runtime_file(path, label) {
+        error!(
+            %error,
+            path = %path.display(),
+            label,
+            "failed to remove cued runtime file"
+        );
+    }
+}
+
+fn remove_runtime_file(path: &Path, label: &str) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove cued {label} {}", path.display())),
+    }
+}
+
+fn daemon_ready(socket_path: &Path) -> bool {
     StdUnixStream::connect(socket_path).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn make_temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cue-daemon-cli-test-{}-{}",
+            process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     fn normalize(args: &[&str]) -> Vec<String> {
         normalize_cli_args_vec(args.iter().map(OsString::from).collect())
@@ -629,5 +692,41 @@ mod tests {
                 socket: Some(PathBuf::from("daemon.sock")),
             }
         );
+    }
+
+    #[test]
+    fn runtime_file_removal_deletes_existing_file() {
+        let dir = make_temp_dir();
+        let path = dir.join("cued.pid");
+        std::fs::write(&path, "123").expect("write runtime file");
+
+        remove_runtime_file(&path, "PID file").expect("remove runtime file");
+
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn runtime_file_removal_accepts_already_missing_file() {
+        let dir = make_temp_dir();
+        let path = dir.join("cued.sock");
+
+        remove_runtime_file(&path, "socket").expect("missing file is clean");
+
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn socket_liveness_guard_rejects_reachable_socket() {
+        let dir = make_temp_dir();
+        let socket = dir.join("cued.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+
+        let error =
+            ensure_socket_not_live(&socket, "PID file is missing").expect_err("socket is live");
+
+        assert!(error.to_string().contains("socket"));
+        assert!(error.to_string().contains("reachable"));
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
     }
 }

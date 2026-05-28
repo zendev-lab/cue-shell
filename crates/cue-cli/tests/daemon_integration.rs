@@ -399,7 +399,7 @@ async fn test_daemon_lifecycle() {
         let mut stream = wait_for_socket(&env.socket, &mut child).await;
         let resp = roundtrip(&mut stream, 1, RequestPayload::Ping {}).await;
         assert!(
-            matches!(resp, ResponsePayload::Ok(OkPayload::Pong {})),
+            matches!(resp, ResponsePayload::Ok(OkPayload::Pong { .. })),
             "expected Pong, got {resp:?}"
         );
 

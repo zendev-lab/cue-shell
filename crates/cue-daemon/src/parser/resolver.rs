@@ -8,19 +8,22 @@
 
 use cue_core::command::{ModeParams, ParamValue};
 use cue_core::cron::{CronPreset, CronSchedule, parse_day_filter, parse_time_of_day};
+use cue_core::ipc::ScriptSource;
 use cue_core::mode::Mode;
 use cue_core::pipeline::{self as core_pipeline};
 
 use super::ast::{Argument, Ast, ChainNode, CronScheduleAst, JobExpr, Pipeline, ScriptItemAst};
-use super::parse::{ParseError, ParseErrorKind, parse_duration_str};
+use super::duration::parse_duration_str;
+use super::parse::{ParseError, ParseErrorKind};
 use super::token::{Span, Value};
 
 /// Resolved command ready for execution.
 #[derive(Debug, Clone)]
 pub enum ResolvedCommand {
-    /// One multiline script submission containing multiple top-level commands.
+    /// One script submission containing one or more top-level commands.
     Script {
         mode: Mode,
+        source: ScriptSource,
         items: Vec<ResolvedScriptItem>,
     },
     /// Run a chain of jobs.
@@ -123,6 +126,7 @@ impl Resolver {
         match ast {
             Ast::Script { items, .. } => Ok(ResolvedCommand::Script {
                 mode,
+                source: ScriptSource::Inline,
                 items: items
                     .into_iter()
                     .map(|item| Self::resolve_script_item(item, mode))

@@ -4,8 +4,7 @@
 //! - `(` immediately after a `Command` token → `ModeParenOpen`
 //! - `(` elsewhere → `GroupOpen`
 
-use std::time::Duration;
-
+use super::duration::parse_duration_str;
 use super::token::{IdKind, Span, Spanned, Token, Value};
 
 /// Tokenizer state machine.
@@ -304,8 +303,9 @@ impl<'a> Tokenizer<'a> {
             }
             if self.pos > num_start {
                 // Make sure next char is not alphanumeric (otherwise it's a regular word)
-                if self.pos >= self.bytes.len() || !is_ident_char(self.bytes[self.pos]) {
-                    let n: u32 = self.slice(num_start, self.pos).parse().unwrap_or(0);
+                if (self.pos >= self.bytes.len() || !is_ident_char(self.bytes[self.pos]))
+                    && let Ok(n) = self.slice(num_start, self.pos).parse::<u32>()
+                {
                     self.last_significant = Some(TokenClass::Other);
                     return Ok(Token::IdRef(kind, n));
                 }
@@ -570,7 +570,7 @@ fn try_parse_value(s: &str) -> Option<Value> {
     }
 
     // Duration: 30s, 5m, 1h, 500ms
-    if let Some(d) = try_parse_duration(s) {
+    if let Some(d) = parse_duration_str(s) {
         return Some(Value::Duration(d));
     }
 
@@ -582,28 +582,10 @@ fn try_parse_value(s: &str) -> Option<Value> {
     None
 }
 
-fn try_parse_duration(s: &str) -> Option<Duration> {
-    if s.ends_with("ms") {
-        let n: u64 = s.strip_suffix("ms")?.parse().ok()?;
-        return Some(Duration::from_millis(n));
-    }
-    if s.ends_with('s') {
-        let n: u64 = s.strip_suffix('s')?.parse().ok()?;
-        return Some(Duration::from_secs(n));
-    }
-    if s.ends_with('m') {
-        let n: u64 = s.strip_suffix('m')?.parse().ok()?;
-        return Some(Duration::from_secs(n * 60));
-    }
-    if s.ends_with('h') {
-        let n: u64 = s.strip_suffix('h')?.parse().ok()?;
-        return Some(Duration::from_secs(n * 3600));
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn tokens(input: &str) -> Vec<Token> {
@@ -729,6 +711,19 @@ mod tests {
     }
 
     #[test]
+    fn oversized_id_refs_stay_words_instead_of_wrapping_to_zero() {
+        let toks = tokens("echo J4294967296");
+        assert_eq!(
+            toks,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("J4294967296".into()),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn grouping_parens() {
         let toks = tokens("(a -> b) ||| c");
         assert_eq!(
@@ -748,11 +743,11 @@ mod tests {
 
     #[test]
     fn duration_values() {
-        assert_eq!(try_parse_duration("30s"), Some(Duration::from_secs(30)));
-        assert_eq!(try_parse_duration("5m"), Some(Duration::from_secs(300)));
-        assert_eq!(try_parse_duration("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_duration_str("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration_str("5m"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_duration_str("1h"), Some(Duration::from_secs(3600)));
         assert_eq!(
-            try_parse_duration("500ms"),
+            parse_duration_str("500ms"),
             Some(Duration::from_millis(500))
         );
     }

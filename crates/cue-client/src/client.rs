@@ -61,6 +61,16 @@ impl CuedClient {
         .await
     }
 
+    /// Convenience: send a file-script request.
+    pub async fn run_script(&mut self, path: &str, input: &str, mode: Mode) -> Result<u32> {
+        self.send(RequestPayload::RunScript {
+            path: path.to_string(),
+            input: input.to_string(),
+            mode,
+        })
+        .await
+    }
+
     /// Convenience: subscribe to event channels.
     pub async fn subscribe(&mut self, channels: &[&str]) -> Result<()> {
         self.send(RequestPayload::Subscribe {
@@ -77,12 +87,20 @@ impl CuedClient {
 
     /// Validate that the daemon speaks the expected IPC protocol.
     pub async fn ping_roundtrip(&mut self) -> Result<()> {
+        self.ping_for_version().await.map(|_| ())
+    }
+
+    /// Send a `Ping` and return the daemon-reported version, if any.
+    ///
+    /// Pre-version-reporting daemons reply with an empty `Pong {}` payload
+    /// and yield `Ok(None)`; current daemons return `Ok(Some(version))`.
+    pub async fn ping_for_version(&mut self) -> Result<Option<String>> {
         let ping_id = self.ping().await?;
         match self.recv().await? {
             Message::Response {
                 id,
-                payload: ResponsePayload::Ok(OkPayload::Pong {}),
-            } if id == ping_id => Ok(()),
+                payload: ResponsePayload::Ok(OkPayload::Pong { version }),
+            } if id == ping_id => Ok(version),
             message => bail!("unexpected message while validating daemon transport: {message:?}"),
         }
     }
@@ -278,6 +296,21 @@ impl MultiplexedClient {
     pub async fn eval(&self, input: &str, mode: Mode) -> Result<ResponsePayload> {
         self.call(RequestPayload::Eval {
             input: input.to_string(),
+            mode,
+        })
+        .await
+    }
+
+    /// Convenience: send a file-script request and wait for its response.
+    pub async fn run_script(
+        &self,
+        path: impl Into<String>,
+        input: impl Into<String>,
+        mode: Mode,
+    ) -> Result<ResponsePayload> {
+        self.call(RequestPayload::RunScript {
+            path: path.into(),
+            input: input.into(),
             mode,
         })
         .await
@@ -706,13 +739,13 @@ mod tests {
             &mut server_stream,
             &Message::Response {
                 id: request_id,
-                payload: ResponsePayload::Ok(OkPayload::Pong {}),
+                payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
             },
         )
         .await;
 
         match response_task.await.unwrap().unwrap() {
-            ResponsePayload::Ok(OkPayload::Pong {}) => {}
+            ResponsePayload::Ok(OkPayload::Pong { version: None }) => {}
             other => panic!("unexpected response: {other:?}"),
         }
 

@@ -18,7 +18,8 @@ use cue_core::cron::{
 };
 use cue_core::ipc::{
     ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, PageInfo,
-    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptSubmitError, StreamText, error_code,
+    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus, ScriptSource,
+    ScriptSubmitError, StreamText, error_code,
 };
 use cue_core::job::{CancelReason, JobStatus};
 use cue_core::mode::Mode;
@@ -123,6 +124,7 @@ struct JobEntry {
 // ── Cron entry ──────────────────────────────────────────────────────────────
 
 /// A registered cron / timer entry.
+#[derive(Clone)]
 struct CronEntry {
     cron_id: CronId,
     schedule_text: String,
@@ -145,6 +147,19 @@ struct PendingWait {
     request_id: u32,
 }
 
+struct PendingScriptRun {
+    client_id: u64,
+    script_id: ScriptId,
+    mode: Mode,
+    source: ScriptSource,
+    items: VecDeque<crate::parser::resolver::ResolvedScriptItem>,
+    next_index: usize,
+    item_scope: ScopeHash,
+    created_items: Vec<ScriptItemInfo>,
+    last_exit_code: i32,
+    waiting_index: Option<usize>,
+}
+
 // ── Scheduler state (all mutable state lives here) ──────────────────────────
 
 struct SchedulerState {
@@ -163,6 +178,11 @@ struct SchedulerState {
     crons: HashMap<CronId, CronEntry>,
     /// Deferred `:wait` responses keyed by job ID.
     job_waiters: HashMap<JobId, Vec<PendingWait>>,
+    /// File script runs waiting for item completion.
+    pending_scripts: HashMap<ScriptId, PendingScriptRun>,
+    pending_script_jobs: HashMap<JobId, ScriptId>,
+    pending_script_chains: HashMap<ChainId, ScriptId>,
+    recently_finished_chains: Vec<(ChainId, i32, Option<ScopeHash>)>,
     /// Runtime wrapper toggle set by `:wrap on` / `:wrap off`.
     wrapper_enabled: Option<bool>,
 }
@@ -179,6 +199,10 @@ impl SchedulerState {
             jobs: HashMap::new(),
             crons: HashMap::new(),
             job_waiters: HashMap::new(),
+            pending_scripts: HashMap::new(),
+            pending_script_jobs: HashMap::new(),
+            pending_script_chains: HashMap::new(),
+            recently_finished_chains: Vec::new(),
             wrapper_enabled: None,
         }
     }
@@ -268,6 +292,29 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
                                         }).await;
                                     }
                                 }
+                                ResolvedCommand::Script {
+                                    mode,
+                                    source: source @ ScriptSource::File { .. },
+                                    items,
+                                } => {
+                                    if let Some(response) = start_pending_script_run(
+                                        mode,
+                                        source,
+                                        items,
+                                        client_id,
+                                        request_id,
+                                        &mut state,
+                                        &db,
+                                        &config,
+                                        &sys,
+                                    ).await {
+                                        let _ = sys.gateway.send(GatewayMsg::SendResponse {
+                                            client_id,
+                                            request_id,
+                                            payload: response,
+                                        }).await;
+                                    }
+                                }
                                 other => {
                                     let response =
                                         handle_command(other, client_id, &mut state, &db, &config, &sys)
@@ -283,6 +330,7 @@ pub fn spawn(mut rx: mpsc::Receiver<SchedulerMsg>, conn: Connection, sys: ActorS
 
                         SchedulerMsg::JobFinished { job_id, exit_code } => {
                             handle_job_finished(job_id, exit_code, &mut state, &db, &sys).await;
+                            advance_pending_scripts_after_terminal_job(job_id, exit_code, &mut state, &db, &config, &sys).await;
                         }
 
                         SchedulerMsg::Shutdown => {
@@ -597,47 +645,43 @@ fn persist_job_entry(db: &storage::SharedConnection, entry: &JobEntry) {
     });
 }
 
-fn persist_cron_entry(db: &storage::SharedConnection, entry: &CronEntry) {
-    persist_cron_record(
-        db,
-        &storage::StoredCron {
-            id: entry.cron_id.to_string(),
-            schedule: entry.schedule_text.clone(),
-            command: chain_to_text(&entry.chain),
-            status: entry.status,
-            scope_hash: Some(entry.scope_hash),
-            cwd_override: entry.cwd_override.clone(),
-            scope_enabled: entry.scope_enabled,
-            wrapper_enabled: entry.wrapper_enabled,
-            age_secs: 0,
-        },
-    );
+fn stored_cron_from_entry(entry: &CronEntry) -> storage::StoredCron {
+    storage::StoredCron {
+        id: entry.cron_id.to_string(),
+        schedule: entry.schedule_text.clone(),
+        command: entry.chain.to_string(),
+        status: entry.status,
+        scope_hash: Some(entry.scope_hash),
+        cwd_override: entry.cwd_override.clone(),
+        scope_enabled: entry.scope_enabled,
+        wrapper_enabled: entry.wrapper_enabled,
+        age_secs: 0,
+    }
 }
 
-fn persist_cron_record(db: &storage::SharedConnection, cron: &storage::StoredCron) {
+async fn persist_cron_entry(
+    db: &storage::SharedConnection,
+    entry: &CronEntry,
+) -> anyhow::Result<()> {
+    persist_cron_record(db, stored_cron_from_entry(entry)).await
+}
+
+async fn persist_cron_record(
+    db: &storage::SharedConnection,
+    cron: storage::StoredCron,
+) -> anyhow::Result<()> {
     let cron_id = cron.id.clone();
-    let stored = cron.clone();
-    let db = Arc::clone(db);
-    tokio::spawn(async move {
-        if let Err(error) =
-            storage::with_connection(&db, move |conn| storage::upsert_cron(conn, &stored)).await
-        {
-            warn!(cron = %cron_id, "scheduler: failed to persist cron: {error}");
-        }
-    });
+    storage::with_connection(db, move |conn| storage::upsert_cron(conn, &cron))
+        .await
+        .map_err(|error| anyhow::anyhow!("persist cron {cron_id}: {error}"))
 }
 
-fn remove_cron_from_db(db: &storage::SharedConnection, cid: CronId) {
+async fn remove_cron_from_db(db: &storage::SharedConnection, cid: CronId) -> anyhow::Result<()> {
     let cron_id = cid.to_string();
-    let db = Arc::clone(db);
-    tokio::spawn(async move {
-        let cid_for_db = cron_id.clone();
-        if let Err(error) =
-            storage::with_connection(&db, move |conn| storage::delete_cron(conn, &cid_for_db)).await
-        {
-            warn!(cron = %cron_id, "scheduler: failed to remove cron from db: {error}");
-        }
-    });
+    let cid_for_db = cron_id.clone();
+    storage::with_connection(db, move |conn| storage::delete_cron(conn, &cid_for_db))
+        .await
+        .map_err(|error| anyhow::anyhow!("remove cron {cron_id}: {error}"))
 }
 
 async fn get_head_snapshot(
@@ -684,7 +728,7 @@ fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
     match node {
         ChainNode::Leaf(plan) => {
             let idx = out.len();
-            let pipeline_text = job_plan_to_text(plan);
+            let pipeline_text = plan.to_string();
             out.push(FlatLeaf {
                 index: idx,
                 plan: plan.clone(),
@@ -694,57 +738,6 @@ fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
         ChainNode::Serial { left, right, .. } | ChainNode::Parallel { left, right, .. } => {
             flatten_leaves_inner(left, out);
             flatten_leaves_inner(right, out);
-        }
-    }
-}
-
-/// Convert a `Pipeline` to a human-readable string.
-fn pipeline_to_text(pipeline: &cue_core::pipeline::Pipeline) -> String {
-    pipeline
-        .segments
-        .iter()
-        .map(|s| {
-            let cmd = s.command.join(" ");
-            match s.pipe_to_next {
-                Some(cue_core::pipeline::PipeOp::Stdout) => format!("{cmd} |>"),
-                Some(cue_core::pipeline::PipeOp::StdoutStderr) => format!("{cmd} |&>"),
-                Some(cue_core::pipeline::PipeOp::StderrOnly) => format!("{cmd} |!>"),
-                None => cmd,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn job_plan_to_text(plan: &cue_core::pipeline::JobPlan) -> String {
-    match plan {
-        cue_core::pipeline::JobPlan::Pipeline(pipeline) => pipeline_to_text(pipeline),
-        cue_core::pipeline::JobPlan::And { left, right } => {
-            format!("{} && {}", job_plan_to_text(left), job_plan_to_text(right))
-        }
-        cue_core::pipeline::JobPlan::Or { left, right } => {
-            format!("{} || {}", job_plan_to_text(left), job_plan_to_text(right))
-        }
-    }
-}
-
-/// Convert a full `ChainNode` to text.
-fn chain_to_text(node: &ChainNode) -> String {
-    match node {
-        ChainNode::Leaf(plan) => job_plan_to_text(plan),
-        ChainNode::Serial { left, op, right } => {
-            let op_str = match op {
-                SerialOp::Then => "->",
-                SerialOp::Always => "~>",
-            };
-            format!("{} {op_str} {}", chain_to_text(left), chain_to_text(right))
-        }
-        ChainNode::Parallel { left, op, right } => {
-            let op_str = match op {
-                ParallelOp::All => "|||",
-                ParallelOp::Race => "|?|",
-            };
-            format!("{} {op_str} {}", chain_to_text(left), chain_to_text(right))
         }
     }
 }
@@ -904,6 +897,29 @@ fn all_leaves_terminal(
                 && all_leaves_terminal(right, offset + left_count, statuses)
         }
     }
+}
+
+fn aggregate_chain_exit_code(chain: &ChainState) -> i32 {
+    let mut last = 0;
+    for idx in 0..leaf_count(&chain.node) {
+        match chain.leaf_status.get(&idx) {
+            Some(LeafStatus::Done(code)) => last = *code,
+            Some(LeafStatus::Failed(code)) => return *code,
+            Some(LeafStatus::Cancelled) => return -1,
+            Some(LeafStatus::Pending | LeafStatus::Running) | None => return -1,
+        }
+    }
+    last
+}
+
+fn chain_final_scope(chain: &ChainState, state: &SchedulerState) -> Option<ScopeHash> {
+    (0..leaf_count(&chain.node)).rev().find_map(|idx| {
+        chain
+            .leaf_jobs
+            .get(&idx)
+            .and_then(|job_id| state.jobs.get(job_id))
+            .and_then(|entry| entry.end_scope.or(entry.start_scope))
+    })
 }
 
 /// Check whether every leaf in the subtree succeeded (exit code 0).
@@ -1537,10 +1553,11 @@ async fn get_scope_snapshot_by_hash(
         return Err("scope_store unreachable".into());
     }
     match rx.await {
-        Ok(Some(scope)) => scope
+        Ok(Ok(Some(scope))) => scope
             .snapshot
             .ok_or_else(|| format!("scope {hash} has no snapshot")),
-        Ok(None) => Err(format!("scope {hash} not found")),
+        Ok(Ok(None)) => Err(format!("scope {hash} not found")),
+        Ok(Err(error)) => Err(format!("scope {hash} lookup failed: {error}")),
         Err(_) => Err("scope_store reply dropped".into()),
     }
 }
@@ -1667,11 +1684,20 @@ async fn set_job_terminal_state(
     let (old_state, effective_end_scope) = {
         let entry = state.jobs.get_mut(&job_id)?;
         if entry.status.is_terminal() {
-            entry.exit_code = Some(exit_code);
-            if entry.end_scope.is_none() {
-                entry.end_scope = end_scope.or(entry.start_scope);
+            let existing_status = entry.status.clone();
+            if entry.end_scope.is_none()
+                && let Some(scope) = end_scope.or(entry.start_scope)
+            {
+                entry.end_scope = Some(scope);
+                persist_job_entry(db, entry);
             }
-            persist_job_entry(db, entry);
+            debug!(
+                %job_id,
+                ?existing_status,
+                ?new_status,
+                reported_exit_code = exit_code,
+                "scheduler: ignoring terminal job state update"
+            );
             return None;
         }
 
@@ -1879,7 +1905,10 @@ async fn fire_due_crons(
         if is_oneshot {
             if let Some(entry) = state.crons.get_mut(&cron_id) {
                 entry.status = CronStatus::Completed;
-                persist_cron_entry(db, entry);
+                let stored = stored_cron_from_entry(entry);
+                if let Err(error) = persist_cron_record(db, stored).await {
+                    warn!(%cron_id, "scheduler: failed to persist completed cron: {error}");
+                }
             }
             debug!(%cron_id, "scheduler: one-shot cron completed");
         } else if let Some(next_trigger) = next_trigger_instant(&schedule, 0)
@@ -2041,7 +2070,7 @@ async fn spawn_chain(
         });
     }
 
-    let chain_text = chain_to_text(&chain);
+    let chain_text = chain.to_string();
     let chain_id = state.alloc_chain();
     let ready_indices = initially_ready(&chain);
     let mut leaf_status: HashMap<usize, LeafStatus> = HashMap::new();
@@ -2136,6 +2165,39 @@ async fn handle_job_finished(
         )
         .await;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_user_terminal_job_update(
+    job_id: JobId,
+    update: TerminalStateUpdate,
+    state: &mut SchedulerState,
+    db: &Arc<Mutex<Connection>>,
+    config: &Config,
+    sys: &ActorSystem,
+) {
+    let reported_exit_code = update.exit_code;
+    if let Some((chain_id, ready_queue, to_cancel)) =
+        set_job_terminal_state(job_id, update, state, db, sys).await
+    {
+        let cwd_override = state
+            .chains
+            .get(&chain_id)
+            .and_then(|c| c.cwd_override.clone());
+        process_chain_advance(
+            chain_id,
+            ready_queue,
+            &to_cancel,
+            0,
+            cwd_override,
+            state,
+            db,
+            sys,
+        )
+        .await;
+    }
+    advance_pending_scripts_after_terminal_job(job_id, reported_exit_code, state, db, config, sys)
+        .await;
 }
 
 /// Shared logic for processing chain advancement results (cancels + spawns + cleanup).
@@ -2299,7 +2361,12 @@ async fn process_chain_advance(
     if let Some(chain) = state.chains.get(&chain_id)
         && all_leaves_terminal(&chain.node, 0, &chain.leaf_status)
     {
-        info!(%chain_id, "scheduler: chain complete");
+        let exit_code = aggregate_chain_exit_code(chain);
+        let end_scope = chain_final_scope(chain, state);
+        info!(%chain_id, exit_code, "scheduler: chain complete");
+        state
+            .recently_finished_chains
+            .push((chain_id, exit_code, end_scope));
         let finished = state.chains.remove(&chain_id).unwrap();
         for jid in finished.leaf_jobs.values() {
             state.job_to_chain.remove(jid);
@@ -2355,6 +2422,354 @@ async fn handle_wait_command(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn start_pending_script_run(
+    mode: Mode,
+    source: ScriptSource,
+    items: Vec<crate::parser::resolver::ResolvedScriptItem>,
+    client_id: u64,
+    _request_id: u32,
+    state: &mut SchedulerState,
+    db: &Arc<Mutex<Connection>>,
+    config: &Config,
+    sys: &ActorSystem,
+) -> Option<ResponsePayload> {
+    let script_id = state.alloc_script();
+    let item_scope = match create_isolated_script_scope(sys).await {
+        Ok(scope) => scope,
+        Err(response) => return Some(response),
+    };
+    let pending = PendingScriptRun {
+        client_id,
+        script_id,
+        mode,
+        source,
+        items: items.into(),
+        next_index: 0,
+        item_scope,
+        created_items: Vec::new(),
+        last_exit_code: 0,
+        waiting_index: None,
+    };
+    submit_pending_script_next(pending, true, state, db, config, sys).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_pending_script_next(
+    mut pending: PendingScriptRun,
+    respond_created: bool,
+    state: &mut SchedulerState,
+    db: &Arc<Mutex<Connection>>,
+    config: &Config,
+    sys: &ActorSystem,
+) -> Option<ResponsePayload> {
+    while let Some(item) = pending.items.pop_front() {
+        let index = pending.next_index;
+        pending.next_index += 1;
+        let source_text = item.source;
+        let response = Box::pin(handle_command_with_scope(
+            *item.command,
+            pending.client_id,
+            state,
+            db,
+            config,
+            sys,
+            Some(pending.item_scope),
+        ))
+        .await;
+
+        match response {
+            ResponsePayload::Err { code, message } => {
+                let submit_error = Some(ScriptSubmitError {
+                    index,
+                    source: source_text,
+                    code,
+                    message,
+                });
+                persist_script_submission(
+                    pending.script_id,
+                    pending.mode,
+                    &pending.created_items,
+                    submit_error.as_ref(),
+                    db,
+                );
+                publish_script_finished(
+                    sys,
+                    pending.script_id,
+                    ScriptRunStatus::Failed,
+                    -1,
+                    Some(index),
+                )
+                .await;
+                return respond_created.then(|| {
+                    ResponsePayload::Ok(OkPayload::ScriptCreated {
+                        script_id: pending.script_id.to_string(),
+                        source: pending.source,
+                        items: pending.created_items,
+                        submit_error,
+                    })
+                });
+            }
+            ResponsePayload::Ok(payload) => {
+                if let Some(next_scope) = script_item_end_scope_from_ok(&payload, state) {
+                    pending.item_scope = next_scope;
+                }
+                let result = script_item_result_from_ok(&payload);
+                pending.created_items.push(ScriptItemInfo {
+                    index,
+                    source: source_text,
+                    result,
+                });
+
+                if let Some(exit_code) = immediate_script_item_exit_code(&payload, state) {
+                    pending.last_exit_code = exit_code;
+                    if exit_code != 0 {
+                        persist_script_submission(
+                            pending.script_id,
+                            pending.mode,
+                            &pending.created_items,
+                            None,
+                            db,
+                        );
+                        publish_script_finished(
+                            sys,
+                            pending.script_id,
+                            ScriptRunStatus::Failed,
+                            exit_code,
+                            Some(index),
+                        )
+                        .await;
+                        return respond_created.then(|| script_created_response(&pending, None));
+                    }
+                    continue;
+                }
+
+                match pending.created_items.last().map(|item| &item.result) {
+                    Some(ScriptItemResult::Job { job_id, .. }) => {
+                        let Some(job_id) = parse_job_id(job_id) else {
+                            publish_script_finished(
+                                sys,
+                                pending.script_id,
+                                ScriptRunStatus::Failed,
+                                -1,
+                                Some(index),
+                            )
+                            .await;
+                            return respond_created
+                                .then(|| script_created_response(&pending, None));
+                        };
+                        pending.waiting_index = Some(index);
+                        let response =
+                            respond_created.then(|| script_created_response(&pending, None));
+                        state.pending_script_jobs.insert(job_id, pending.script_id);
+                        state.pending_scripts.insert(pending.script_id, pending);
+                        return response;
+                    }
+                    Some(ScriptItemResult::Chain { chain_id, .. }) => {
+                        let Some(chain_id) = parse_chain_id(chain_id) else {
+                            publish_script_finished(
+                                sys,
+                                pending.script_id,
+                                ScriptRunStatus::Failed,
+                                -1,
+                                Some(index),
+                            )
+                            .await;
+                            return respond_created
+                                .then(|| script_created_response(&pending, None));
+                        };
+                        pending.waiting_index = Some(index);
+                        let response =
+                            respond_created.then(|| script_created_response(&pending, None));
+                        if let Some((exit_code, end_scope)) =
+                            take_recently_finished_chain(state, chain_id)
+                        {
+                            if let Some(scope) = end_scope {
+                                pending.item_scope = scope;
+                            }
+                            pending.last_exit_code = exit_code;
+                            if exit_code != 0 {
+                                finish_pending_script_failed(pending, exit_code, db, sys).await;
+                                return response;
+                            }
+                            continue;
+                        }
+                        state
+                            .pending_script_chains
+                            .insert(chain_id, pending.script_id);
+                        state.pending_scripts.insert(pending.script_id, pending);
+                        return response;
+                    }
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    persist_script_submission(
+        pending.script_id,
+        pending.mode,
+        &pending.created_items,
+        None,
+        db,
+    );
+    publish_script_finished(
+        sys,
+        pending.script_id,
+        ScriptRunStatus::Done,
+        pending.last_exit_code,
+        None,
+    )
+    .await;
+    respond_created.then(|| script_created_response(&pending, None))
+}
+
+fn take_recently_finished_chain(
+    state: &mut SchedulerState,
+    chain_id: ChainId,
+) -> Option<(i32, Option<ScopeHash>)> {
+    let index = state
+        .recently_finished_chains
+        .iter()
+        .position(|(finished, _, _)| *finished == chain_id)?;
+    let (_, exit_code, end_scope) = state.recently_finished_chains.remove(index);
+    Some((exit_code, end_scope))
+}
+
+async fn advance_pending_scripts_after_terminal_job(
+    job_id: JobId,
+    reported_exit_code: i32,
+    state: &mut SchedulerState,
+    db: &Arc<Mutex<Connection>>,
+    config: &Config,
+    sys: &ActorSystem,
+) {
+    if let Some(script_id) = state.pending_script_jobs.remove(&job_id)
+        && let Some(mut pending) = state.pending_scripts.remove(&script_id)
+    {
+        let exit_code = script_exit_code_for_job(state, job_id, reported_exit_code);
+        if let Some(entry) = state.jobs.get(&job_id)
+            && let Some(scope) = entry.end_scope.or(entry.start_scope)
+        {
+            pending.item_scope = scope;
+        }
+        pending.last_exit_code = exit_code;
+        if exit_code != 0 {
+            finish_pending_script_failed(pending, exit_code, db, sys).await;
+        } else {
+            let _ = submit_pending_script_next(pending, false, state, db, config, sys).await;
+        }
+    }
+
+    let finished_chains = std::mem::take(&mut state.recently_finished_chains);
+    for (chain_id, exit_code, end_scope) in finished_chains {
+        let Some(script_id) = state.pending_script_chains.remove(&chain_id) else {
+            continue;
+        };
+        let Some(mut pending) = state.pending_scripts.remove(&script_id) else {
+            continue;
+        };
+        if let Some(scope) = end_scope {
+            pending.item_scope = scope;
+        }
+        pending.last_exit_code = exit_code;
+        if exit_code != 0 {
+            finish_pending_script_failed(pending, exit_code, db, sys).await;
+        } else {
+            let _ = submit_pending_script_next(pending, false, state, db, config, sys).await;
+        }
+    }
+}
+
+fn script_exit_code_for_job(state: &SchedulerState, job_id: JobId, reported_exit_code: i32) -> i32 {
+    let Some(entry) = state.jobs.get(&job_id) else {
+        return reported_exit_code;
+    };
+    match entry.status {
+        JobStatus::Done => entry.exit_code.unwrap_or(0),
+        JobStatus::Failed | JobStatus::Killed | JobStatus::Cancelled(_) => {
+            entry.exit_code.unwrap_or(-1)
+        }
+        JobStatus::Pending | JobStatus::Running => reported_exit_code,
+    }
+}
+
+async fn finish_pending_script_failed(
+    pending: PendingScriptRun,
+    exit_code: i32,
+    db: &Arc<Mutex<Connection>>,
+    sys: &ActorSystem,
+) {
+    let failed_index = pending.waiting_index;
+    persist_script_submission(
+        pending.script_id,
+        pending.mode,
+        &pending.created_items,
+        None,
+        db,
+    );
+    publish_script_finished(
+        sys,
+        pending.script_id,
+        ScriptRunStatus::Failed,
+        exit_code,
+        failed_index,
+    )
+    .await;
+}
+
+fn immediate_script_item_exit_code(payload: &OkPayload, state: &SchedulerState) -> Option<i32> {
+    match payload {
+        OkPayload::JobCreated { job_id, .. } => {
+            let job_id = parse_job_id(job_id)?;
+            let entry = state.jobs.get(&job_id)?;
+            entry
+                .status
+                .is_terminal()
+                .then_some(entry.exit_code.unwrap_or(-1))
+        }
+        OkPayload::CronAdded { .. }
+        | OkPayload::EvalText { .. }
+        | OkPayload::TextOutput { .. }
+        | OkPayload::ScopeCreated { .. }
+        | OkPayload::Ack {} => Some(0),
+        _ => None,
+    }
+}
+
+fn script_created_response(
+    pending: &PendingScriptRun,
+    submit_error: Option<ScriptSubmitError>,
+) -> ResponsePayload {
+    ResponsePayload::Ok(OkPayload::ScriptCreated {
+        script_id: pending.script_id.to_string(),
+        source: pending.source.clone(),
+        items: pending.created_items.clone(),
+        submit_error,
+    })
+}
+
+async fn publish_script_finished(
+    sys: &ActorSystem,
+    script_id: ScriptId,
+    status: ScriptRunStatus,
+    exit_code: i32,
+    failed_item_index: Option<usize>,
+) {
+    let _ = sys
+        .gateway
+        .send(GatewayMsg::PushEvent {
+            payload: EventPayload::ScriptFinished {
+                script_id: script_id.to_string(),
+                status,
+                exit_code,
+                failed_item_index,
+            },
+            channel: "jobs".into(),
+        })
+        .await;
+}
+
 async fn handle_command(
     cmd: ResolvedCommand,
     client_id: u64,
@@ -2363,26 +2778,50 @@ async fn handle_command(
     config: &Config,
     sys: &ActorSystem,
 ) -> ResponsePayload {
+    handle_command_with_scope(cmd, client_id, state, db, config, sys, None).await
+}
+
+async fn handle_command_with_scope(
+    cmd: ResolvedCommand,
+    client_id: u64,
+    state: &mut SchedulerState,
+    db: &Arc<Mutex<Connection>>,
+    config: &Config,
+    sys: &ActorSystem,
+    scope_override: Option<ScopeHash>,
+) -> ResponsePayload {
     match cmd {
-        ResolvedCommand::Script { mode, items } => {
+        ResolvedCommand::Script {
+            mode,
+            source,
+            items,
+        } => {
             let script_id = state.alloc_script();
             let total_items = items.len();
             let mut created_items = Vec::with_capacity(total_items);
             let mut submit_error = None;
+            let mut item_scope = match create_isolated_script_scope(sys).await {
+                Ok(scope) => scope,
+                Err(response) => return response,
+            };
 
             for (index, item) in items.into_iter().enumerate() {
                 let source = item.source;
-                let response = Box::pin(handle_command(
+                let response = Box::pin(handle_command_with_scope(
                     *item.command,
                     client_id,
                     state,
                     db,
                     config,
                     sys,
+                    Some(item_scope),
                 ))
                 .await;
                 match response {
                     ResponsePayload::Ok(payload) => {
+                        if let Some(next_scope) = script_item_end_scope_from_ok(&payload, state) {
+                            item_scope = next_scope;
+                        }
                         created_items.push(ScriptItemInfo {
                             index,
                             source,
@@ -2406,12 +2845,13 @@ async fn handle_command(
 
             ResponsePayload::Ok(OkPayload::ScriptCreated {
                 script_id: script_id.to_string(),
+                source,
                 items: created_items,
                 submit_error,
             })
         }
         ResolvedCommand::Run { chain, params } => {
-            let scope_hash = match get_head_scope(sys).await {
+            let scope_hash = match resolve_command_scope(sys, scope_override).await {
                 Ok(h) => h,
                 Err(resp) => return resp,
             };
@@ -2452,7 +2892,7 @@ async fn handle_command(
             params,
         } => {
             let display_text = schedule.display();
-            let scope_hash = match get_head_scope(sys).await {
+            let scope_hash = match resolve_command_scope(sys, scope_override).await {
                 Ok(h) => h,
                 Err(resp) => return resp,
             };
@@ -2464,8 +2904,6 @@ async fn handle_command(
                     format!("cannot compute next trigger for schedule: {display_text}"),
                 );
             };
-            info!(%cron_id, %display_text, "scheduler: cron added");
-
             let entry = CronEntry {
                 cron_id,
                 schedule_text: display_text,
@@ -2480,8 +2918,11 @@ async fn handle_command(
                     .wrapper_enabled()
                     .unwrap_or_else(|| state.wrapper_enabled(config)),
             };
-            persist_cron_entry(db, &entry);
+            if let Err(error) = persist_cron_entry(db, &entry).await {
+                return ResponsePayload::err(error_code::INTERNAL, error.to_string());
+            }
             state.crons.insert(cron_id, entry);
+            info!(%cron_id, "scheduler: cron added");
 
             ResponsePayload::Ok(OkPayload::CronAdded {
                 cron_id: cron_id.to_string(),
@@ -2534,12 +2975,19 @@ async fn handle_command(
                 let status = state.jobs.get(&jid).map(|entry| entry.status.clone());
                 match status {
                     Some(JobStatus::Running) => {
-                        let _ = sys
+                        if sys
                             .process_mgr
                             .send(ProcessMgrMsg::KillJob { job_id: jid })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return ResponsePayload::err(
+                                error_code::INTERNAL,
+                                "process_mgr unreachable",
+                            );
+                        }
                         info!(%jid, "scheduler: job killed");
-                        if let Some((chain_id, ready_queue, to_cancel)) = set_job_terminal_state(
+                        apply_user_terminal_job_update(
                             jid,
                             TerminalStateUpdate {
                                 status: JobStatus::Killed,
@@ -2549,26 +2997,10 @@ async fn handle_command(
                             },
                             state,
                             db,
+                            config,
                             sys,
                         )
-                        .await
-                        {
-                            let cwd_override = state
-                                .chains
-                                .get(&chain_id)
-                                .and_then(|c| c.cwd_override.clone());
-                            process_chain_advance(
-                                chain_id,
-                                ready_queue,
-                                &to_cancel,
-                                0,
-                                cwd_override,
-                                state,
-                                db,
-                                sys,
-                            )
-                            .await;
-                        }
+                        .await;
                         ResponsePayload::ack()
                     }
                     Some(_) => ResponsePayload::err(
@@ -2580,8 +3012,11 @@ async fn handle_command(
                     }
                 }
             } else if let Some(cid) = parse_cron_id(&id) {
-                if state.crons.remove(&cid).is_some() {
-                    remove_cron_from_db(db, cid);
+                if state.crons.contains_key(&cid) {
+                    if let Err(error) = remove_cron_from_db(db, cid).await {
+                        return ResponsePayload::err(error_code::INTERNAL, error.to_string());
+                    }
+                    state.crons.remove(&cid);
                     info!(%cid, "scheduler: cron removed");
                     ResponsePayload::ack()
                 } else {
@@ -2603,12 +3038,19 @@ async fn handle_command(
             let status = state.jobs.get(&jid).map(|entry| entry.status.clone());
             match status {
                 Some(JobStatus::Running) => {
-                    let _ = sys
+                    if sys
                         .process_mgr
                         .send(ProcessMgrMsg::KillJob { job_id: jid })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return ResponsePayload::err(
+                            error_code::INTERNAL,
+                            "process_mgr unreachable",
+                        );
+                    }
                     info!(%jid, "scheduler: job killed");
-                    if let Some((chain_id, ready_queue, to_cancel)) = set_job_terminal_state(
+                    apply_user_terminal_job_update(
                         jid,
                         TerminalStateUpdate {
                             status: JobStatus::Killed,
@@ -2618,26 +3060,10 @@ async fn handle_command(
                         },
                         state,
                         db,
+                        config,
                         sys,
                     )
-                    .await
-                    {
-                        let cwd_override = state
-                            .chains
-                            .get(&chain_id)
-                            .and_then(|c| c.cwd_override.clone());
-                        process_chain_advance(
-                            chain_id,
-                            ready_queue,
-                            &to_cancel,
-                            0,
-                            cwd_override,
-                            state,
-                            db,
-                            sys,
-                        )
-                        .await;
-                    }
+                    .await;
                     ResponsePayload::ack()
                 }
                 Some(_) => ResponsePayload::err(
@@ -2655,8 +3081,11 @@ async fn handle_command(
                     "RemoveCron only supports cron IDs (C<n>)",
                 );
             };
-            if state.crons.remove(&cid).is_some() {
-                remove_cron_from_db(db, cid);
+            if state.crons.contains_key(&cid) {
+                if let Err(error) = remove_cron_from_db(db, cid).await {
+                    return ResponsePayload::err(error_code::INTERNAL, error.to_string());
+                }
+                state.crons.remove(&cid);
                 info!(%cid, "scheduler: cron removed");
                 ResponsePayload::ack()
             } else {
@@ -2669,14 +3098,20 @@ async fn handle_command(
                 let status = state.jobs.get(&jid).map(|entry| entry.status.clone());
                 match status {
                     Some(JobStatus::Pending) | Some(JobStatus::Running) => {
-                        if matches!(status, Some(JobStatus::Running)) {
-                            let _ = sys
+                        if matches!(status, Some(JobStatus::Running))
+                            && sys
                                 .process_mgr
                                 .send(ProcessMgrMsg::KillJob { job_id: jid })
-                                .await;
+                                .await
+                                .is_err()
+                        {
+                            return ResponsePayload::err(
+                                error_code::INTERNAL,
+                                "process_mgr unreachable",
+                            );
                         }
                         info!(%jid, "scheduler: job cancelled");
-                        if let Some((chain_id, ready_queue, to_cancel)) = set_job_terminal_state(
+                        apply_user_terminal_job_update(
                             jid,
                             TerminalStateUpdate {
                                 status: JobStatus::Cancelled(CancelReason::User),
@@ -2686,26 +3121,10 @@ async fn handle_command(
                             },
                             state,
                             db,
+                            config,
                             sys,
                         )
-                        .await
-                        {
-                            let cwd_override = state
-                                .chains
-                                .get(&chain_id)
-                                .and_then(|c| c.cwd_override.clone());
-                            process_chain_advance(
-                                chain_id,
-                                ready_queue,
-                                &to_cancel,
-                                0,
-                                cwd_override,
-                                state,
-                                db,
-                                sys,
-                            )
-                            .await;
-                        }
+                        .await;
                         ResponsePayload::ack()
                     }
                     Some(_) => ResponsePayload::err(
@@ -2723,15 +3142,19 @@ async fn handle_command(
 
         ResolvedCommand::Pause { id } => {
             if let Some(cid) = parse_cron_id(&id) {
-                if let Some(entry) = state.crons.get_mut(&cid) {
+                if let Some(entry) = state.crons.get(&cid) {
                     if entry.status.is_terminal() {
                         return ResponsePayload::err(
                             error_code::INVALID_STATE,
                             format!("cron {cid} is already terminal"),
                         );
                     }
-                    entry.status = CronStatus::Paused;
-                    persist_cron_entry(db, entry);
+                    let mut updated = entry.clone();
+                    updated.status = CronStatus::Paused;
+                    if let Err(error) = persist_cron_entry(db, &updated).await {
+                        return ResponsePayload::err(error_code::INTERNAL, error.to_string());
+                    }
+                    state.crons.insert(cid, updated);
                     info!(%cid, "scheduler: cron paused");
                     return ResponsePayload::ack();
                 }
@@ -2746,18 +3169,22 @@ async fn handle_command(
 
         ResolvedCommand::Resume { id } => {
             if let Some(cid) = parse_cron_id(&id) {
-                if let Some(entry) = state.crons.get_mut(&cid) {
+                if let Some(entry) = state.crons.get(&cid) {
                     if entry.status.is_terminal() {
                         return ResponsePayload::err(
                             error_code::INVALID_STATE,
                             format!("cron {cid} is already terminal"),
                         );
                     }
-                    entry.status = CronStatus::Scheduled;
-                    if let Some(next_trigger) = next_trigger_instant(&entry.schedule, 0) {
-                        entry.next_trigger = next_trigger;
+                    let mut updated = entry.clone();
+                    updated.status = CronStatus::Scheduled;
+                    if let Some(next_trigger) = next_trigger_instant(&updated.schedule, 0) {
+                        updated.next_trigger = next_trigger;
                     }
-                    persist_cron_entry(db, entry);
+                    if let Err(error) = persist_cron_entry(db, &updated).await {
+                        return ResponsePayload::err(error_code::INTERNAL, error.to_string());
+                    }
+                    state.crons.insert(cid, updated);
                     info!(%cid, "scheduler: cron resumed");
                     return ResponsePayload::ack();
                 }
@@ -3202,6 +3629,46 @@ fn script_item_result_from_ok(payload: &OkPayload) -> ScriptItemResult {
     }
 }
 
+fn script_item_end_scope_from_ok(payload: &OkPayload, state: &SchedulerState) -> Option<ScopeHash> {
+    match payload {
+        OkPayload::JobCreated { job_id, .. } => {
+            let job_id = parse_job_id(job_id)?;
+            let entry = state.jobs.get(&job_id)?;
+            entry
+                .status
+                .is_terminal()
+                .then_some(())
+                .and(entry.end_scope.or(entry.start_scope))
+        }
+        _ => None,
+    }
+}
+
+async fn resolve_command_scope(
+    sys: &ActorSystem,
+    scope_override: Option<ScopeHash>,
+) -> Result<ScopeHash, ResponsePayload> {
+    match scope_override {
+        Some(scope) => Ok(scope),
+        None => get_head_scope(sys).await,
+    }
+}
+
+async fn create_isolated_script_scope(sys: &ActorSystem) -> Result<ScopeHash, ResponsePayload> {
+    let head = get_head_scope(sys).await?;
+    derive_scope(
+        sys,
+        head,
+        cue_core::scope::EnvDelta {
+            set: std::collections::BTreeMap::new(),
+            unset: vec![],
+            cwd: None,
+        },
+    )
+    .await
+    .map_err(|error| ResponsePayload::err(error_code::INTERNAL, error))
+}
+
 fn persist_script_submission(
     script_id: ScriptId,
     mode: Mode,
@@ -3287,6 +3754,14 @@ fn parse_job_id(s: &str) -> Option<JobId> {
     s.strip_prefix('J')
         .and_then(|n| n.parse::<u32>().ok())
         .map(JobId)
+}
+
+/// Parse a string like `"CH3"` into a `ChainId`.
+fn parse_chain_id(s: &str) -> Option<ChainId> {
+    let s = s.trim();
+    s.strip_prefix("CH")
+        .and_then(|n| n.parse::<u32>().ok())
+        .map(ChainId)
 }
 
 /// Parse a string like `"C3"` into a `CronId`.
@@ -3533,7 +4008,7 @@ fn sorted_cron_list(state: &SchedulerState) -> Vec<CronInfo> {
         .map(|cron| CronInfo {
             id: cron.cron_id.to_string(),
             schedule: cron.schedule_text.clone(),
-            command: chain_to_text(&cron.chain),
+            command: cron.chain.to_string(),
             status: cron.status,
         })
         .collect();
@@ -3931,6 +4406,8 @@ async fn read_stderr_from_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::resolver::ResolvedScriptItem;
+    use cue_core::ipc::ScriptSource;
     use cue_core::pipeline::{JobPlan, PipeSegment, Pipeline};
     use std::path::Path;
     use std::sync::Arc;
@@ -3979,6 +4456,13 @@ mod tests {
         ))
     }
 
+    fn drop_crons_table(conn: &Arc<Mutex<Connection>>) {
+        conn.lock()
+            .unwrap()
+            .execute_batch("DROP TABLE crons;")
+            .expect("drop crons table");
+    }
+
     /// Spawn a fake scope_store that always replies with a zero hash.
     fn spawn_fake_scope_store(mut rx: mpsc::Receiver<ScopeStoreMsg>) {
         tokio::spawn(async move {
@@ -3994,7 +4478,7 @@ mod tests {
                         }));
                     }
                     ScopeStoreMsg::GetScope { hash, reply } => {
-                        let _ = reply.send(Some(cue_core::scope::Scope {
+                        let _ = reply.send(Ok(Some(cue_core::scope::Scope {
                             hash,
                             parent: None,
                             delta: None,
@@ -4002,7 +4486,7 @@ mod tests {
                                 env: std::collections::BTreeMap::new(),
                                 cwd: std::env::current_dir().expect("current dir"),
                             }),
-                        }));
+                        })));
                     }
                     ScopeStoreMsg::Derive { base, delta, reply } => {
                         let snapshot = cue_core::scope::EnvSnapshot {
@@ -4086,11 +4570,45 @@ mod tests {
         ids
     }
 
+    async fn drain_spawn_scopes(rx: &mut mpsc::Receiver<ProcessMgrMsg>) -> Vec<ScopeHash> {
+        let mut scopes = Vec::new();
+        tokio::task::yield_now().await;
+        while let Ok(msg) = rx.try_recv() {
+            if let ProcessMgrMsg::SpawnJob { scope_hash, .. } = msg {
+                scopes.push(scope_hash);
+            }
+        }
+        scopes
+    }
+
     async fn recv_gateway_msg(rx: &mut mpsc::Receiver<GatewayMsg>) -> GatewayMsg {
         tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("gateway message timeout")
             .expect("gateway channel closed")
+    }
+
+    async fn drain_script_finished_events(
+        rx: &mut mpsc::Receiver<GatewayMsg>,
+    ) -> Vec<(String, ScriptRunStatus, i32, Option<usize>)> {
+        let mut events = Vec::new();
+        tokio::task::yield_now().await;
+        while let Ok(msg) = rx.try_recv() {
+            if let GatewayMsg::PushEvent {
+                payload:
+                    EventPayload::ScriptFinished {
+                        script_id,
+                        status,
+                        exit_code,
+                        failed_item_index,
+                    },
+                ..
+            } = msg
+            {
+                events.push((script_id, status, exit_code, failed_item_index));
+            }
+        }
+        events
     }
 
     #[test]
@@ -4392,6 +4910,290 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn script_run_uses_isolated_scope_not_head() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let resp = handle_command(
+            ResolvedCommand::Script {
+                mode: Mode::Job,
+                source: ScriptSource::Inline,
+                items: vec![ResolvedScriptItem {
+                    source: "echo hi".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("echo hi"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                }],
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::ScriptCreated { .. })
+        ));
+        let scopes = drain_spawn_scopes(&mut pm_rx).await;
+        assert_eq!(scopes.len(), 1);
+        assert_ne!(scopes[0], ScopeHash([0u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn script_scope_transform_feeds_following_immediate_item() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let mut scope_params = cue_core::command::ModeParams::new();
+        scope_params.insert("scope", cue_core::command::ParamValue::Bool(true));
+        let temp_dir = std::env::temp_dir();
+        let cd_command = format!("cd {}", temp_dir.display());
+
+        let resp = handle_command(
+            ResolvedCommand::Script {
+                mode: Mode::Job,
+                source: ScriptSource::Inline,
+                items: vec![
+                    ResolvedScriptItem {
+                        source: cd_command.clone(),
+                        command: Box::new(ResolvedCommand::Run {
+                            chain: leaf(&cd_command),
+                            params: scope_params,
+                        }),
+                    },
+                    ResolvedScriptItem {
+                        source: "echo after".into(),
+                        command: Box::new(ResolvedCommand::Run {
+                            chain: leaf("echo after"),
+                            params: cue_core::command::ModeParams::new(),
+                        }),
+                    },
+                ],
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::ScriptCreated { .. })
+        ));
+        let first_end_scope = state
+            .jobs
+            .get(&JobId(1))
+            .and_then(|entry| entry.end_scope)
+            .expect("scope-transform end scope");
+        let scopes = drain_spawn_scopes(&mut pm_rx).await;
+        assert_eq!(scopes, vec![first_end_scope]);
+    }
+
+    #[tokio::test]
+    async fn pending_file_script_fail_fast_stops_following_items() {
+        let (sys, mut gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let response = start_pending_script_run(
+            Mode::Job,
+            ScriptSource::File {
+                path: "fail.cue".into(),
+            },
+            vec![
+                ResolvedScriptItem {
+                    source: "false".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("false"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+                ResolvedScriptItem {
+                    source: "echo never".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("echo never"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+            ],
+            0,
+            1,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await
+        .expect("created response");
+        assert!(matches!(
+            response,
+            ResponsePayload::Ok(OkPayload::ScriptCreated { .. })
+        ));
+
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(spawned.len(), 1);
+        handle_job_finished(spawned[0], 7, &mut state, &conn, &sys).await;
+        advance_pending_scripts_after_terminal_job(spawned[0], 7, &mut state, &conn, &config, &sys)
+            .await;
+
+        assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
+        let events = drain_script_finished_events(&mut gw_rx).await;
+        assert_eq!(
+            events,
+            vec![("R1".into(), ScriptRunStatus::Failed, 7, Some(0))]
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_file_script_cancel_fails_without_waiting_for_late_process_exit() {
+        let (sys, mut gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let _ = start_pending_script_run(
+            Mode::Job,
+            ScriptSource::File {
+                path: "cancel.cue".into(),
+            },
+            vec![
+                ResolvedScriptItem {
+                    source: "long-running".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("long-running"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+                ResolvedScriptItem {
+                    source: "echo never".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("echo never"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+            ],
+            0,
+            1,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await
+        .expect("created response");
+
+        let spawned = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(spawned.len(), 1);
+        let jid = spawned[0];
+
+        let response = handle_command(
+            ResolvedCommand::Cancel {
+                id: jid.to_string(),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(response, ResponsePayload::Ok(OkPayload::Ack {})));
+        assert_eq!(
+            state.jobs[&jid].status,
+            JobStatus::Cancelled(CancelReason::User)
+        );
+        assert_eq!(state.jobs[&jid].exit_code, Some(-1));
+        assert!(state.pending_script_jobs.is_empty());
+        assert!(state.pending_scripts.is_empty());
+        assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
+        assert_eq!(
+            drain_script_finished_events(&mut gw_rx).await,
+            vec![("R1".into(), ScriptRunStatus::Failed, -1, Some(0))]
+        );
+
+        handle_job_finished(jid, 0, &mut state, &conn, &sys).await;
+        advance_pending_scripts_after_terminal_job(jid, 0, &mut state, &conn, &config, &sys).await;
+
+        assert_eq!(
+            state.jobs[&jid].status,
+            JobStatus::Cancelled(CancelReason::User)
+        );
+        assert_eq!(state.jobs[&jid].exit_code, Some(-1));
+        assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
+        assert!(drain_script_finished_events(&mut gw_rx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_file_script_success_advances_to_next_item_and_finishes() {
+        let (sys, mut gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let _ = start_pending_script_run(
+            Mode::Job,
+            ScriptSource::File {
+                path: "ok.cue".into(),
+            },
+            vec![
+                ResolvedScriptItem {
+                    source: "echo one".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("echo one"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+                ResolvedScriptItem {
+                    source: "echo two".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("echo two"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+            ],
+            0,
+            1,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await
+        .expect("created response");
+
+        let first = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(first.len(), 1);
+        handle_job_finished(first[0], 0, &mut state, &conn, &sys).await;
+        advance_pending_scripts_after_terminal_job(first[0], 0, &mut state, &conn, &config, &sys)
+            .await;
+
+        let second = drain_spawn_jobs(&mut pm_rx).await;
+        assert_eq!(second.len(), 1);
+        handle_job_finished(second[0], 0, &mut state, &conn, &sys).await;
+        advance_pending_scripts_after_terminal_job(second[0], 0, &mut state, &conn, &config, &sys)
+            .await;
+
+        let events = drain_script_finished_events(&mut gw_rx).await;
+        assert_eq!(events, vec![("R1".into(), ScriptRunStatus::Done, 0, None)]);
+    }
+
+    #[tokio::test]
     async fn warned_run_commands_still_execute() {
         let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
         spawn_fake_scope_store(ss_rx);
@@ -4525,6 +5327,110 @@ mod tests {
         } else {
             panic!("expected CronList");
         }
+    }
+
+    #[tokio::test]
+    async fn cron_add_reports_persist_failure_without_registering() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        drop_crons_table(&conn);
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let cmd = ResolvedCommand::Cron {
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
+            chain: leaf("backup.sh"),
+            params: cue_core::command::ModeParams::new(),
+        };
+        let resp = handle_command(cmd, 0, &mut state, &conn, &config, &sys).await;
+
+        match resp {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, error_code::INTERNAL);
+                assert!(message.contains("persist cron C1"));
+            }
+            other => panic!("expected cron persist failure, got {other:?}"),
+        }
+        assert!(state.crons.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_cron_reports_persist_failure_without_removing_state() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let cmd = ResolvedCommand::Cron {
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
+            chain: leaf("backup.sh"),
+            params: cue_core::command::ModeParams::new(),
+        };
+        let added = handle_command(cmd, 0, &mut state, &conn, &config, &sys).await;
+        assert!(matches!(
+            added,
+            ResponsePayload::Ok(OkPayload::CronAdded { .. })
+        ));
+        drop_crons_table(&conn);
+
+        let removed = handle_command(
+            ResolvedCommand::RemoveCron { id: "C1".into() },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match removed {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, error_code::INTERNAL);
+                assert!(message.contains("remove cron C1"));
+            }
+            other => panic!("expected cron remove failure, got {other:?}"),
+        }
+        assert!(state.crons.contains_key(&CronId(1)));
+    }
+
+    #[tokio::test]
+    async fn pause_cron_reports_persist_failure_without_mutating_status() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let cmd = ResolvedCommand::Cron {
+            schedule: CronSchedule::Interval(std::time::Duration::from_secs(300)),
+            chain: leaf("backup.sh"),
+            params: cue_core::command::ModeParams::new(),
+        };
+        let added = handle_command(cmd, 0, &mut state, &conn, &config, &sys).await;
+        assert!(matches!(
+            added,
+            ResponsePayload::Ok(OkPayload::CronAdded { .. })
+        ));
+        drop_crons_table(&conn);
+
+        let paused = handle_command(
+            ResolvedCommand::Pause { id: "C1".into() },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        match paused {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, error_code::INTERNAL);
+                assert!(message.contains("persist cron C1"));
+            }
+            other => panic!("expected cron pause failure, got {other:?}"),
+        }
+        assert_eq!(state.crons[&CronId(1)].status, CronStatus::Scheduled);
     }
 
     #[tokio::test]
@@ -5439,6 +6345,7 @@ mod tests {
         .await;
         assert!(matches!(resp, ResponsePayload::Ok(OkPayload::Ack {})));
         assert_eq!(state.jobs[&jid].status, JobStatus::Killed);
+        assert_eq!(state.jobs[&jid].exit_code, Some(-1));
 
         // Now the process exits (JobFinished arrives).
         handle_job_finished(jid, -9, &mut state, &conn, &sys).await;
@@ -5448,6 +6355,11 @@ mod tests {
             state.jobs[&jid].status,
             JobStatus::Killed,
             "Killed status must not be overwritten by JobFinished"
+        );
+        assert_eq!(
+            state.jobs[&jid].exit_code,
+            Some(-1),
+            "Killed exit code must not be overwritten by JobFinished"
         );
     }
 }
