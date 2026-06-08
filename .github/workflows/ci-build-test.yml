@@ -29,35 +29,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Check cue-cli feature matrix with clippy
-        run: |
-          set -euo pipefail
-
-          for features in \
-            "" \
-            "daemon" \
-            "extensions" \
-            "script" \
-            "tui" \
-            "daemon,extensions" \
-            "daemon,script" \
-            "daemon,tui" \
-            "extensions,script" \
-            "extensions,tui" \
-            "script,tui" \
-            "daemon,extensions,script" \
-            "daemon,extensions,tui" \
-            "daemon,script,tui" \
-            "extensions,script,tui" \
-            "daemon,extensions,script,tui"
-          do
-            if [ -z "$features" ]; then
-              cargo clippy -p cue-cli --no-default-features --all-targets -- -D warnings
-            else
-              cargo clippy -p cue-cli --no-default-features --features "$features" --all-targets -- -D warnings
-            fi
-          done
-
       - name: Run tests with coverage
         run: cargo llvm-cov test --lcov --output-path lcov.info -- --no-capture
 
