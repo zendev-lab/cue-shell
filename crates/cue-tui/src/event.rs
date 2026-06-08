@@ -5,6 +5,7 @@
 //! disconnects, it retries every 3 seconds and sends `Reconnected` with a
 //! new [`crate::client::WriterHandle`] on success.
 
+use std::fmt::Display;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -13,22 +14,22 @@ use tokio::sync::mpsc;
 
 use crate::app::AppMsg;
 use crate::client::{
-    ClientConnector, ClientReader, ConnectionEvent, ReconnectCmd,
+    ClientConnector, ClientReader, ConnectionController, ConnectionEvent,
     spawn_connection_manager_controllable,
 };
 use cue_core::ipc::Message;
 
 /// Spawn the event-producing tasks and return a receiver of [`AppMsg`] and a
-/// sender for [`ReconnectCmd`]s that control the connection manager.
+/// controller for the connection manager.
 ///
 /// Three sources feed the channel:
 /// 1. **Terminal events** — crossterm key/mouse/resize (blocking thread)
 /// 2. **Socket connection manager** — read + auto-reconnect (async task)
 /// 3. **Tick timer** — periodic refresh for the status bar clock (async task)
-pub fn spawn_event_loop(
+pub(crate) fn spawn_event_loop(
     socket_reader: Option<ClientReader>,
     connector: ClientConnector,
-) -> Result<(mpsc::UnboundedReceiver<AppMsg>, mpsc::Sender<ReconnectCmd>)> {
+) -> Result<(mpsc::UnboundedReceiver<AppMsg>, ConnectionController)> {
     let (tx, rx) = mpsc::unbounded_channel();
 
     // 1. Terminal events (blocking thread)
@@ -40,28 +41,30 @@ pub fn spawn_event_loop(
                 match event::poll(Duration::from_millis(100)) {
                     Ok(true) => match event::read() {
                         Ok(ev) => {
-                            let msg = match ev {
-                                CtEvent::Key(key) => AppMsg::KeyEvent(key),
-                                CtEvent::Mouse(mouse) => AppMsg::MouseEvent(mouse),
-                                CtEvent::Paste(data) => AppMsg::Paste(data),
-                                CtEvent::Resize(w, h) => AppMsg::Resize(w, h),
-                                _ => continue,
+                            let Some(msg) = terminal_event_msg(ev) else {
+                                continue;
                             };
                             if tx_term.send(msg).is_err() {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(error) => {
+                            let _ = tx_term.send(terminal_event_error("read", error));
+                            break;
+                        }
                     },
                     Ok(false) => continue,
-                    Err(_) => break,
+                    Err(error) => {
+                        let _ = tx_term.send(terminal_event_error("poll", error));
+                        break;
+                    }
                 }
             }
         })?;
 
     // 2. Socket connection manager (read + auto-reconnect + controllable)
     let tx_sock = tx.clone();
-    let (mut socket_events, cmd_tx) =
+    let (mut socket_events, controller) =
         spawn_connection_manager_controllable(socket_reader, connector);
     tokio::spawn(async move {
         while let Some(event) = socket_events.recv().await {
@@ -93,5 +96,60 @@ pub fn spawn_event_loop(
         }
     });
 
-    Ok((rx, cmd_tx))
+    Ok((rx, controller))
+}
+
+fn terminal_event_msg(event: CtEvent) -> Option<AppMsg> {
+    match event {
+        CtEvent::Key(key) => Some(AppMsg::KeyEvent(key)),
+        CtEvent::Mouse(mouse) => Some(AppMsg::MouseEvent(mouse)),
+        CtEvent::Paste(data) => Some(AppMsg::Paste(data)),
+        CtEvent::Resize(w, h) => Some(AppMsg::Resize(w, h)),
+        _ => None,
+    }
+}
+
+fn terminal_event_error(action: &str, error: impl Display) -> AppMsg {
+    AppMsg::FatalError {
+        message: format!("terminal event {action} failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+
+    #[test]
+    fn terminal_event_msg_maps_supported_events_and_ignores_focus() {
+        assert!(matches!(
+            terminal_event_msg(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            ))),
+            Some(AppMsg::KeyEvent(_))
+        ));
+        assert!(matches!(
+            terminal_event_msg(CtEvent::Resize(120, 40)),
+            Some(AppMsg::Resize(120, 40))
+        ));
+        assert!(terminal_event_msg(CtEvent::FocusGained).is_none());
+    }
+
+    #[test]
+    fn terminal_event_error_is_fatal_and_names_failed_action() {
+        let msg = terminal_event_error(
+            "poll",
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "tty closed"),
+        );
+
+        match msg {
+            AppMsg::FatalError { message } => {
+                assert!(message.contains("terminal event poll failed"), "{message}");
+                assert!(message.contains("tty closed"), "{message}");
+            }
+            _ => panic!("expected fatal error"),
+        }
+    }
 }

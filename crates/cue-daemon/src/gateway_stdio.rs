@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Connect to the local gateway socket and relay raw IPC bytes over stdio.
-pub async fn run(socket_path: PathBuf) -> Result<()> {
+pub(crate) async fn run(socket_path: PathBuf) -> Result<()> {
     let socket = connect_socket(&socket_path).await?;
     relay(tokio::io::stdin(), tokio::io::stdout(), socket).await
 }
@@ -28,7 +28,7 @@ async fn connect_socket(socket_path: &Path) -> Result<UnixStream> {
     })
 }
 
-pub async fn relay<R, W, S>(stdin: R, stdout: W, socket: S) -> Result<()>
+pub(crate) async fn relay<R, W, S>(stdin: R, stdout: W, socket: S) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -165,7 +165,9 @@ mod tests {
 
         let response = encode_message(&Message::Response {
             id: 7,
-            payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
+            payload: ResponsePayload::Ok(OkPayload::Pong {
+                version: "0.1.0".into(),
+            }),
         })
         .unwrap();
         daemon_socket.write_all(&response).await.unwrap();

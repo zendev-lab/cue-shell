@@ -18,9 +18,7 @@ use cue_core::ipc::{
     Message, OkPayload, RequestPayload, ResponsePayload, encode_message, error_code,
 };
 
-use crate::parser::resolver::ResolvedCommand;
-use crate::parser::token::Token;
-use crate::parser::{Parser, Resolver, Tokenizer};
+use crate::parser::{ResolvedCommand, Token, Tokenizer, parse_command, parse_file_script_command};
 
 use super::{ActorSystem, CLIENT_EVENT_CAP, EventBusMsg, GatewayMsg, SchedulerMsg};
 
@@ -30,7 +28,7 @@ static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 // ── Message framing ──
 
 /// Read one length-prefixed JSON message from the stream.
-pub async fn read_message(stream: &mut UnixStream) -> Result<Message> {
+pub(crate) async fn read_message(stream: &mut UnixStream) -> Result<Message> {
     let len = stream.read_u32().await.context("read length prefix")?;
     if len as usize > MAX_MESSAGE_SIZE {
         bail!("message too large: {len} bytes");
@@ -42,7 +40,7 @@ pub async fn read_message(stream: &mut UnixStream) -> Result<Message> {
 }
 
 /// Write one length-prefixed JSON message to the stream.
-pub async fn write_message(stream: &mut UnixStream, msg: &Message) -> Result<()> {
+pub(crate) async fn write_message(stream: &mut UnixStream, msg: &Message) -> Result<()> {
     let encoded = encode_message(msg)?;
     stream.write_all(&encoded).await.context("write message")?;
     stream.flush().await.context("flush")?;
@@ -57,7 +55,7 @@ type ClientEventMap = Arc<tokio::sync::Mutex<HashMap<u64, mpsc::Sender<EventPayl
 ///
 /// This creates a Unix socket listener and spawns a task that accepts connections.
 /// Per-client handler tasks are spawned for each connection.
-pub async fn spawn(
+pub(super) async fn spawn(
     mut rx: mpsc::Receiver<GatewayMsg>,
     socket_path: PathBuf,
     sys: ActorSystem,
@@ -269,53 +267,29 @@ async fn route_request(
 ) -> Result<()> {
     match payload {
         RequestPayload::Eval { input, mode } => {
-            let input = sys.config.bash_compat.apply(&input);
             let input = sys.config.aliases.apply(&input);
-            // Parse → resolve → send to scheduler.
-            match Parser::parse(&input) {
-                Ok(ast) => match Resolver::resolve(ast, mode) {
-                    Ok(command) => {
-                        if matches!(
-                            command,
-                            crate::parser::resolver::ResolvedCommand::Script {
-                                source: cue_core::ipc::ScriptSource::Inline,
-                                ..
-                            }
-                        ) {
-                            sys.gateway
-                                .send(GatewayMsg::SendResponse {
-                                    client_id,
-                                    request_id,
-                                    payload: inline_script_disabled_response(),
-                                })
-                                .await
-                                .context("send inline script rejection")?;
-                            return Ok(());
+            match parse_command(&input, mode) {
+                Ok(command) => {
+                    if matches!(
+                        command,
+                        ResolvedCommand::Script {
+                            source: cue_core::ipc::ScriptSource::Inline,
+                            ..
                         }
-                        send_scheduler_eval(
-                            sys,
-                            client_id,
-                            request_id,
-                            command,
-                            "send to scheduler",
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        // Parse/resolve error → respond immediately.
+                    ) {
                         sys.gateway
                             .send(GatewayMsg::SendResponse {
                                 client_id,
                                 request_id,
-                                payload: ResponsePayload::err(
-                                    error_code::INVALID_SYNTAX,
-                                    syntax_error_message(&input, &e.to_string()),
-                                ),
+                                payload: inline_script_disabled_response(),
                             })
                             .await
-                            .context("send error response")?;
+                            .context("send inline script rejection")?;
+                        return Ok(());
                     }
-                },
+                    send_scheduler_eval(sys, client_id, request_id, command, "send to scheduler")
+                        .await?;
+                }
                 Err(e) => {
                     sys.gateway
                         .send(GatewayMsg::SendResponse {
@@ -332,53 +306,34 @@ async fn route_request(
             }
         }
 
-        RequestPayload::RunScript { path, input, mode } => {
-            match Parser::parse_file_script(&input) {
-                Ok(ast) => match Resolver::resolve(ast, mode) {
-                    Ok(mut command) => {
-                        if let crate::parser::resolver::ResolvedCommand::Script { source, .. } =
-                            &mut command
-                        {
-                            *source = cue_core::ipc::ScriptSource::File { path };
-                        }
-                        send_scheduler_eval(
-                            sys,
-                            client_id,
-                            request_id,
-                            command,
-                            "send script to scheduler",
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        sys.gateway
-                            .send(GatewayMsg::SendResponse {
-                                client_id,
-                                request_id,
-                                payload: ResponsePayload::err(
-                                    error_code::INVALID_SYNTAX,
-                                    syntax_error_message(&input, &e.to_string()),
-                                ),
-                            })
-                            .await
-                            .context("send error response")?;
-                    }
-                },
-                Err(e) => {
-                    sys.gateway
-                        .send(GatewayMsg::SendResponse {
-                            client_id,
-                            request_id,
-                            payload: ResponsePayload::err(
-                                error_code::INVALID_SYNTAX,
-                                syntax_error_message(&input, &e.to_string()),
-                            ),
-                        })
-                        .await
-                        .context("send error response")?;
+        RequestPayload::RunScript { path, input } => match parse_file_script_command(&input) {
+            Ok(mut command) => {
+                if let ResolvedCommand::Script { source, .. } = &mut command {
+                    *source = cue_core::ipc::ScriptSource::File { path };
                 }
+                send_scheduler_eval(
+                    sys,
+                    client_id,
+                    request_id,
+                    command,
+                    "send script to scheduler",
+                )
+                .await?;
             }
-        }
+            Err(e) => {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: ResponsePayload::err(
+                            error_code::INVALID_SYNTAX,
+                            syntax_error_message(&input, &e.to_string()),
+                        ),
+                    })
+                    .await
+                    .context("send error response")?;
+            }
+        },
 
         RequestPayload::ListJobs { limit } => {
             send_scheduler_eval(
@@ -634,11 +589,7 @@ async fn route_request(
                 .await?;
         }
 
-        RequestPayload::Complete {
-            input,
-            cursor,
-            mode: _,
-        } => {
+        RequestPayload::Complete { input, cursor } => {
             sys.gateway
                 .send(GatewayMsg::SendResponse {
                     client_id,
@@ -668,7 +619,7 @@ async fn route_request(
                     client_id,
                     request_id,
                     payload: ResponsePayload::Ok(OkPayload::Pong {
-                        version: Some(crate::version().to_string()),
+                        version: crate::version().to_string(),
                     }),
                 })
                 .await?;
@@ -783,10 +734,7 @@ fn bash_syntax_hints(input: &str) -> Vec<&'static str> {
 }
 
 fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
-    let prefix = input
-        .get(..cursor.min(input.len()))
-        .unwrap_or(input)
-        .trim_start();
+    let prefix = prefix_before_cursor(input, cursor).trim_start();
 
     if let Some((command, param_prefix)) = mode_param_key_prefix(prefix) {
         return mode_param_specs_for_command(command)
@@ -818,6 +766,14 @@ fn complete_input(input: &str, cursor: usize) -> Vec<CompletionItem> {
     }
 
     Vec::new()
+}
+
+fn prefix_before_cursor(input: &str, cursor: usize) -> &str {
+    let mut cursor = cursor.min(input.len());
+    while !input.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    &input[..cursor]
 }
 
 fn mode_param_key_prefix(prefix: &str) -> Option<(&str, &str)> {
@@ -916,7 +872,9 @@ mod tests {
         let (mut a, mut b) = UnixStream::pair().unwrap();
         let msg = Message::Response {
             id: 1,
-            payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
+            payload: ResponsePayload::Ok(OkPayload::Pong {
+                version: "0.1.0".into(),
+            }),
         };
         write_message(&mut a, &msg).await.unwrap();
         let decoded = read_message(&mut b).await.unwrap();
@@ -924,8 +882,8 @@ mod tests {
             decoded,
             Message::Response {
                 id: 1,
-                payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
-            }
+                payload: ResponsePayload::Ok(OkPayload::Pong { version }),
+            } if version == "0.1.0"
         ));
     }
 
@@ -1065,6 +1023,17 @@ mod tests {
     }
 
     #[test]
+    fn completion_clamps_cursor_to_utf8_boundary() {
+        let input = ":r💖un";
+        let cursor_inside_heart = ":r".len() + 1;
+
+        assert_eq!(prefix_before_cursor(input, cursor_inside_heart), ":r");
+        let items = complete_input(input, cursor_inside_heart);
+
+        assert!(items.iter().any(|item| item.label == ":run"));
+    }
+
+    #[test]
     fn completion_uses_shared_mode_param_specs() {
         let items = complete_input(":run(p", 6);
         assert!(items.iter().any(|item| item.label == "pty"));
@@ -1076,11 +1045,10 @@ mod tests {
 
     #[test]
     fn inline_multiline_script_rejection_points_to_cue_run() {
-        let ast = Parser::parse("cargo test\n:run cargo clippy").unwrap();
-        let command = Resolver::resolve(ast, cue_core::Mode::Job).unwrap();
+        let command = parse_command("cargo test\n:run cargo clippy", cue_core::Mode::Job).unwrap();
         assert!(matches!(
             command,
-            crate::parser::resolver::ResolvedCommand::Script {
+            ResolvedCommand::Script {
                 source: cue_core::ipc::ScriptSource::Inline,
                 ..
             }
@@ -1092,6 +1060,66 @@ mod tests {
                 assert!(message.contains("cue run path/to/file.cue"));
             }
             _ => panic!("expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_script_requests_are_resolved_with_job_mode() {
+        let (event_bus_tx, _event_bus_rx) = mpsc::channel(1);
+        let (gateway_tx, mut gateway_rx) = mpsc::channel(1);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_mgr, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_store, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr,
+            scope_store,
+            event_bus: event_bus_tx,
+            config: crate::config::Config::default(),
+        };
+        let (evt_tx, _evt_rx) = mpsc::channel(1);
+
+        route_request(
+            7,
+            42,
+            RequestPayload::RunScript {
+                path: "build.cue".into(),
+                input: "every 5m echo hi".into(),
+            },
+            &sys,
+            &evt_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(gateway_rx.try_recv().is_err());
+        match scheduler_rx.recv().await.unwrap() {
+            SchedulerMsg::Eval {
+                client_id,
+                request_id,
+                command,
+            } => {
+                assert_eq!(client_id, 7);
+                assert_eq!(request_id, 42);
+                match *command {
+                    ResolvedCommand::Script { source, items, .. } => {
+                        assert_eq!(
+                            source,
+                            cue_core::ipc::ScriptSource::File {
+                                path: "build.cue".into(),
+                            }
+                        );
+                        assert_eq!(items.len(), 1);
+                        assert!(matches!(
+                            *items.into_iter().next().unwrap().command,
+                            ResolvedCommand::Run { .. }
+                        ));
+                    }
+                    other => panic!("expected file script command, got {other:?}"),
+                }
+            }
+            _ => panic!("expected scheduler eval"),
         }
     }
 

@@ -1,9 +1,9 @@
 //! Component trait and concrete panel implementations.
 
-pub mod input_line;
-pub mod main_view;
-pub mod sidebar;
-pub mod status_bar;
+pub(crate) mod input_line;
+pub(crate) mod main_view;
+pub(crate) mod sidebar;
+pub(crate) mod status_bar;
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -17,7 +17,7 @@ use crate::app::AppMsg;
 /// - Accept its own `Message` type for internal updates
 /// - Render itself into a given area
 /// - Convert raw key/mouse events into app-level messages
-pub trait Component {
+pub(crate) trait Component {
     /// Component-local message type for internal state changes.
     type Message;
 

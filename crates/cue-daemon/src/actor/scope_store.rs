@@ -21,7 +21,7 @@ use cue_core::ipc::EventPayload;
 /// Spawn the ScopeStore actor task.
 ///
 /// Initialises a root scope from the current process environment.
-pub async fn spawn(
+pub(super) async fn spawn(
     mut rx: mpsc::Receiver<ScopeStoreMsg>,
     conn: Connection,
     sys: ActorSystem,
@@ -64,39 +64,6 @@ pub async fn spawn(
                         error!("scope_store: get head snapshot failed: {error}");
                     }
                     let _ = reply.send(snapshot);
-                }
-
-                ScopeStoreMsg::CreateRoot { snapshot, reply } => {
-                    let scope = Scope::root(snapshot);
-                    let hash = scope.hash;
-                    let scope_for_db = scope.clone();
-                    if let Err(e) = storage::with_connection(&db, move |conn| {
-                        storage::insert_scope(conn, &scope_for_db)
-                            .and_then(|_| storage::set_head(conn, &hash))
-                    })
-                    .await
-                    {
-                        error!("scope_store: persist root failed: {e}");
-                        let _ = reply.send(Err(anyhow::anyhow!("persist root scope {hash}: {e}")));
-                        continue;
-                    }
-                    cache.insert(hash, scope);
-
-                    let old_hash = current_head;
-                    current_head = hash;
-
-                    publish_actor_event(
-                        "scope_store",
-                        &sys.event_bus,
-                        EventChannel::Scopes,
-                        EventPayload::HeadChanged {
-                            old_hash: old_hash.to_string(),
-                            new_hash: current_head.to_string(),
-                        },
-                    )
-                    .await;
-
-                    let _ = reply.send(Ok(hash));
                 }
 
                 ScopeStoreMsg::Fork { delta, reply } => {

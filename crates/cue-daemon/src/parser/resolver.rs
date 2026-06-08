@@ -121,10 +121,10 @@ pub struct ResolvedScriptItem {
 }
 
 /// Resolve an AST into a command ready for execution.
-pub struct Resolver;
+pub(super) struct Resolver;
 
 impl Resolver {
-    pub fn resolve(ast: Ast, mode: Mode) -> Result<ResolvedCommand, ParseError> {
+    pub(super) fn resolve(ast: Ast, mode: Mode) -> Result<ResolvedCommand, ParseError> {
         match ast {
             Ast::Script { items, .. } => Ok(ResolvedCommand::Script {
                 mode,
@@ -497,7 +497,7 @@ fn format_duration(duration: std::time::Duration) -> String {
     format!("{seconds}s")
 }
 
-/// Convert a chain AST back to text (for legacy prompt-mode bare input).
+/// Convert a chain AST back to text for prompt-mode bare input.
 fn chain_to_text(node: &ChainNode) -> String {
     match node {
         ChainNode::Leaf(expr) => job_expr_to_text(expr),

@@ -3,24 +3,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use cue_client::{CuedClient, ResolvedTransport, connect_ssh_transport};
-use cue_core::Mode;
-use cue_core::ipc::{EventPayload, Message, OkPayload, ResponsePayload, Stream};
+use cue_client::CuedClient;
+use cue_core::ipc::{EventPayload, Message, OkPayload, ResponsePayload, ScriptRunStatus, Stream};
 
 use crate::config::Config;
-use crate::daemon_lifecycle::{
-    check_local_daemon_version, ensure_daemon_running, version_from_ping,
-    warn_on_remote_version_mismatch,
-};
+use crate::frontend_connection::connect_required_frontend_transport;
 
 pub fn run(path: PathBuf) -> Result<i32> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    crate::tracing_config::init_stderr_tracing("warn")?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -42,29 +32,13 @@ async fn connect_for_script() -> Result<CuedClient> {
     let client_config = Config::load()?;
     let transport =
         client_config.resolve_transport(std::env::var_os("CUE_SOCKET").map(PathBuf::from))?;
-    match transport {
-        ResolvedTransport::Unix { socket_path, .. } => {
-            let client = ensure_daemon_running(&socket_path).await.ok_or_else(|| {
-                anyhow::anyhow!("cued is not available at {}", socket_path.display())
-            })?;
-            check_local_daemon_version(Some(client), &socket_path)
-                .await
-                .ok_or_else(|| {
-                    anyhow::anyhow!("cued is not available at {}", socket_path.display())
-                })
-        }
-        ssh_transport @ ResolvedTransport::Ssh { .. } => {
-            let (client, daemon_version) = connect_ssh_transport(&ssh_transport).await?;
-            warn_on_remote_version_mismatch(version_from_ping(daemon_version));
-            Ok(client)
-        }
-    }
+    connect_required_frontend_transport(&transport).await
 }
 
 async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Result<i32> {
-    let request_id = client.run_script(path, input, Mode::Job).await?;
+    let request_id = client.run_script(path, input).await?;
     let mut script_id: Option<String> = None;
-    let mut pending_finished: Vec<(String, i32)> = Vec::new();
+    let mut pending_finished: Vec<(String, ScriptFinishEvent)> = Vec::new();
 
     loop {
         match client.recv().await? {
@@ -76,12 +50,6 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
                     ..
                 }) => {
                     script_id = Some(created.clone());
-                    if let Some((_, exit_code)) = pending_finished
-                        .iter()
-                        .find(|(finished, _)| finished == &created)
-                    {
-                        return Ok(*exit_code);
-                    }
                     if let Some(error) = submit_error {
                         bail!(
                             "script {created} submission failed at item {} [{}]: {}",
@@ -89,6 +57,12 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
                             error.code,
                             error.message
                         );
+                    }
+                    if let Some((_, finish)) = pending_finished
+                        .iter()
+                        .find(|(finished, _)| finished == &created)
+                    {
+                        return script_finished_exit_code(&created, *finish);
                     }
                 }
                 ResponsePayload::Err { code, message } => {
@@ -110,13 +84,20 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
                 }
                 EventPayload::ScriptFinished {
                     script_id: finished,
+                    status,
                     exit_code,
+                    failed_item_index,
                     ..
                 } => {
+                    let finish = ScriptFinishEvent {
+                        status,
+                        exit_code,
+                        failed_item_index,
+                    };
                     if script_id.as_deref() == Some(finished.as_str()) {
-                        return Ok(exit_code);
+                        return script_finished_exit_code(&finished, finish);
                     }
-                    pending_finished.push((finished, exit_code));
+                    pending_finished.push((finished, finish));
                 }
                 _ => {}
             },
@@ -124,11 +105,44 @@ async fn run_with_client(client: &mut CuedClient, path: &str, input: &str) -> Re
     }
 }
 
+#[derive(Clone, Copy)]
+struct ScriptFinishEvent {
+    status: ScriptRunStatus,
+    exit_code: i32,
+    failed_item_index: Option<usize>,
+}
+
+fn script_finished_exit_code(script_id: &str, finish: ScriptFinishEvent) -> Result<i32> {
+    match (finish.status, finish.exit_code) {
+        (ScriptRunStatus::Done, 0) => Ok(0),
+        (ScriptRunStatus::Done, code) => {
+            bail!("script {script_id} reported done with non-zero exit code {code}")
+        }
+        (ScriptRunStatus::Failed, 0) => {
+            let item = finish
+                .failed_item_index
+                .map(|index| format!(" at item {index}"))
+                .unwrap_or_default();
+            bail!("script {script_id} reported failed{item} with zero exit code")
+        }
+        (ScriptRunStatus::Failed, code) => Ok(code),
+    }
+}
+
 fn write_stream(stream: Stream, bytes: &[u8]) -> Result<()> {
     match stream {
-        Stream::Stdout => std::io::stdout().write_all(bytes)?,
-        Stream::Stderr => std::io::stderr().write_all(bytes)?,
+        Stream::Stdout => write_stream_to(&mut std::io::stdout(), bytes)?,
+        Stream::Stderr => write_stream_to(&mut std::io::stderr(), bytes)?,
     }
+    Ok(())
+}
+
+fn write_stream_to<W>(writer: &mut W, bytes: &[u8]) -> Result<()>
+where
+    W: Write,
+{
+    writer.write_all(bytes)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -142,8 +156,9 @@ fn decode_binary_output_chunk(base64: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use cue_core::ipc::{
-        MAX_MESSAGE_SIZE, RequestPayload, ScriptRunStatus, ScriptSource, encode_message,
+        MAX_MESSAGE_SIZE, RequestPayload, ScriptSource, ScriptSubmitError, encode_message,
     };
+    use cue_core::job::EXIT_CODE_UNAVAILABLE;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     async fn read_test_message<R>(stream: &mut R) -> Message
@@ -185,6 +200,49 @@ mod tests {
         assert_eq!(decoded, vec![0, 159, 146, 150, b'\n']);
     }
 
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        flush_count: usize,
+    }
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_count += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn output_chunks_flush_after_write() {
+        let mut writer = RecordingWriter::default();
+
+        write_stream_to(&mut writer, b"partial output").expect("write output chunk");
+
+        assert_eq!(writer.bytes, b"partial output");
+        assert_eq!(writer.flush_count, 1);
+    }
+
+    #[test]
+    fn script_finished_exit_code_rejects_inconsistent_status() {
+        let error = script_finished_exit_code(
+            "R9",
+            ScriptFinishEvent {
+                status: ScriptRunStatus::Failed,
+                exit_code: 0,
+                failed_item_index: Some(2),
+            },
+        )
+        .expect_err("failed status with zero exit code should be invalid");
+
+        assert!(format!("{error:#}").contains("script R9 reported failed at item 2"));
+    }
+
     #[tokio::test]
     async fn run_with_client_uses_direct_script_finished_without_jobs_subscription() {
         let (client_stream, mut server_stream) = tokio::io::duplex(4096);
@@ -195,12 +253,11 @@ mod tests {
         match read_test_message(&mut server_stream).await {
             Message::Request {
                 id,
-                payload: RequestPayload::RunScript { path, input, mode },
+                payload: RequestPayload::RunScript { path, input },
             } => {
                 assert_eq!(id, 1);
                 assert_eq!(path, "fast.cue");
                 assert_eq!(input, ":help\n");
-                assert_eq!(mode, Mode::Job);
             }
             other => panic!("expected first request to be RunScript, got {other:?}"),
         }
@@ -238,5 +295,122 @@ mod tests {
             .expect("runner task")
             .expect("run_with_client succeeds");
         assert_eq!(exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn run_with_client_rejects_inconsistent_finished_status() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let mut client = CuedClient::from_stream(client_stream);
+        let runner = tokio::spawn(async move {
+            run_with_client(&mut client, "inconsistent.cue", ":help\n").await
+        });
+
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::RunScript { path, input },
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(path, "inconsistent.cue");
+                assert_eq!(input, ":help\n");
+            }
+            other => panic!("expected first request to be RunScript, got {other:?}"),
+        }
+
+        write_test_message(
+            &mut server_stream,
+            Message::Response {
+                id: 1,
+                payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
+                    script_id: "R1".into(),
+                    source: ScriptSource::File {
+                        path: "inconsistent.cue".into(),
+                    },
+                    items: vec![],
+                    submit_error: None,
+                }),
+            },
+        )
+        .await;
+        write_test_message(
+            &mut server_stream,
+            Message::Event {
+                payload: EventPayload::ScriptFinished {
+                    script_id: "R1".into(),
+                    status: ScriptRunStatus::Done,
+                    exit_code: 7,
+                    failed_item_index: None,
+                },
+            },
+        )
+        .await;
+
+        let error = runner
+            .await
+            .expect("runner task")
+            .expect_err("inconsistent status should be reported");
+        assert!(format!("{error:#}").contains("script R1 reported done with non-zero exit code 7"));
+    }
+
+    #[tokio::test]
+    async fn run_with_client_reports_submit_error_when_finished_arrives_first() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let mut client = CuedClient::from_stream(client_stream);
+        let runner =
+            tokio::spawn(async move { run_with_client(&mut client, "bad.cue", ":bad\n").await });
+
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::RunScript { path, input },
+            } => {
+                assert_eq!(id, 1);
+                assert_eq!(path, "bad.cue");
+                assert_eq!(input, ":bad\n");
+            }
+            other => panic!("expected first request to be RunScript, got {other:?}"),
+        }
+
+        write_test_message(
+            &mut server_stream,
+            Message::Event {
+                payload: EventPayload::ScriptFinished {
+                    script_id: "R1".into(),
+                    status: ScriptRunStatus::Failed,
+                    exit_code: EXIT_CODE_UNAVAILABLE,
+                    failed_item_index: Some(0),
+                },
+            },
+        )
+        .await;
+        write_test_message(
+            &mut server_stream,
+            Message::Response {
+                id: 1,
+                payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
+                    script_id: "R1".into(),
+                    source: ScriptSource::File {
+                        path: "bad.cue".into(),
+                    },
+                    items: vec![],
+                    submit_error: Some(ScriptSubmitError {
+                        index: 0,
+                        source: ":bad".into(),
+                        code: "PARSE_ERROR".into(),
+                        message: "unknown command".into(),
+                    }),
+                }),
+            },
+        )
+        .await;
+
+        let error = runner
+            .await
+            .expect("runner task")
+            .expect_err("submit error should be reported");
+        assert!(
+            format!("{error:#}")
+                .contains("script R1 submission failed at item 0 [PARSE_ERROR]: unknown command")
+        );
     }
 }

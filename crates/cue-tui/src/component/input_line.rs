@@ -19,32 +19,32 @@ use super::Component;
 use crate::app::AppMsg;
 
 /// Messages local to the input line.
-pub enum InputMsg {
+pub(crate) enum InputMsg {
     /// Set the active mode (reflects global mode changes).
     SetMode(Mode),
     /// Clear content after submission.
     Clear,
 }
 
-pub struct InputLine {
+pub(crate) struct InputLine {
     /// Current text content.
-    pub content: String,
+    pub(crate) content: String,
     /// Byte-offset cursor position within `content`.
-    pub cursor: usize,
+    pub(crate) cursor: usize,
     /// Command history (newest last).
-    pub history: Vec<String>,
+    pub(crate) history: Vec<String>,
     /// Current position in history browsing (`None` = not browsing).
     history_idx: Option<usize>,
     /// Stashed content when browsing history.
     stashed: String,
     /// Active input mode.
-    pub mode: Mode,
+    pub(crate) mode: Mode,
 }
 
 impl InputLine {
     const MAX_VISIBLE_LINES: u16 = 6;
 
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             content: String::new(),
             cursor: 0,
@@ -56,7 +56,7 @@ impl InputLine {
     }
 
     /// Take the current content (for submission) and push to history.
-    pub fn take_input(&mut self) -> String {
+    pub(crate) fn take_input(&mut self) -> String {
         let input = std::mem::take(&mut self.content);
         self.cursor = 0;
         self.history_idx = None;
@@ -98,7 +98,7 @@ impl InputLine {
         self.cursor = self.content.len();
     }
 
-    pub fn desired_height(&self) -> u16 {
+    pub(crate) fn desired_height(&self) -> u16 {
         self.content
             .split('\n')
             .count()
@@ -106,19 +106,19 @@ impl InputLine {
             .min(Self::MAX_VISIBLE_LINES as usize) as u16
     }
 
-    pub fn insert_text(&mut self, text: &str) {
+    pub(crate) fn insert_text(&mut self, text: &str) {
         self.content.insert_str(self.cursor, text);
         self.cursor += text.len();
         self.history_idx = None;
     }
 
-    pub fn replace_history(&mut self, history: Vec<String>) {
+    pub(crate) fn replace_history(&mut self, history: Vec<String>) {
         self.history = history;
         self.history_idx = None;
         self.stashed.clear();
     }
 
-    pub fn current_word_range(&self) -> Range<usize> {
+    pub(crate) fn current_word_range(&self) -> Range<usize> {
         let cursor = self.cursor.min(self.content.len());
         let start = self.content[..cursor]
             .rfind(char::is_whitespace)
@@ -130,7 +130,7 @@ impl InputLine {
         start..end
     }
 
-    pub fn replace_range(&mut self, range: Range<usize>, text: &str) {
+    pub(crate) fn replace_range(&mut self, range: Range<usize>, text: &str) {
         self.content.replace_range(range.clone(), text);
         self.cursor = range.start + text.len();
         self.history_idx = None;
@@ -279,7 +279,7 @@ impl InputLine {
         format!(" [{}] > ", self.mode.indicator())
     }
 
-    pub fn set_cursor_from_point(&mut self, area: Rect, column: u16, row: u16) {
+    pub(crate) fn set_cursor_from_point(&mut self, area: Rect, column: u16, row: u16) {
         let line_index = row.saturating_sub(area.y) as usize;
         let prompt_width = self.prompt_text().chars().count();
         let visual_column = column.saturating_sub(area.x) as usize;

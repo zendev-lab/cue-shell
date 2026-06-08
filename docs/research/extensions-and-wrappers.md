@@ -16,7 +16,7 @@ This note summarizes the current repository state, implementation complexity, de
 
 ### CLI / TUI extension shape
 
-`cue-tui` is currently an optional Cargo dependency of `cue-cli` behind the `tui` feature. `cue` and `cue tui` both enter the TUI when the feature is enabled. This is a static, compile-time extension, not a dynamic registry.
+`cue-tui` is an optional Cargo dependency of `cue-cli` behind the `tui` feature. When that feature is enabled, `cue` and `cue tui` enter the TUI in-process. When `cue` is built without `tui` but with `extensions`, `cue tui` dispatches to the first-party external `cue-tui` companion binary next to `cue`.
 
 A near-term external CLI extension registry now exists:
 
@@ -72,7 +72,7 @@ It depends heavily on which level of extension is meant.
 
 ### Level 0 — static feature subcommands
 
-Already done for `cue tui`.
+Still supported for `cue tui` when `cue-cli` is built with the `tui` feature.
 
 - Complexity: already present.
 - Good for first-party compiled modules.
@@ -94,21 +94,23 @@ Optional config/registry can add metadata:
 
 ```toml
 [extensions.commands.foo]
-command = "cue-foo"
+program = "cue-foo"
 description = "Foo extension"
 ```
 
-`command` is an executable path/name; arguments are forwarded from the `cue foo ...` invocation.
+`program` is an executable path/name; arguments are forwarded from the `cue foo ...` invocation.
 
 Complexity: low to medium.
 
 Implementation sketch:
 
 1. Keep known builtins (`tui`, `help`, `version`) first.
-2. On unknown subcommand, search configured extension table, then optionally PATH for `cue-{subcommand}` when `path_lookup = true`.
-3. Use `std::process::Command` for the current implementation; Unix `exec`-style replacement can be added later if needed.
-4. Forward args and environment unchanged.
-5. Add `cue extensions list` later if desired.
+2. On unknown non-reserved subcommand, search the configured extension program
+   table, then optionally PATH for `cue-{subcommand}` when `path_lookup = true`.
+3. Treat first-party external subcommands such as `tui` as reserved extension names that use companion binary lookup only; user PATH discovery remains limited to non-reserved extensions when `path_lookup = true`.
+4. Use `std::process::Command` for the current implementation; Unix `exec`-style replacement can be added later if needed.
+5. Forward args and environment unchanged.
+6. Add `cue extensions list` later if desired.
 
 Pros:
 
@@ -136,7 +138,7 @@ Possible config:
 enabled = ["foo", "bar"]
 
 [extensions.commands.foo]
-command = "cue-foo"
+program = "cue-foo"
 description = "Foo extension"
 # aliases = ["f"] # TODO
 ```
@@ -145,9 +147,11 @@ Complexity: medium.
 
 Additional decisions:
 
-- Config file: `client.toml` is more appropriate for CLI extension discovery than `server.toml`.
-- Precedence: builtins should win unless user explicitly enables shadowing.
-- Names: use kebab-case and reject names colliding with builtins by default.
+- Config file: `client.toml` is more appropriate for CLI extension discovery than `daemon.toml`.
+- Precedence: built-in and first-party subcommands win; there is no current
+  shadowing knob.
+- Names: use kebab-case and reject names colliding with built-in or first-party
+  subcommands by default.
 - Trust: config-controlled extensions should be explicit, but PATH discovery can be opt-in/opt-out.
 
 Pros over Level 1:
@@ -192,7 +196,8 @@ Decision: use external subcommand registration as the near-term extension mechan
 
 Recommended phased plan:
 
-1. Level 1 dispatch: builtins first, then configured command, then optional PATH lookup for `cue-{name}`.
+1. Level 1 dispatch: built-in/first-party names first, then configured program,
+   then optional PATH lookup for `cue-{name}`.
 2. Add `cue extensions list` once a manifest table exists.
 3. Keep daemon extension actors and TUI plugins as future research, not current implementation.
 
@@ -200,9 +205,11 @@ This is not very hard if scoped to external subcommands. It becomes hard only if
 
 Implemented near-term behavior:
 
-- builtins win by default;
-- configured `[extensions.commands.<name>]` entries are checked before PATH;
+- built-in and first-party subcommands win by default;
+- configured `[extensions.commands.<name>]` entries for non-reserved names are
+  checked before PATH;
 - PATH lookup is gated by `[extensions] path_lookup = true`;
+- `cue tui` can fall through to the first-party external `cue-tui` companion binary next to `cue` when the in-process `tui` feature is not compiled in;
 - unknown extensions receive forwarded args and environment.
 
 TODO:
@@ -232,7 +239,7 @@ Important constraints from cue-shell design:
 
 Before implementing multiple wrappers, keep the existing single-wrapper semantics minimal:
 
-1. Replace denylist targeting with allowlist-only targeting.
+1. Use allowlist-only targeting.
 
    Target config:
 
@@ -245,7 +252,7 @@ Before implementing multiple wrappers, keep the existing single-wrapper semantic
    commands = ["cargo", "git", "pnpm", "node"]
    ```
 
-   Behavior: only commands in `allowlist.commands` may be wrapped. If the allowlist is absent or empty, no commands are wrapped. There is no parallel denylist in the target model; allowlist is simpler and matches the safety expectation.
+   Behavior: only commands in `allowlist.commands` may be wrapped. If the allowlist is absent or empty, no commands are wrapped.
 
 2. Use mode param override.
 
@@ -475,7 +482,7 @@ sh -c 'cat file | rg pattern'
    - foreground-like commands are not wrapped.
    - native pipeline wraps each allowlisted segment.
    - logical `&&` / `||` wraps spawned child commands.
-2. Replaced denylist-based targeting with `allowlist.commands` in `WrapperConfig`.
+2. Use `allowlist.commands` in `WrapperConfig`.
 3. Shared foreground/open-hint classification in `cue-core`.
 4. Threaded `wrapper_enabled` through native pipeline and logical job paths.
 5. Persisted cron wrapper behavior.
@@ -484,7 +491,7 @@ sh -c 'cat file | rg pattern'
 
 ## Bottom line
 
-- A practical generic CLI extension registry uses external subcommands plus optional manifest metadata in `client.toml`; the near-term implementation supports configured commands and opt-in `cue-*` PATH lookup.
+- A practical generic CLI extension registry uses external subcommands plus optional manifest metadata in `client.toml`; the near-term implementation supports configured programs and opt-in `cue-*` PATH lookup.
 - A daemon/TUI plugin system is much harder and should remain future work.
 - Runtime wrappers are a separate mechanism from CLI extensions. The immediate safe path is a single wrapper with explicit allowlist-only targeting, consistent per-segment application, effective mode overrides, and working interactive bypass.
 - Multiple wrappers are TODO/future work. If implemented later, they should likely default to `first_match`; nested/chained wrappers should be opt-in because composition semantics and idempotence are subtle.

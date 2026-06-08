@@ -16,6 +16,11 @@ name = "cued"
 path = "src/bin/cued.rs"
 required-features = ["daemon"]
 
+[[bin]]
+name = "cue-tui"
+path = "src/bin/cue-tui.rs"
+required-features = ["tui"]
+
 [[test]]
 name = "daemon_integration"
 path = "tests/daemon_integration.rs"
@@ -40,15 +45,23 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [features]
-default = ["daemon", "extensions", "tui"]
+default = ["daemon", "extensions", "script", "tui"]
 daemon = ["dep:cue-daemon"]
 extensions = [
   "dep:cue-client",
   "dep:serde",
   "dep:toml",
 ]
-tui = [
+script = [
   "dep:base64",
+  "dep:cue-client",
+  "dep:serde",
+  "dep:tokio",
+  "dep:toml",
+  "dep:tracing",
+  "dep:tracing-subscriber",
+]
+tui = [
   "dep:cue-client",
   "dep:cue-tui",
   "dep:serde",

@@ -11,6 +11,9 @@ cued = "cued"
 cron = "cron"
 tui = "tui"
 ratatui = "ratatui"
+# Intentional typo fixtures used by tests that assert unknown-section
+# errors against client.toml.
+transprt = "transprt"
 
 [files]
 extend-exclude = ["docs/research/"]

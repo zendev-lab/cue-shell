@@ -45,12 +45,11 @@ pub enum ParseErrorKind {
     MissingArgument,
     InvalidIdRef,
     UnmatchedParen,
-    InvalidOperator,
     InvalidCronSchedule,
 }
 
 /// Recursive descent parser.
-pub struct Parser<'a> {
+pub(super) struct Parser<'a> {
     tokens: Vec<Spanned>,
     /// Current position (index into tokens, skipping whitespace).
     pos: usize,
@@ -68,13 +67,13 @@ struct ScriptChunk {
 
 impl<'a> Parser<'a> {
     /// Parse a raw input string into an AST.
-    pub fn parse(input: &'a str) -> Result<Ast, ParseError> {
+    pub(super) fn parse(input: &'a str) -> Result<Ast, ParseError> {
         let tokens = tokenize_for_parser(input)?;
         Self::parse_tokens(tokens, input)
     }
 
     /// Parse a `.cue` file-script body into a top-level script AST.
-    pub fn parse_file_script(input: &str) -> Result<Ast, ParseError> {
+    pub(super) fn parse_file_script(input: &str) -> Result<Ast, ParseError> {
         let normalized = normalize_file_script(input);
         let tokens = tokenize_for_parser(&normalized)?;
         Self::parse_tokens_as_script(tokens, &normalized)
@@ -1116,6 +1115,18 @@ mod tests {
             },
             _ => panic!("expected Command"),
         }
+    }
+
+    #[test]
+    fn parse_rejects_bare_shell_pipe() {
+        let err = Parser::parse(":run echo hi | wc -c")
+            .expect_err("bare shell pipe should not be accepted as a word");
+
+        assert!(
+            err.message
+                .contains("bare `|` is not a cue-shell pipe operator")
+        );
+        assert!(err.message.contains("use `|>`"));
     }
 
     #[test]

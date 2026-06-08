@@ -9,19 +9,59 @@ use tokio::sync::mpsc;
 
 use cue_core::ipc::Message;
 
-use crate::{ClientReader, CuedClient, WriterHandle, spawn_writer_task};
+use crate::client::{ClientReader, CuedClient, WriterHandle, spawn_writer_task};
 
 type ConnectFuture = Pin<Box<dyn Future<Output = Result<CuedClient>> + Send + 'static>>;
 
-/// Commands that can be sent to a controllable connection manager to influence
-/// its reconnect behaviour at runtime.
-pub enum ReconnectCmd {
+/// Commands sent to the connection manager task.
+enum ReconnectCmd {
     /// Drop the current transport and immediately attempt to reconnect using
     /// the supplied connector.  If the first attempt fails the manager falls
     /// back to its normal periodic retry loop.
     SwitchTarget(ClientConnector),
     /// Shut the connection manager down cleanly.
     Shutdown,
+}
+
+/// Failure while sending a control command to the connection manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionControlError {
+    Full,
+    Closed,
+}
+
+impl std::fmt::Display for ConnectionControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Full => f.write_str("connection control queue is full"),
+            Self::Closed => f.write_str("connection manager is closed"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionControlError {}
+
+/// Cloneable control handle for the connection manager.
+#[derive(Clone)]
+pub struct ConnectionController {
+    tx: mpsc::Sender<ReconnectCmd>,
+}
+
+impl ConnectionController {
+    pub fn switch_target(&self, connector: ClientConnector) -> Result<(), ConnectionControlError> {
+        self.try_send(ReconnectCmd::SwitchTarget(connector))
+    }
+
+    pub fn shutdown(&self) -> Result<(), ConnectionControlError> {
+        self.try_send(ReconnectCmd::Shutdown)
+    }
+
+    fn try_send(&self, command: ReconnectCmd) -> Result<(), ConnectionControlError> {
+        self.tx.try_send(command).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ConnectionControlError::Full,
+            mpsc::error::TrySendError::Closed(_) => ConnectionControlError::Closed,
+        })
+    }
 }
 
 /// Cloneable connector used by the shared reconnect loop.
@@ -54,7 +94,7 @@ impl ClientConnector {
 }
 
 /// Default reconnect interval after the daemon disconnects.
-pub const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(3);
+const DEFAULT_RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
 /// Events produced by the shared connection manager.
 pub enum ConnectionEvent {
@@ -64,63 +104,17 @@ pub enum ConnectionEvent {
     Reconnected { writer: WriterHandle },
 }
 
-/// Spawn the socket connection manager and return a receiver of shared client
-/// events.
-pub fn spawn_socket_manager(
-    initial_reader: Option<ClientReader>,
-    socket_path: PathBuf,
-) -> mpsc::UnboundedReceiver<ConnectionEvent> {
-    spawn_connection_manager(initial_reader, ClientConnector::unix(socket_path))
-}
-
-/// Spawn the socket connection manager with a custom reconnect interval.
-pub fn spawn_socket_manager_with_delay(
-    initial_reader: Option<ClientReader>,
-    socket_path: PathBuf,
-    reconnect_delay: Duration,
-) -> mpsc::UnboundedReceiver<ConnectionEvent> {
-    spawn_connection_manager_with_delay(
-        initial_reader,
-        ClientConnector::unix(socket_path),
-        reconnect_delay,
-    )
-}
-
-/// Spawn the shared connection manager with a custom connector.
-pub fn spawn_connection_manager(
-    initial_reader: Option<ClientReader>,
-    connector: ClientConnector,
-) -> mpsc::UnboundedReceiver<ConnectionEvent> {
-    spawn_connection_manager_with_delay(initial_reader, connector, DEFAULT_RECONNECT_DELAY)
-}
-
-/// Spawn the shared connection manager with a custom connector and reconnect interval.
-pub fn spawn_connection_manager_with_delay(
-    initial_reader: Option<ClientReader>,
-    connector: ClientConnector,
-    reconnect_delay: Duration,
-) -> mpsc::UnboundedReceiver<ConnectionEvent> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(run_connection_manager_with_delay(
-        initial_reader,
-        connector,
-        reconnect_delay,
-        tx,
-    ));
-    rx
-}
-
-/// Spawn the connection manager with a control channel.
+/// Spawn the connection manager with a control handle.
 ///
-/// Returns `(event_rx, cmd_tx)`:
+/// Returns `(event_rx, controller)`:
 /// - `event_rx` delivers [`ConnectionEvent`]s to the caller.
-/// - `cmd_tx` lets the caller send [`ReconnectCmd`]s (e.g. `SwitchTarget`).
+/// - `controller` lets the caller request target switches or shutdown.
 pub fn spawn_connection_manager_controllable(
     initial_reader: Option<ClientReader>,
     connector: ClientConnector,
 ) -> (
     mpsc::UnboundedReceiver<ConnectionEvent>,
-    mpsc::Sender<ReconnectCmd>,
+    ConnectionController,
 ) {
     spawn_connection_manager_controllable_with_delay(
         initial_reader,
@@ -131,16 +125,17 @@ pub fn spawn_connection_manager_controllable(
 
 /// Spawn the connection manager with a control channel and a custom reconnect
 /// interval.
-pub fn spawn_connection_manager_controllable_with_delay(
+fn spawn_connection_manager_controllable_with_delay(
     initial_reader: Option<ClientReader>,
     connector: ClientConnector,
     reconnect_delay: Duration,
 ) -> (
     mpsc::UnboundedReceiver<ConnectionEvent>,
-    mpsc::Sender<ReconnectCmd>,
+    ConnectionController,
 ) {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    let controller = ConnectionController { tx: cmd_tx };
     tokio::spawn(run_controllable_connection_manager(
         initial_reader,
         connector,
@@ -148,93 +143,11 @@ pub fn spawn_connection_manager_controllable_with_delay(
         event_tx,
         cmd_rx,
     ));
-    (event_rx, cmd_tx)
-}
-
-/// Long-lived task that reads from the daemon socket and auto-reconnects.
-pub async fn run_socket_manager(
-    initial_reader: Option<ClientReader>,
-    socket_path: PathBuf,
-    tx: mpsc::UnboundedSender<ConnectionEvent>,
-) {
-    run_connection_manager(initial_reader, ClientConnector::unix(socket_path), tx).await;
-}
-
-/// Long-lived task that reads from the daemon socket and auto-reconnects using
-/// `reconnect_delay`.
-pub async fn run_socket_manager_with_delay(
-    initial_reader: Option<ClientReader>,
-    socket_path: PathBuf,
-    reconnect_delay: Duration,
-    tx: mpsc::UnboundedSender<ConnectionEvent>,
-) {
-    run_connection_manager_with_delay(
-        initial_reader,
-        ClientConnector::unix(socket_path),
-        reconnect_delay,
-        tx,
-    )
-    .await;
-}
-
-/// Long-lived task that reads from the daemon connection and auto-reconnects.
-pub async fn run_connection_manager(
-    initial_reader: Option<ClientReader>,
-    connector: ClientConnector,
-    tx: mpsc::UnboundedSender<ConnectionEvent>,
-) {
-    run_connection_manager_with_delay(initial_reader, connector, DEFAULT_RECONNECT_DELAY, tx).await;
-}
-
-/// Long-lived task that reads from the daemon connection and auto-reconnects using
-/// `reconnect_delay`.
-pub async fn run_connection_manager_with_delay(
-    initial_reader: Option<ClientReader>,
-    connector: ClientConnector,
-    reconnect_delay: Duration,
-    tx: mpsc::UnboundedSender<ConnectionEvent>,
-) {
-    let mut reader_opt = initial_reader;
-
-    loop {
-        if let Some(mut reader) = reader_opt.take() {
-            if read_until_disconnect(&mut reader, &tx).await.is_err() {
-                return;
-            }
-            if tx.send(ConnectionEvent::Disconnected).is_err() {
-                return;
-            }
-        }
-
-        let mut failure_reported = false;
-        loop {
-            tokio::time::sleep(reconnect_delay).await;
-
-            match connector.connect().await {
-                Ok(client) => {
-                    let (reader, writer) = client.into_split();
-                    let writer = spawn_writer_task(writer);
-                    if tx.send(ConnectionEvent::Reconnected { writer }).is_err() {
-                        return;
-                    }
-                    reader_opt = Some(reader);
-                    break;
-                }
-                Err(error) => {
-                    if !failure_reported {
-                        if send_reconnect_failed(&tx, error).is_err() {
-                            return;
-                        }
-                        failure_reported = true;
-                    }
-                }
-            }
-        }
-    }
+    (event_rx, controller)
 }
 
 /// Long-lived controllable task.  Reads from the active connection, forwards
-/// messages and handles [`ReconnectCmd`]s concurrently.
+/// messages and handles control commands concurrently.
 async fn run_controllable_connection_manager(
     initial_reader: Option<ClientReader>,
     mut connector: ClientConnector,
@@ -366,22 +279,6 @@ fn send_reconnect_failed(
     .map_err(|_| ())
 }
 
-async fn read_until_disconnect(
-    reader: &mut ClientReader,
-    tx: &mpsc::UnboundedSender<ConnectionEvent>,
-) -> Result<(), ()> {
-    loop {
-        match reader.recv().await {
-            Ok(msg) => {
-                if tx.send(ConnectionEvent::Incoming(msg)).is_err() {
-                    return Err(());
-                }
-            }
-            Err(_) => return Ok(()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -416,13 +313,11 @@ mod tests {
             }
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(run_connection_manager_with_delay(
+        let (mut rx, _controller) = spawn_connection_manager_controllable_with_delay(
             Some(initial_reader),
             connector,
             Duration::from_millis(10),
-            tx,
-        ));
+        );
 
         drop(initial_daemon_stream);
 
@@ -488,16 +383,15 @@ mod tests {
             Ok(CuedClient::from_stream(client_stream))
         });
 
-        let (mut event_rx, cmd_tx) = spawn_connection_manager_controllable_with_delay(
+        let (mut event_rx, controller) = spawn_connection_manager_controllable_with_delay(
             Some(initial_reader),
             initial_connector,
             Duration::from_millis(10),
         );
 
         // Trigger a target switch while connected.
-        cmd_tx
-            .send(ReconnectCmd::SwitchTarget(new_connector))
-            .await
+        controller
+            .switch_target(new_connector)
             .expect("send SwitchTarget");
 
         // Expect Disconnected then Reconnected.
@@ -561,15 +455,14 @@ mod tests {
             Ok(CuedClient::from_stream(client_stream))
         });
 
-        let (mut event_rx, cmd_tx) = spawn_connection_manager_controllable_with_delay(
+        let (mut event_rx, controller) = spawn_connection_manager_controllable_with_delay(
             Some(initial_reader),
             initial_connector,
             Duration::from_millis(10),
         );
 
-        cmd_tx
-            .send(ReconnectCmd::SwitchTarget(new_connector))
-            .await
+        controller
+            .switch_target(new_connector)
             .expect("send SwitchTarget");
 
         let disconnected = timeout(Duration::from_secs(2), event_rx.recv())
@@ -601,5 +494,22 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
 
         drop(initial_daemon_stream);
+    }
+
+    #[tokio::test]
+    async fn controller_shutdown_closes_connection_manager() {
+        let connector = ClientConnector::new(|| async { anyhow::bail!("should not connect") });
+        let (mut event_rx, controller) = spawn_connection_manager_controllable_with_delay(
+            None,
+            connector,
+            Duration::from_secs(60),
+        );
+
+        controller.shutdown().expect("send shutdown");
+
+        let event = timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("connection manager did not shut down");
+        assert!(event.is_none(), "shutdown should close event stream");
     }
 }

@@ -2,13 +2,6 @@ use anyhow::bail;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-#[cfg(feature = "extensions")]
-use anyhow::Context;
-#[cfg(feature = "extensions")]
-use std::ffi::OsStr;
-#[cfg(feature = "extensions")]
-use std::process::Command;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CueCommand {
     Help,
@@ -38,7 +31,17 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
     let mut args = args.into_iter();
     let _program = args.next();
 
-    match args.next().as_deref().and_then(|arg| arg.to_str()) {
+    let command = args.next();
+    let command = match command.as_deref() {
+        Some(command) => Some(
+            command
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("cue subcommand must be valid UTF-8"))?,
+        ),
+        None => None,
+    };
+
+    match command {
         Some("-h" | "--help" | "help") => {
             if args.next().is_some() {
                 bail!("`cue help` does not accept extra arguments");
@@ -82,39 +85,33 @@ fn run_tui() -> anyhow::Result<()> {
     cue_cli::run_tui()
 }
 
-#[cfg(not(feature = "tui"))]
+#[cfg(all(not(feature = "tui"), feature = "extensions"))]
 fn run_tui() -> anyhow::Result<()> {
-    bail!("`cue tui` is unavailable because cue-cli was built without the `tui` feature")
+    run_extension("tui", &[])
 }
 
-#[cfg(feature = "tui")]
+#[cfg(all(not(feature = "tui"), not(feature = "extensions")))]
+fn run_tui() -> anyhow::Result<()> {
+    bail!(
+        "`cue tui` is unavailable because cue-cli was built without the `tui` or `extensions` feature"
+    )
+}
+
+#[cfg(feature = "script")]
 fn run_script(path: PathBuf) -> anyhow::Result<()> {
     let code = cue_cli::run_script(path)?;
-    std::process::exit(code);
+    std::process::exit(process_exit_code(code));
 }
 
-#[cfg(not(feature = "tui"))]
+#[cfg(not(feature = "script"))]
 fn run_script(_path: PathBuf) -> anyhow::Result<()> {
-    bail!("`cue run` is unavailable because cue-cli was built without the `tui` feature")
+    bail!("`cue run` is unavailable because cue-cli was built without the `script` feature")
 }
 
 #[cfg(feature = "extensions")]
 fn run_extension(name: &str, args: &[OsString]) -> anyhow::Result<()> {
-    let config = cue_cli::config::Config::load()?;
-    if let Some(extension) = config.extensions.commands.get(name) {
-        return exec_extension_command(&extension.command, args);
-    }
-
-    if config.extensions.path_lookup
-        && let Some(command) = cue_cli::path_lookup::find_executable_on_path(&format!("cue-{name}"))
-    {
-        return exec_program(command.as_os_str(), args);
-    }
-
-    bail!(
-        "unknown cue subcommand `{name}`; supported: {}",
-        supported_subcommands()
-    )
+    let code = cue_cli::run_extension(name, args, supported_subcommands())?;
+    std::process::exit(process_exit_code(code));
 }
 
 #[cfg(not(feature = "extensions"))]
@@ -125,22 +122,9 @@ fn run_extension(name: &str, _args: &[OsString]) -> anyhow::Result<()> {
     )
 }
 
-#[cfg(feature = "extensions")]
-fn exec_extension_command(command: &str, args: &[OsString]) -> anyhow::Result<()> {
-    let program = command.trim();
-    if program.is_empty() {
-        bail!("extension command is empty");
-    }
-    exec_program(OsStr::new(program), args)
-}
-
-#[cfg(feature = "extensions")]
-fn exec_program(program: &OsStr, args: &[OsString]) -> anyhow::Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .status()
-        .with_context(|| format!("failed to run extension `{}`", program.to_string_lossy()))?;
-    std::process::exit(status.code().unwrap_or(1));
+#[cfg(any(feature = "extensions", feature = "script", test))]
+fn process_exit_code(code: i32) -> i32 {
+    if code < 0 { 1 } else { code }
 }
 
 fn print_help() {
@@ -150,8 +134,20 @@ fn print_help() {
 fn help_text() -> String {
     let tui_help = if cfg!(feature = "tui") {
         "  tui        Start the terminal UI (default)"
+    } else if cfg!(feature = "extensions") {
+        "  tui        Start the terminal UI via the external cue-tui extension (default)"
     } else {
-        "  tui        Unavailable in this build (enable the `tui` feature)"
+        "  tui        Unavailable in this build (enable the `tui` or `extensions` feature)"
+    };
+    let script_usage = if cfg!(feature = "script") {
+        "\n       cue run <file.cue>"
+    } else {
+        ""
+    };
+    let script_help = if cfg!(feature = "script") {
+        "\n  run        Run a .cue script file"
+    } else {
+        "\n  run        Unavailable in this build (enable the `script` feature)"
     };
     let extension_usage = if cfg!(feature = "extensions") {
         "\n       cue <extension> [args...]"
@@ -165,16 +161,20 @@ fn help_text() -> String {
     };
 
     format!(
-        "cue {}\n\nUsage: cue [tui]{extension_usage}\n       cue run <file.cue>\n       cue --version\n\nCommands:\n{tui_help}\n  run        Run a .cue script file{extension_help}\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        "cue {}\n\nUsage: cue [tui]{script_usage}{extension_usage}\n       cue --version\n\nCommands:\n{tui_help}{script_help}{extension_help}\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
         env!("CARGO_PKG_VERSION"),
     )
 }
 
 fn supported_subcommands() -> &'static str {
-    if cfg!(feature = "tui") {
-        "tui, run, help, version"
-    } else {
-        "run, help, version"
+    match (
+        cfg!(any(feature = "tui", feature = "extensions")),
+        cfg!(feature = "script"),
+    ) {
+        (true, true) => "tui, run, help, version",
+        (true, false) => "tui, help, version",
+        (false, true) => "run, help, version",
+        (false, false) => "help, version",
     }
 }
 
@@ -222,6 +222,17 @@ mod tests {
         .expect_err("extra tui args should fail");
 
         assert!(format!("{error:#}").contains("`cue tui` does not accept extra arguments"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_command_rejects_non_utf8_subcommand() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let error = parse_command([OsString::from("cue"), OsString::from_vec(vec![0xff])])
+            .expect_err("non-UTF-8 subcommand should not fall back to default tui");
+
+        assert!(format!("{error:#}").contains("cue subcommand must be valid UTF-8"));
     }
 
     #[test]
@@ -280,6 +291,13 @@ mod tests {
     }
 
     #[test]
+    fn process_exit_code_maps_internal_unavailable_sentinel() {
+        assert_eq!(process_exit_code(-1), 1);
+        assert_eq!(process_exit_code(0), 0);
+        assert_eq!(process_exit_code(7), 7);
+    }
+
+    #[test]
     fn help_text_matches_enabled_features() {
         let text = help_text();
         if cfg!(feature = "extensions") {
@@ -289,8 +307,17 @@ mod tests {
         }
         if cfg!(feature = "tui") {
             assert!(text.contains("Start the terminal UI"));
+        } else if cfg!(feature = "extensions") {
+            assert!(text.contains("external cue-tui extension"));
         } else {
             assert!(text.contains("Unavailable in this build"));
+        }
+        if cfg!(feature = "script") {
+            assert!(text.contains("cue run <file.cue>"));
+            assert!(text.contains("Run a .cue script file"));
+        } else {
+            assert!(!text.contains("cue run <file.cue>"));
+            assert!(text.contains("enable the `script` feature"));
         }
     }
 }

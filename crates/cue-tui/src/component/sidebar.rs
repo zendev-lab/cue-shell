@@ -17,56 +17,56 @@ use crate::app::AppMsg;
 
 /// A single item in the sidebar list.
 #[derive(Debug, Clone)]
-pub struct SidebarItem {
+pub(crate) struct SidebarItem {
     /// Short identifier, e.g. "J1", "C2".
-    pub id: String,
+    pub(crate) id: String,
     /// Human-readable label (command text).
-    pub label: String,
+    pub(crate) label: String,
     /// Status icon.
-    pub status_icon: &'static str,
+    pub(crate) status_icon: &'static str,
 }
 
 /// Aggregate counts mirrored into the top header.
 #[derive(Debug, Clone, Default)]
-pub struct OverviewCounts {
-    pub jobs: u32,
-    pub jobs_running: u32,
-    pub crons: u32,
+pub(crate) struct OverviewCounts {
+    pub(crate) jobs: u32,
+    pub(crate) jobs_running: u32,
+    pub(crate) crons: u32,
 }
 
 // ── Component messages ──
 
 /// Messages local to the sidebar.
-pub enum SidebarMsg {
+pub(crate) enum SidebarMsg {
     /// Switch the active mode so titles and empty state match.
-    SetMode(Mode),
+    Mode(Mode),
     /// Reflect whether the sidebar currently owns focus.
-    SetFocused(bool),
+    Focused(bool),
     /// Replace the item list entirely.
-    SetItems(Vec<SidebarItem>),
+    Items(Vec<SidebarItem>),
     /// Update overview counts.
-    SetOverview(OverviewCounts),
+    Overview(OverviewCounts),
 }
 
 // ── Sidebar ──
 
-pub struct Sidebar {
+pub(crate) struct Sidebar {
     /// Active input mode.
-    pub mode: Mode,
+    pub(crate) mode: Mode,
     /// Whether the sidebar currently owns focus.
-    pub focused: bool,
+    pub(crate) focused: bool,
     /// Current list items.
-    pub items: Vec<SidebarItem>,
+    pub(crate) items: Vec<SidebarItem>,
     /// Currently selected index (for highlight).
-    pub selected: Option<usize>,
+    pub(crate) selected: Option<usize>,
     /// Aggregate counts mirrored into the top header.
-    pub overview: OverviewCounts,
+    pub(crate) overview: OverviewCounts,
     /// Scroll offset for the first visible row.
     list_offset: Cell<usize>,
 }
 
 impl Sidebar {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             mode: Mode::default(),
             focused: false,
@@ -91,7 +91,7 @@ impl Sidebar {
         }
     }
 
-    pub fn move_selection(&mut self, delta: isize) {
+    pub(crate) fn move_selection(&mut self, delta: isize) {
         if self.items.is_empty() {
             self.selected = None;
             self.list_offset.set(0);
@@ -103,13 +103,13 @@ impl Sidebar {
         self.selected = Some(next as usize);
     }
 
-    pub fn select_visible_row(&mut self, row: usize) -> Option<usize> {
+    pub(crate) fn select_visible_row(&mut self, row: usize) -> Option<usize> {
         let index = self.visible_row_index(row)?;
         self.selected = Some(index);
         Some(index)
     }
 
-    pub fn visible_row_index(&self, row: usize) -> Option<usize> {
+    pub(crate) fn visible_row_index(&self, row: usize) -> Option<usize> {
         let index = self.list_offset.get().saturating_add(row);
         (index < self.items.len()).then_some(index)
     }
@@ -126,9 +126,9 @@ impl Component for Sidebar {
 
     fn update(&mut self, msg: SidebarMsg) {
         match msg {
-            SidebarMsg::SetMode(mode) => self.mode = mode,
-            SidebarMsg::SetFocused(focused) => self.focused = focused,
-            SidebarMsg::SetItems(items) => {
+            SidebarMsg::Mode(mode) => self.mode = mode,
+            SidebarMsg::Focused(focused) => self.focused = focused,
+            SidebarMsg::Items(items) => {
                 self.items = items;
                 // Keep selection in bounds.
                 if self.selected.is_some_and(|sel| sel >= self.items.len()) {
@@ -138,7 +138,7 @@ impl Component for Sidebar {
                     self.list_offset.set(0);
                 }
             }
-            SidebarMsg::SetOverview(counts) => {
+            SidebarMsg::Overview(counts) => {
                 self.overview = counts;
             }
         }
@@ -241,7 +241,7 @@ mod tests {
 
     fn sidebar_with_items(count: usize) -> Sidebar {
         let mut sidebar = Sidebar::new();
-        sidebar.update(SidebarMsg::SetItems(
+        sidebar.update(SidebarMsg::Items(
             (0..count)
                 .map(|index| SidebarItem {
                     id: format!("J{}", index + 1),

@@ -15,36 +15,36 @@ use crate::component::sidebar::OverviewCounts;
 // ── Component messages ──
 
 /// Messages local to the status bar.
-pub enum StatusBarMsg {
+pub(crate) enum StatusBarMsg {
     /// Update connection state.
-    SetConnected(bool),
+    Connected(bool),
     /// Update mouse interaction mode.
-    SetMouseMode(MouseMode),
+    MouseMode(MouseMode),
     /// Update the active input mode.
-    SetMode(Mode),
+    Mode(Mode),
     /// Update whether clear display is currently safe.
-    SetClearEnabled(bool),
+    ClearEnabled(bool),
     /// Update current overview counts.
-    SetOverview(OverviewCounts),
+    Overview(OverviewCounts),
 }
 
 // ── StatusBar ──
 
-pub struct StatusBar {
+pub(crate) struct StatusBar {
     /// Whether we are connected to cued.
-    pub connected: bool,
+    pub(crate) connected: bool,
     /// Whether mouse is captured by the UI or left to terminal selection.
-    pub mouse_mode: MouseMode,
+    pub(crate) mouse_mode: MouseMode,
     /// The currently active input mode.
-    pub mode: Mode,
+    pub(crate) mode: Mode,
     /// Whether the clear-display action is currently enabled.
-    pub clear_enabled: bool,
+    pub(crate) clear_enabled: bool,
     /// Aggregate counts shown in the session header.
-    pub overview: OverviewCounts,
+    pub(crate) overview: OverviewCounts,
 }
 
 impl StatusBar {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             connected: false,
             mouse_mode: MouseMode::UiCapture,
@@ -111,7 +111,7 @@ impl StatusBar {
         chars.min(u16::MAX as usize) as u16
     }
 
-    pub fn action_at(&self, area: Rect, column: u16) -> Option<AppMsg> {
+    pub(crate) fn action_at(&self, area: Rect, column: u16) -> Option<AppMsg> {
         let actions = self.action_labels();
         let width = self.action_text_width();
         if width == 0 || area.width < width {
@@ -148,11 +148,11 @@ impl Component for StatusBar {
 
     fn update(&mut self, msg: StatusBarMsg) {
         match msg {
-            StatusBarMsg::SetConnected(c) => self.connected = c,
-            StatusBarMsg::SetMouseMode(mode) => self.mouse_mode = mode,
-            StatusBarMsg::SetMode(mode) => self.mode = mode,
-            StatusBarMsg::SetClearEnabled(enabled) => self.clear_enabled = enabled,
-            StatusBarMsg::SetOverview(overview) => self.overview = overview,
+            StatusBarMsg::Connected(c) => self.connected = c,
+            StatusBarMsg::MouseMode(mode) => self.mouse_mode = mode,
+            StatusBarMsg::Mode(mode) => self.mode = mode,
+            StatusBarMsg::ClearEnabled(enabled) => self.clear_enabled = enabled,
+            StatusBarMsg::Overview(overview) => self.overview = overview,
         }
     }
 

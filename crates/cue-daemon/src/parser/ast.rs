@@ -8,7 +8,7 @@ use super::token::{IdKind, Span, Value};
 
 /// Top-level parsed input.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Ast {
+pub(super) enum Ast {
     /// File-script body containing one or more top-level statements.
     Script {
         items: Vec<ScriptItemAst>,
@@ -26,26 +26,21 @@ pub enum Ast {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ScriptItemAst {
-    pub source: String,
-    pub statement: Box<Ast>,
-    pub span: Span,
+pub(super) struct ScriptItemAst {
+    pub(super) source: String,
+    pub(super) statement: Box<Ast>,
+    pub(super) span: Span,
 }
 
 /// Argument types — which variant is valid depends on the command.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Argument {
+pub(super) enum Argument {
     /// Chain expression (for `:run`, bare input in JOB/CRON mode).
     Chain(ChainNode),
     /// Entity ID reference (for `:kill`, `:out`, `:fg`, `:retry`).
     IdRef(IdKind, u32),
     /// Free-form text arguments for builtins like `:send`.
     Text(String),
-    /// Cron expression: schedule + body.
-    CronExpr {
-        schedule: CronScheduleAst,
-        body: ChainNode,
-    },
     /// Entity ID with optional byte count (for `:tail J3 1024`).
     TailRef(IdKind, u32, Option<usize>),
     /// No argument (`:jobs`, `:crons`, `:help`).
@@ -54,7 +49,7 @@ pub enum Argument {
 
 /// Chain AST — tree structure of job-level operations.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ChainNode {
+pub(super) enum ChainNode {
     Leaf(JobExpr),
     Serial {
         op: SerialOp,
@@ -71,7 +66,7 @@ pub enum ChainNode {
 /// Job-internal expression. This is one cue Job even when it contains
 /// shell-style logical operators.
 #[derive(Debug, Clone, PartialEq)]
-pub enum JobExpr {
+pub(super) enum JobExpr {
     Pipeline(Pipeline),
     And {
         left: Box<JobExpr>,
@@ -85,22 +80,22 @@ pub enum JobExpr {
 
 /// Pipeline = one Job's process chain.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Pipeline {
-    pub segments: Vec<PipeSegment>,
+pub(super) struct Pipeline {
+    pub(super) segments: Vec<PipeSegment>,
 }
 
 /// One process in a pipeline.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PipeSegment {
+pub(super) struct PipeSegment {
     /// Command words, e.g. `["cargo", "test", "--release"]`.
-    pub command: Vec<String>,
+    pub(super) command: Vec<String>,
     /// Pipe to next segment (None for last).
-    pub pipe_to_next: Option<PipeOp>,
+    pub(super) pipe_to_next: Option<PipeOp>,
 }
 
 /// Cron schedule AST (before resolution).
 #[derive(Debug, Clone, PartialEq)]
-pub enum CronScheduleAst {
+pub(super) enum CronScheduleAst {
     /// `every 5m`
     Every(Duration),
     /// `at 09:00 [on weekdays]` / `on weekdays at 09:00`
@@ -111,21 +106,4 @@ pub enum CronScheduleAst {
     Crontab(String),
     /// `daily`, `hourly`, etc.
     Preset(String),
-}
-
-impl Pipeline {
-    pub fn simple(command: Vec<String>) -> Self {
-        Self {
-            segments: vec![PipeSegment {
-                command,
-                pipe_to_next: None,
-            }],
-        }
-    }
-}
-
-impl JobExpr {
-    pub fn simple(command: Vec<String>) -> Self {
-        Self::Pipeline(Pipeline::simple(command))
-    }
 }

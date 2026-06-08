@@ -42,8 +42,8 @@ crates/
 ├── cue-core/   — Core types and logic: Job, Scope, Chain, Cron
 ├── cue-client/ — Client connection stack shared by frontends
 ├── cue-daemon/ — Background daemon implementation library used by the `cued` CLI
-├── cue-tui/    — Optional TUI extension mounted as the `cue tui` subcommand
-├── cue-cli/    — CLI entry crate; builds `cue` and `cued` via `extensions`/`tui`/`daemon`
+├── cue-tui/    — Optional TUI frontend library used by the `cue-tui` extension binary
+├── cue-cli/    — CLI entry crate; builds `cue`, `cued`, and the first-party `cue-tui` extension
 ```
 
 ## Installation
@@ -95,16 +95,12 @@ See [`docs/design/README.md`](docs/design/README.md) for the design index:
 - **commands-and-modes.md** — Command reference, mode system, `:cron` syntax
 - **cue-script.md** — `.cue` file script contract for `cue run <file.cue>`
 
-## Client + server config
+## Client + daemon config
 
-cue-shell now prefers a split config layout in the platform config dir:
+cue-shell uses split config files in the platform config dir:
 
 - `client.toml` — client-side transport/profile selection used by `cue`
-- `server.toml` — daemon-side runtime defaults used by `cued`
-
-During migration, cue-shell still falls back to the legacy combined
-`config.toml`. If you keep using that file for now, put client transport under
-`[transport]`.
+- `daemon.toml` — daemon-side runtime defaults used by `cued`
 
 ### `.cue` file script mode
 
@@ -147,6 +143,9 @@ gateway_command = "cued gateway --stdio"
 start_command = "cued start"
 ```
 
+The `local` profile name is reserved for Unix socket transport; use another
+profile name for SSH targets.
+
 Phase 1 uses the system OpenSSH client and runs the configured gateway command
 over SSH, so the client speaks the same IPC through `cued gateway --stdio`.
 Remote daemon startup still stays explicit: `cue` will **not** run
@@ -157,23 +156,53 @@ enabled by the default `cue-cli` `extensions` Cargo feature:
 
 ```toml
 [extensions.commands.foo]
-command = "cue-foo"
+program = "cue-foo"
 description = "Foo extension"
 ```
 
-`command` is the executable path/name; extension arguments come from the `cue foo ...`
+`program` is the executable path/name; extension arguments come from the `cue foo ...`
 invocation. Then `cue foo arg` runs `cue-foo arg`. Built-in subcommands such as
-`tui`, `help`, and `version` take precedence. Optional PATH lookup for unknown
-`cue-<name>` binaries can be enabled explicitly:
+`help`, `run`, and `version` take precedence, and extension names must be
+kebab-case without colliding with built-in or first-party subcommands such as
+`tui`.
+
+When `cue` is built without the `tui` feature but with `extensions`, `cue tui`
+dispatches to the first-party external `cue-tui` binary next to `cue`. Optional
+PATH lookup for other unknown `cue-<name>` binaries can be enabled explicitly:
 
 ```toml
 [extensions]
 path_lookup = true
 ```
 
-### Server runtime config
+### Daemon runtime config
 
-`server.toml` can cap persisted job/script history:
+`daemon.toml` can block unsafe commands or command arguments and attach remediation hints.
+Block rules run before advisory warnings, so a command can both warn generally
+and fail fast for specific arguments.
+
+```toml
+[block.commands]
+sh = "Avoid shell wrappers. Use cue-shell direct-exec, cwd=..., or cue operators."
+
+[block.commands.git]
+"--no-verify" = "Run the commit normally; if hooks fail, inspect and fix the hook/check."
+
+[block.commands.npm]
+"--force" = "Use the lockfile and normal install path."
+
+[warn.commands]
+cd = "Prefer cwd=... over cd in command strings."
+```
+
+Matching is literal, not glob or regex based:
+
+- `[block.commands] sh = "..."` blocks a command whose `argv[0]` basename is exactly `sh`. It matches `sh` and `/bin/sh`; it does not match `zsh`, `/bin/zsh`, or `shellcheck`.
+- Each `[block.commands.<name>]` entry maps one blocked argument pattern to its remediation hint. The command name is also matched by exact `argv[0]` basename.
+- Argument patterns are checked against each argv token independently, not against the joined command line. `"--no-verify"` matches an argument token `--no-verify`; it also matches `--no-verify=...` via the `--flag=value` convention.
+- `[warn.commands]` maps an exact command basename to an advisory hint.
+
+`daemon.toml` can cap persisted job/script history:
 
 ```toml
 [retention]
@@ -184,8 +213,6 @@ max_script_runs = 100
 It can also enable a runtime wrapper such as `rtk`. Wrapping is allowlist-only:
 commands not listed under `[wrapper.allowlist]` are never wrapped, and an empty
 allowlist wraps nothing.
-Legacy `[wrapper.denylist]` config is rejected with a migration error because
-the old "wrap everything except..." behavior cannot be safely converted.
 
 ```toml
 [wrapper]
@@ -211,8 +238,9 @@ ssh user@example.com "cued start"
 cue
 ```
 
-If the remote daemon is not running (or its socket is missing), `cue` fails
-with a message that includes the profile's explicit `start_command`.
+If the remote daemon is not running (or its socket is missing), `cue` starts the
+TUI offline and keeps retrying the configured gateway. `cue run <file>` still
+fails immediately because file-script execution needs a live daemon.
 
 ## Project Status
 

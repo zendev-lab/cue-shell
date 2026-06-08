@@ -1,7 +1,7 @@
 use ansi_to_tui::IntoText as _;
 use ratatui::text::Text;
 
-pub fn to_text(output: &str) -> Text<'static> {
+pub(crate) fn to_text(output: &str) -> Text<'static> {
     output
         .as_bytes()
         .into_text()

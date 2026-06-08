@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod job;
 pub mod mode;
 pub mod pipeline;
+pub mod process_status;
 pub mod scope;
 
 // Re-export commonly used types at crate root.

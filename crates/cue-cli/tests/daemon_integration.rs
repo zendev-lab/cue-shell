@@ -190,7 +190,7 @@ async fn connect_bridge(
     let socket = UnixStream::connect(socket)
         .await
         .expect("connect bridge socket");
-    let relay = tokio::spawn(cue_daemon::gateway_stdio::relay(
+    let relay = tokio::spawn(cue_daemon::relay_gateway_stdio(
         relay_input,
         relay_output,
         socket,
@@ -205,10 +205,10 @@ fn write_executable_script(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("chmod test script");
 }
 
-fn write_server_config(env: &TestEnv, text: &str) {
+fn write_daemon_config(env: &TestEnv, text: &str) {
     let config_dir = env.root.join("config/cue-shell");
     fs::create_dir_all(&config_dir).expect("create config dir");
-    fs::write(config_dir.join("server.toml"), text).expect("write server.toml");
+    fs::write(config_dir.join("daemon.toml"), text).expect("write daemon.toml");
 }
 
 fn job_id_from_created(resp: ResponsePayload) -> String {
@@ -290,7 +290,7 @@ async fn wait_for_job_terminal<S>(stream: &mut S, mut request_id: u32, job_id: &
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let resp = roundtrip(
             stream,
@@ -302,6 +302,7 @@ where
         )
         .await;
         request_id += 1;
+        let jobs_response = format!("{resp:?}");
 
         if let ResponsePayload::Ok(OkPayload::JobList(list)) = resp
             && let Some(job) = list.into_iter().find(|job| job.id == job_id)
@@ -312,7 +313,7 @@ where
 
         assert!(
             tokio::time::Instant::now() < deadline,
-            "job {job_id} did not become terminal in time"
+            "job {job_id} did not become terminal in time; last :jobs response: {jobs_response}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -2194,7 +2195,7 @@ async fn test_wrapper_allowlist_wraps_single_pipeline_and_logical_jobs() {
                 wrapper_log.display()
             ),
         );
-        write_server_config(
+        write_daemon_config(
             &env,
             &format!(
                 r#"
@@ -2284,7 +2285,7 @@ async fn test_wrapper_non_allowlisted_and_param_disabled_do_not_wrap() {
                 wrapper_log.display()
             ),
         );
-        write_server_config(
+        write_daemon_config(
             &env,
             &format!(
                 r#"

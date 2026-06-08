@@ -304,7 +304,7 @@ Shift+Tab 循环：Job → Cron → Job
 ### 参数分类
 
 ```rust
-/// 模式参数：影响执行行为，可在 server.toml 设默认值
+/// 模式参数：影响执行行为，可在 daemon.toml 设默认值
 /// 语法：:cmd(key=val, key=val) args
 pub struct ModeParams {
     pub params: BTreeMap<String, ParamValue>,

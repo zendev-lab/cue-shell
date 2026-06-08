@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 use cue_core::ipc::{EventPayload, Stream as OutputStream};
 use cue_core::job::{EXIT_CODE_UNAVAILABLE, JobStatus};
 use cue_core::pipeline::{JobPlan, command_prefers_foreground};
+use cue_core::process_status::exit_code_from_status;
 use cue_core::scope::EnvSnapshot;
 use cue_core::{EventChannel, JobId};
 
@@ -105,8 +106,74 @@ enum JobLocalBuiltin {
     EnvSet { assignments: Vec<String> },
 }
 
+#[derive(Clone)]
+struct ProcessTaskRuntime {
+    sys: ActorSystem,
+    fg_owner: Arc<Mutex<Option<u64>>>,
+    direct_output_client: Option<u64>,
+    cleanup_tx: mpsc::Sender<JobId>,
+}
+
+struct PtyReaderTask {
+    job_id: JobId,
+    child: tokio::process::Child,
+    reader: AsyncFd<std::fs::File>,
+    log_file: Option<std::fs::File>,
+    kill_rx: mpsc::Receiver<()>,
+    ring: Arc<Mutex<RingBuffer>>,
+    runtime: ProcessTaskRuntime,
+}
+
+struct PipelineReaderTask {
+    job_id: JobId,
+    children: Vec<tokio::process::Child>,
+    stdout_sources: Vec<tokio::process::ChildStdout>,
+    stderr_sources: Vec<tokio::process::ChildStderr>,
+    log_file: Option<std::fs::File>,
+    stderr_log: Option<std::fs::File>,
+    kill_rx: mpsc::Receiver<()>,
+    ring: Arc<Mutex<RingBuffer>>,
+    stderr_ring: Arc<Mutex<RingBuffer>>,
+    runtime: ProcessTaskRuntime,
+}
+
+struct LogicalJobTask {
+    job_id: JobId,
+    plan: JobPlan,
+    snapshot: EnvSnapshot,
+    cwd_override: Option<std::path::PathBuf>,
+    log_file: Option<std::fs::File>,
+    stderr_log: Option<std::fs::File>,
+    kill_rx: mpsc::Receiver<()>,
+    wrapper_enabled: bool,
+    capture_stdin: bool,
+    ring: Arc<Mutex<RingBuffer>>,
+    stderr_ring: Arc<Mutex<RingBuffer>>,
+    runtime: ProcessTaskRuntime,
+}
+
+#[derive(Clone, Copy)]
+struct StreamingOptions {
+    wrapper_enabled: bool,
+    capture_stdin: bool,
+}
+
+struct StreamingContext<'a> {
+    job_id: JobId,
+    snapshot: &'a mut EnvSnapshot,
+    kill_rx: &'a mut mpsc::Receiver<()>,
+    was_killed: &'a mut bool,
+    options: StreamingOptions,
+    sys: &'a ActorSystem,
+    ring: &'a Arc<Mutex<RingBuffer>>,
+    stderr_ring: &'a Arc<Mutex<RingBuffer>>,
+    log_file: &'a Arc<Mutex<Option<std::fs::File>>>,
+    stderr_log: &'a Arc<Mutex<Option<std::fs::File>>>,
+    direct_output_client: Option<u64>,
+}
+
 /// Spawn the ProcessManager actor task.
-pub fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
+pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
     tokio::spawn(async move {
         debug!("process_mgr: started");
 
@@ -589,7 +656,6 @@ fn detect_job_local_builtin(words: &[String]) -> Option<JobLocalBuiltin> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn spawn_job_plan(
     job_id: JobId,
     plan: &JobPlan,
@@ -757,7 +823,7 @@ async fn spawn_single_pipe_job(
         let (exit_code, was_killed) = tokio::select! {
             status = child.wait() => {
                 let code = match status {
-                    Ok(status) => exit_code_from_status(status),
+                    Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
                     Err(error) => {
                         error!(%job_id, err = %error, "process_mgr: pipe child wait failed");
                         EXIT_CODE_UNAVAILABLE
@@ -916,24 +982,22 @@ async fn spawn_single_pty_job(
 
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
-    let ring_clone = ring_buffer.clone();
     let fg_owner = Arc::new(Mutex::new(None));
-    let fg_owner_clone = fg_owner.clone();
-    let sys_clone = sys.clone();
-    let cleanup_tx_clone = cleanup_tx.clone();
     let direct_output_client = options.direct_output_client;
-    let reader_handle = tokio::spawn(reader_task(
+    let reader_handle = tokio::spawn(reader_task(PtyReaderTask {
         job_id,
         child,
         reader,
         log_file,
         kill_rx,
-        sys_clone,
-        ring_clone,
-        fg_owner_clone,
-        direct_output_client,
-        cleanup_tx_clone,
-    ));
+        ring: ring_buffer.clone(),
+        runtime: ProcessTaskRuntime {
+            sys: sys.clone(),
+            fg_owner: fg_owner.clone(),
+            direct_output_client,
+            cleanup_tx: cleanup_tx.clone(),
+        },
+    }));
 
     Ok(ProcessEntry {
         job_id,
@@ -961,7 +1025,7 @@ fn wrap_segment_if_enabled(
 
     let wrapper = &sys.config.wrapper;
     let is_foreground = command_prefers_foreground(&segment.command_line);
-    if wrapper.binary.is_empty() || !wrapper.should_wrap(&program, is_foreground, Some(true)) {
+    if !wrapper.should_wrap(&program, is_foreground, Some(true)) {
         return (program, args);
     }
 
@@ -1008,7 +1072,7 @@ async fn spawn_native_pipeline_job(
     let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
     let fg_owner = Arc::new(Mutex::new(None));
     let direct_output_client = options.direct_output_client;
-    let reader_handle = tokio::spawn(pipeline_reader_task(
+    let reader_handle = tokio::spawn(pipeline_reader_task(PipelineReaderTask {
         job_id,
         children,
         stdout_sources,
@@ -1016,13 +1080,15 @@ async fn spawn_native_pipeline_job(
         log_file,
         stderr_log,
         kill_rx,
-        sys.clone(),
-        ring_buffer.clone(),
-        stderr_ring.clone(),
-        fg_owner.clone(),
-        direct_output_client,
-        cleanup_tx.clone(),
-    ));
+        ring: ring_buffer.clone(),
+        stderr_ring: stderr_ring.clone(),
+        runtime: ProcessTaskRuntime {
+            sys: sys.clone(),
+            fg_owner: fg_owner.clone(),
+            direct_output_client,
+            cleanup_tx: cleanup_tx.clone(),
+        },
+    }));
 
     Ok(ProcessEntry {
         job_id,
@@ -1052,23 +1118,25 @@ async fn spawn_logical_job(
     let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
     let fg_owner = Arc::new(Mutex::new(None));
     let direct_output_client = options.direct_output_client;
-    let reader_handle = tokio::spawn(logical_job_task(
+    let reader_handle = tokio::spawn(logical_job_task(LogicalJobTask {
         job_id,
         plan,
         snapshot,
-        options.cwd_override.clone(),
+        cwd_override: options.cwd_override.clone(),
         log_file,
         stderr_log,
         kill_rx,
-        options.wrapper_enabled,
-        options.pty_enabled,
-        sys.clone(),
-        ring_buffer.clone(),
-        stderr_ring.clone(),
-        fg_owner.clone(),
-        direct_output_client,
-        cleanup_tx.clone(),
-    ));
+        wrapper_enabled: options.wrapper_enabled,
+        capture_stdin: options.pty_enabled,
+        ring: ring_buffer.clone(),
+        stderr_ring: stderr_ring.clone(),
+        runtime: ProcessTaskRuntime {
+            sys: sys.clone(),
+            fg_owner: fg_owner.clone(),
+            direct_output_client,
+            cleanup_tx: cleanup_tx.clone(),
+        },
+    }));
 
     Ok(ProcessEntry {
         job_id,
@@ -1201,7 +1269,13 @@ fn create_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
 /// Tokio runtime thread.
 async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
     match tokio::task::spawn_blocking(move || {
-        let dir = crate::dirs::output_dir();
+        let dir = match crate::dirs::output_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                error!(%job_id, err = %error, "process_mgr: cannot resolve output dir");
+                return None;
+            }
+        };
         if let Err(e) = std::fs::create_dir_all(&dir) {
             error!(%job_id, err = %e, "process_mgr: cannot create output dir");
             return None;
@@ -1231,7 +1305,13 @@ async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
 
 async fn open_stderr_log(job_id: JobId) -> Option<std::fs::File> {
     match tokio::task::spawn_blocking(move || {
-        let dir = crate::dirs::output_dir();
+        let dir = match crate::dirs::output_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                error!(%job_id, err = %error, "process_mgr: cannot resolve output dir");
+                return None;
+            }
+        };
         if let Err(e) = std::fs::create_dir_all(&dir) {
             error!(%job_id, err = %e, "process_mgr: cannot create output dir");
             return None;
@@ -1261,8 +1341,15 @@ async fn open_stderr_log(job_id: JobId) -> Option<std::fs::File> {
 
 async fn clear_job_logs(job_id: JobId) {
     if let Err(error) = tokio::task::spawn_blocking(move || {
+        let dir = match crate::dirs::output_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                warn!(%job_id, err = %error, "process_mgr: cannot resolve output dir for cleanup");
+                return;
+            }
+        };
         for suffix in [".log", ".stderr"] {
-            let path = crate::dirs::output_dir().join(format!("{job_id}{suffix}"));
+            let path = dir.join(format!("{job_id}{suffix}"));
             if let Err(error) = std::fs::remove_file(&path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -1283,19 +1370,17 @@ async fn clear_job_logs(job_id: JobId) {
 
 /// Background task that reads PTY output, populates the ring buffer,
 /// writes to the log file, emits events, and waits for the child to exit.
-#[allow(clippy::too_many_arguments)]
-async fn reader_task(
-    job_id: JobId,
-    mut child: tokio::process::Child,
-    reader: AsyncFd<std::fs::File>,
-    log_file: Option<std::fs::File>,
-    mut kill_rx: mpsc::Receiver<()>,
-    sys: ActorSystem,
-    ring: Arc<Mutex<RingBuffer>>,
-    fg_owner: Arc<Mutex<Option<u64>>>,
-    direct_output_client: Option<u64>,
-    cleanup_tx: mpsc::Sender<JobId>,
-) {
+async fn reader_task(task: PtyReaderTask) {
+    let PtyReaderTask {
+        job_id,
+        mut child,
+        reader,
+        log_file,
+        mut kill_rx,
+        ring,
+        runtime,
+    } = task;
+
     // Wrap the log file so it can be shared with `spawn_blocking`.
     let log_file = Arc::new(Mutex::new(log_file));
     let mut pty_buf = vec![0u8; 8192];
@@ -1313,7 +1398,7 @@ async fn reader_task(
                 tokio::select! {
                     status = child.wait() => {
                         let code = match status {
-                            Ok(status) => exit_code_from_status(status),
+                            Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
                             Err(error) => {
                                 error!(%job_id, err = %error, "process_mgr: wait after kill failed");
                                 EXIT_CODE_UNAVAILABLE
@@ -1328,11 +1413,11 @@ async fn reader_task(
                     }
                 }
 
-                emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-                emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
-                emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+                emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+                emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+                emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
                 // Tell the main loop to remove our entry.
-                notify_cleanup(&cleanup_tx, job_id).await;
+                notify_cleanup(&runtime.cleanup_tx, job_id).await;
                 return;
             }
 
@@ -1343,8 +1428,8 @@ async fn reader_task(
                         let chunk = &pty_buf[..n];
                         ring.lock().unwrap().push(chunk);
                         write_log(job_id, LogStream::Stdout, &log_file, chunk).await;
-                        emit_output(&sys, job_id, OutputStream::Stdout, chunk, direct_output_client).await;
-                        emit_fg_output(&sys, &fg_owner, chunk).await;
+                        emit_output(&runtime.sys, job_id, OutputStream::Stdout, chunk, runtime.direct_output_client).await;
+                        emit_fg_output(&runtime.sys, &runtime.fg_owner, chunk).await;
                     }
                     Err(e) => {
                         if e.raw_os_error() == Some(libc::EIO) {
@@ -1367,7 +1452,7 @@ async fn reader_task(
     let (exit_code, was_killed) = tokio::select! {
         status = child.wait() => {
             let code = match status {
-                Ok(status) => exit_code_from_status(status),
+                Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
                 Err(e) => {
                     error!(%job_id, err = %e, "process_mgr: wait failed");
                     EXIT_CODE_UNAVAILABLE
@@ -1385,12 +1470,12 @@ async fn reader_task(
     let ring_len = ring.lock().unwrap().len();
     info!(%job_id, exit_code, bytes = ring_len, "process_mgr: child exited");
 
-    emit_output_eof(&sys, job_id, direct_output_client).await;
+    emit_output_eof(&runtime.sys, job_id, runtime.direct_output_client).await;
 
     if was_killed {
-        emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-        emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
-        emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+        emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+        emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
     } else {
         // Determine final state.
         let new_state = if exit_code == 0 {
@@ -1399,37 +1484,35 @@ async fn reader_task(
             JobStatus::Failed
         };
 
-        emit_state_change(&sys, job_id, JobStatus::Running, new_state).await;
+        emit_state_change(&runtime.sys, job_id, JobStatus::Running, new_state).await;
         let reason = if exit_code == 0 {
             "done".to_string()
         } else {
             format!("exit {exit_code}")
         };
-        emit_fg_exit(&sys, &fg_owner, job_id, &reason).await;
+        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, &reason).await;
 
-        emit_job_finished(&sys, job_id, exit_code).await;
+        emit_job_finished(&runtime.sys, job_id, exit_code).await;
     }
 
     // Tell the main loop to remove our entry.
-    notify_cleanup(&cleanup_tx, job_id).await;
+    notify_cleanup(&runtime.cleanup_tx, job_id).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn pipeline_reader_task(
-    job_id: JobId,
-    mut children: Vec<tokio::process::Child>,
-    stdout_sources: Vec<tokio::process::ChildStdout>,
-    stderr_sources: Vec<tokio::process::ChildStderr>,
-    log_file: Option<std::fs::File>,
-    stderr_log: Option<std::fs::File>,
-    mut kill_rx: mpsc::Receiver<()>,
-    sys: ActorSystem,
-    ring: Arc<Mutex<RingBuffer>>,
-    stderr_ring: Arc<Mutex<RingBuffer>>,
-    fg_owner: Arc<Mutex<Option<u64>>>,
-    direct_output_client: Option<u64>,
-    cleanup_tx: mpsc::Sender<JobId>,
-) {
+async fn pipeline_reader_task(task: PipelineReaderTask) {
+    let PipelineReaderTask {
+        job_id,
+        mut children,
+        stdout_sources,
+        stderr_sources,
+        log_file,
+        stderr_log,
+        mut kill_rx,
+        ring,
+        stderr_ring,
+        runtime,
+    } = task;
+
     let log_file = Arc::new(Mutex::new(log_file));
     let stderr_log = Arc::new(Mutex::new(stderr_log));
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
@@ -1459,11 +1542,11 @@ async fn pipeline_reader_task(
                         ring.lock().unwrap().push(&data);
                         write_log(job_id, LogStream::Stdout, &log_file, &data).await;
                         emit_output(
-                            &sys,
+                            &runtime.sys,
                             job_id,
                             OutputStream::Stdout,
                             &data,
-                            direct_output_client,
+                            runtime.direct_output_client,
                         )
                         .await;
                     }
@@ -1471,11 +1554,11 @@ async fn pipeline_reader_task(
                         stderr_ring.lock().unwrap().push(&data);
                         write_log(job_id, LogStream::Stderr, &stderr_log, &data).await;
                         emit_output(
-                            &sys,
+                            &runtime.sys,
                             job_id,
                             OutputStream::Stderr,
                             &data,
-                            direct_output_client,
+                            runtime.direct_output_client,
                         )
                         .await;
                     }
@@ -1505,49 +1588,47 @@ async fn pipeline_reader_task(
     let stderr_len = stderr_ring.lock().unwrap().len();
     info!(%job_id, exit_code, stdout_bytes = stdout_len, stderr_bytes = stderr_len, "process_mgr: native pipeline exited");
 
-    emit_output_eof(&sys, job_id, direct_output_client).await;
+    emit_output_eof(&runtime.sys, job_id, runtime.direct_output_client).await;
 
     if was_killed {
-        emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-        emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
-        emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+        emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+        emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
     } else {
         let new_state = if exit_code == 0 {
             JobStatus::Done
         } else {
             JobStatus::Failed
         };
-        emit_state_change(&sys, job_id, JobStatus::Running, new_state).await;
+        emit_state_change(&runtime.sys, job_id, JobStatus::Running, new_state).await;
         let reason = if exit_code == 0 {
             "done".to_string()
         } else {
             format!("exit {exit_code}")
         };
-        emit_fg_exit(&sys, &fg_owner, job_id, &reason).await;
-        emit_job_finished(&sys, job_id, exit_code).await;
+        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, &reason).await;
+        emit_job_finished(&runtime.sys, job_id, exit_code).await;
     }
 
-    notify_cleanup(&cleanup_tx, job_id).await;
+    notify_cleanup(&runtime.cleanup_tx, job_id).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn logical_job_task(
-    job_id: JobId,
-    plan: JobPlan,
-    snapshot: EnvSnapshot,
-    cwd_override: Option<std::path::PathBuf>,
-    log_file: Option<std::fs::File>,
-    stderr_log: Option<std::fs::File>,
-    mut kill_rx: mpsc::Receiver<()>,
-    wrapper_enabled: bool,
-    capture_stdin: bool,
-    sys: ActorSystem,
-    ring: Arc<Mutex<RingBuffer>>,
-    stderr_ring: Arc<Mutex<RingBuffer>>,
-    fg_owner: Arc<Mutex<Option<u64>>>,
-    direct_output_client: Option<u64>,
-    cleanup_tx: mpsc::Sender<JobId>,
-) {
+async fn logical_job_task(task: LogicalJobTask) {
+    let LogicalJobTask {
+        job_id,
+        plan,
+        snapshot,
+        cwd_override,
+        log_file,
+        stderr_log,
+        mut kill_rx,
+        wrapper_enabled,
+        capture_stdin,
+        ring,
+        stderr_ring,
+        runtime,
+    } = task;
+
     let log_file = Arc::new(Mutex::new(log_file));
     let stderr_log = Arc::new(Mutex::new(stderr_log));
     let mut was_killed = false;
@@ -1555,158 +1636,67 @@ async fn logical_job_task(
     if let Some(cwd) = cwd_override.as_ref() {
         local_snapshot.cwd = cwd.clone();
     }
-    let exit_code = run_job_plan_streaming(
+    let mut streaming = StreamingContext {
         job_id,
-        &plan,
-        &mut local_snapshot,
-        &mut kill_rx,
-        &mut was_killed,
-        wrapper_enabled,
-        capture_stdin,
-        &sys,
-        &ring,
-        &stderr_ring,
-        &log_file,
-        &stderr_log,
-        direct_output_client,
-    )
-    .await;
+        snapshot: &mut local_snapshot,
+        kill_rx: &mut kill_rx,
+        was_killed: &mut was_killed,
+        options: StreamingOptions {
+            wrapper_enabled,
+            capture_stdin,
+        },
+        sys: &runtime.sys,
+        ring: &ring,
+        stderr_ring: &stderr_ring,
+        log_file: &log_file,
+        stderr_log: &stderr_log,
+        direct_output_client: runtime.direct_output_client,
+    };
+    let exit_code = run_job_plan_streaming(&plan, &mut streaming).await;
 
-    emit_output_eof(&sys, job_id, direct_output_client).await;
+    emit_output_eof(&runtime.sys, job_id, runtime.direct_output_client).await;
 
     if was_killed {
-        emit_state_change(&sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-        emit_fg_exit(&sys, &fg_owner, job_id, "killed").await;
-        emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
+        emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
+        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+        emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
     } else {
         let new_state = if exit_code == 0 {
             JobStatus::Done
         } else {
             JobStatus::Failed
         };
-        emit_state_change(&sys, job_id, JobStatus::Running, new_state).await;
+        emit_state_change(&runtime.sys, job_id, JobStatus::Running, new_state).await;
         let reason = if exit_code == 0 {
             "done".to_string()
         } else {
             format!("exit {exit_code}")
         };
-        emit_fg_exit(&sys, &fg_owner, job_id, &reason).await;
-        emit_job_finished(&sys, job_id, exit_code).await;
+        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, &reason).await;
+        emit_job_finished(&runtime.sys, job_id, exit_code).await;
     }
 
-    notify_cleanup(&cleanup_tx, job_id).await;
+    notify_cleanup(&runtime.cleanup_tx, job_id).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_job_plan_streaming(
-    job_id: JobId,
-    plan: &JobPlan,
-    snapshot: &mut EnvSnapshot,
-    kill_rx: &mut mpsc::Receiver<()>,
-    was_killed: &mut bool,
-    wrapper_enabled: bool,
-    capture_stdin: bool,
-    sys: &ActorSystem,
-    ring: &Arc<Mutex<RingBuffer>>,
-    stderr_ring: &Arc<Mutex<RingBuffer>>,
-    log_file: &Arc<Mutex<Option<std::fs::File>>>,
-    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
-    direct_output_client: Option<u64>,
-) -> i32 {
-    if *was_killed {
+async fn run_job_plan_streaming(plan: &JobPlan, context: &mut StreamingContext<'_>) -> i32 {
+    if *context.was_killed {
         return EXIT_CODE_UNAVAILABLE;
     }
     match plan {
-        JobPlan::Pipeline(pipeline) => {
-            run_pipeline_streaming(
-                job_id,
-                pipeline,
-                snapshot,
-                kill_rx,
-                was_killed,
-                wrapper_enabled,
-                capture_stdin,
-                sys,
-                ring,
-                stderr_ring,
-                log_file,
-                stderr_log,
-                direct_output_client,
-            )
-            .await
-        }
+        JobPlan::Pipeline(pipeline) => run_pipeline_streaming(pipeline, context).await,
         JobPlan::And { left, right } => {
-            let code = Box::pin(run_job_plan_streaming(
-                job_id,
-                left,
-                snapshot,
-                kill_rx,
-                was_killed,
-                wrapper_enabled,
-                capture_stdin,
-                sys,
-                ring,
-                stderr_ring,
-                log_file,
-                stderr_log,
-                direct_output_client,
-            ))
-            .await;
-            if code == 0 && !*was_killed {
-                Box::pin(run_job_plan_streaming(
-                    job_id,
-                    right,
-                    snapshot,
-                    kill_rx,
-                    was_killed,
-                    wrapper_enabled,
-                    capture_stdin,
-                    sys,
-                    ring,
-                    stderr_ring,
-                    log_file,
-                    stderr_log,
-                    direct_output_client,
-                ))
-                .await
+            let code = Box::pin(run_job_plan_streaming(left, context)).await;
+            if code == 0 && !*context.was_killed {
+                Box::pin(run_job_plan_streaming(right, context)).await
             } else {
                 code
             }
         }
         JobPlan::Or { left, right } => {
-            let code = Box::pin(run_job_plan_streaming(
-                job_id,
-                left,
-                snapshot,
-                kill_rx,
-                was_killed,
-                wrapper_enabled,
-                capture_stdin,
-                sys,
-                ring,
-                stderr_ring,
-                log_file,
-                stderr_log,
-                direct_output_client,
-            ))
-            .await;
-            if code != 0 && !*was_killed {
-                Box::pin(run_job_plan_streaming(
-                    job_id,
-                    right,
-                    snapshot,
-                    kill_rx,
-                    was_killed,
-                    wrapper_enabled,
-                    capture_stdin,
-                    sys,
-                    ring,
-                    stderr_ring,
-                    log_file,
-                    stderr_log,
-                    direct_output_client,
-                ))
-                .await
+            let code = Box::pin(run_job_plan_streaming(left, context)).await;
+            if code != 0 && !*context.was_killed {
+                Box::pin(run_job_plan_streaming(right, context)).await
             } else {
                 code
             }
@@ -1714,40 +1704,34 @@ async fn run_job_plan_streaming(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_pipeline_streaming(
-    job_id: JobId,
     pipeline: &cue_core::pipeline::Pipeline,
-    snapshot: &mut EnvSnapshot,
-    kill_rx: &mut mpsc::Receiver<()>,
-    was_killed: &mut bool,
-    wrapper_enabled: bool,
-    capture_stdin: bool,
-    sys: &ActorSystem,
-    ring: &Arc<Mutex<RingBuffer>>,
-    stderr_ring: &Arc<Mutex<RingBuffer>>,
-    log_file: &Arc<Mutex<Option<std::fs::File>>>,
-    stderr_log: &Arc<Mutex<Option<std::fs::File>>>,
-    direct_output_client: Option<u64>,
+    context: &mut StreamingContext<'_>,
 ) -> i32 {
-    if let Some(code) =
-        run_job_local_builtin(job_id, pipeline, snapshot, stderr_ring, stderr_log).await
+    if let Some(code) = run_job_local_builtin(
+        context.job_id,
+        pipeline,
+        context.snapshot,
+        context.stderr_ring,
+        context.stderr_log,
+    )
+    .await
     {
         return code;
     }
 
-    let segments = match expand_pipeline_segments(job_id, pipeline, snapshot) {
+    let segments = match expand_pipeline_segments(context.job_id, pipeline, context.snapshot) {
         Ok(segments) => segments,
         Err(()) => return EXIT_CODE_UNAVAILABLE,
     };
     let mut spawn = match spawn_native_pipeline(
-        job_id,
+        context.job_id,
         &segments,
-        snapshot,
+        context.snapshot,
         None,
-        wrapper_enabled,
-        capture_stdin,
-        sys,
+        context.options.wrapper_enabled,
+        context.options.capture_stdin,
+        context.sys,
     ) {
         Ok(spawn) => spawn,
         Err(()) => return EXIT_CODE_UNAVAILABLE,
@@ -1758,43 +1742,53 @@ async fn run_pipeline_streaming(
 
     for stdout in spawn.stdout_sources.drain(..) {
         active_readers += 1;
-        spawn_pipeline_stream_reader(job_id, stdout, PipelineStreamKind::Stdout, chunk_tx.clone());
+        spawn_pipeline_stream_reader(
+            context.job_id,
+            stdout,
+            PipelineStreamKind::Stdout,
+            chunk_tx.clone(),
+        );
     }
     for stderr in spawn.stderr_sources.drain(..) {
         active_readers += 1;
-        spawn_pipeline_stream_reader(job_id, stderr, PipelineStreamKind::Stderr, chunk_tx.clone());
+        spawn_pipeline_stream_reader(
+            context.job_id,
+            stderr,
+            PipelineStreamKind::Stderr,
+            chunk_tx.clone(),
+        );
     }
     drop(chunk_tx);
 
     while active_readers > 0 {
         tokio::select! {
-            _ = kill_rx.recv(), if !*was_killed => {
-                *was_killed = true;
-                terminate_children(job_id, &mut spawn.children).await;
+            _ = context.kill_rx.recv(), if !*context.was_killed => {
+                *context.was_killed = true;
+                terminate_children(context.job_id, &mut spawn.children).await;
             }
             Some(msg) = chunk_rx.recv() => {
                 match msg {
                     PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stdout, data } => {
-                        ring.lock().unwrap().push(&data);
-                        write_log(job_id, LogStream::Stdout, log_file, &data).await;
+                        context.ring.lock().unwrap().push(&data);
+                        write_log(context.job_id, LogStream::Stdout, context.log_file, &data).await;
                         emit_output(
-                            sys,
-                            job_id,
+                            context.sys,
+                            context.job_id,
                             OutputStream::Stdout,
                             &data,
-                            direct_output_client,
+                            context.direct_output_client,
                         )
                         .await;
                     }
                     PipelineReaderMsg::Chunk { kind: PipelineStreamKind::Stderr, data } => {
-                        stderr_ring.lock().unwrap().push(&data);
-                        write_log(job_id, LogStream::Stderr, stderr_log, &data).await;
+                        context.stderr_ring.lock().unwrap().push(&data);
+                        write_log(context.job_id, LogStream::Stderr, context.stderr_log, &data).await;
                         emit_output(
-                            sys,
-                            job_id,
+                            context.sys,
+                            context.job_id,
                             OutputStream::Stderr,
                             &data,
-                            direct_output_client,
+                            context.direct_output_client,
                         )
                         .await;
                     }
@@ -1807,14 +1801,14 @@ async fn run_pipeline_streaming(
         }
     }
 
-    if *was_killed {
+    if *context.was_killed {
         wait_for_children(&mut spawn.children).await;
         EXIT_CODE_UNAVAILABLE
     } else {
         tokio::select! {
-            _ = kill_rx.recv() => {
-                *was_killed = true;
-                terminate_children(job_id, &mut spawn.children).await;
+            _ = context.kill_rx.recv() => {
+                *context.was_killed = true;
+                terminate_children(context.job_id, &mut spawn.children).await;
                 wait_for_children(&mut spawn.children).await;
                 EXIT_CODE_UNAVAILABLE
             }
@@ -1991,7 +1985,7 @@ fn request_child_kill(job_id: JobId, child: &mut tokio::process::Child, reason: 
 
 async fn wait_for_child(job_id: JobId, child: &mut tokio::process::Child, reason: &str) -> i32 {
     match child.wait().await {
-        Ok(status) => exit_code_from_status(status),
+        Ok(status) => exit_code_from_status(status, EXIT_CODE_UNAVAILABLE),
         Err(error) => {
             error!(
                 %job_id,
@@ -2017,7 +2011,7 @@ async fn wait_for_children(children: &mut [tokio::process::Child]) -> i32 {
         match child.wait().await {
             Ok(status) => {
                 if idx == last_idx {
-                    exit_code = exit_code_from_status(status);
+                    exit_code = exit_code_from_status(status, EXIT_CODE_UNAVAILABLE);
                 }
             }
             Err(error) => {
@@ -2029,23 +2023,6 @@ async fn wait_for_children(children: &mut [tokio::process::Child]) -> i32 {
         }
     }
     exit_code
-}
-
-fn exit_code_from_status(status: std::process::ExitStatus) -> i32 {
-    if let Some(code) = status.code() {
-        return code;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-
-        if let Some(signal) = status.signal() {
-            return 128 + signal;
-        }
-    }
-
-    EXIT_CODE_UNAVAILABLE
 }
 
 async fn fail_pending_spawn(sys: &ActorSystem, job_id: JobId) {
@@ -2262,24 +2239,6 @@ mod tests {
             ]),
             cwd: PathBuf::from("/tmp/work"),
         }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exit_code_from_status_preserves_normal_exit_code() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let status = std::process::ExitStatus::from_raw(7 << 8);
-        assert_eq!(exit_code_from_status(status), 7);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exit_code_from_status_maps_signal_to_shell_exit_code() {
-        use std::os::unix::process::ExitStatusExt;
-
-        let status = std::process::ExitStatus::from_raw(libc::SIGTERM);
-        assert_eq!(exit_code_from_status(status), 128 + libc::SIGTERM);
     }
 
     #[tokio::test]

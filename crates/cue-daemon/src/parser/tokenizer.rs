@@ -273,11 +273,10 @@ impl<'a> Tokenizer<'a> {
                 self.last_significant = Some(TokenClass::Other);
                 Ok(Token::JobOr)
             }
-            _ => {
-                // Bare `|` — treat as word for now (could be error)
-                self.last_significant = Some(TokenClass::Other);
-                Ok(Token::Word("|".into()))
-            }
+            _ => Err(TokenizeError {
+                pos: start,
+                message: "bare `|` is not a cue-shell pipe operator; use `|>` for stdout pipes, `|&>` for stdout+stderr, or quote `|` to pass it as an argument".into(),
+            }),
         }
     }
 
@@ -672,6 +671,23 @@ mod tests {
                 Token::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn bare_pipe_is_rejected_instead_of_becoming_a_word() {
+        for input in ["a | b", "a|b"] {
+            let err = Tokenizer::tokenize(input).unwrap_err();
+            assert_eq!(err.pos, input.find('|').expect("test input has pipe"));
+            assert!(
+                err.message
+                    .contains("bare `|` is not a cue-shell pipe operator"),
+                "unexpected error for {input}: {err}"
+            );
+            assert!(
+                err.message.contains("use `|>`"),
+                "error should point to cue-shell pipe syntax for {input}: {err}"
+            );
+        }
     }
 
     #[test]

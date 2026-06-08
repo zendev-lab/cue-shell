@@ -188,7 +188,7 @@ v1 explicitly does not include:
 - shebang execution
 - `cue ./foo.cue` path-form dispatch
 - replacing or narrowing extension dispatch (`cue foo` stays extension-first)
-- compatibility shims that keep inline multiline batch as script mode
+- inline multiline batch handling outside explicit script execution
 
 ## Implementation checklist
 

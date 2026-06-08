@@ -336,9 +336,8 @@ fn parse_schedule_duration(text: &str) -> Option<std::time::Duration> {
     (!duration.is_zero()).then_some(duration)
 }
 
-/// Parsed five-field crontab expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CrontabExpr {
+struct CrontabExpr {
     minute: Vec<u32>,
     hour: Vec<u32>,
     day_of_month: Vec<u32>,
@@ -366,8 +365,20 @@ impl CrontabSchedule {
         &self.expr
     }
 
-    pub fn matcher(&self) -> &CrontabExpr {
-        &self.matcher
+    /// Match against minute, hour, day-of-month, month, and day-of-week.
+    ///
+    /// `day_of_week` uses cron numbering: Sunday is `0`.
+    /// When both day fields are restricted, standard cron treats them as OR.
+    pub fn matches(
+        &self,
+        minute: u32,
+        hour: u32,
+        day_of_month: u32,
+        month: u32,
+        day_of_week: u32,
+    ) -> bool {
+        self.matcher
+            .matches(minute, hour, day_of_month, month, day_of_week)
     }
 }
 
@@ -423,8 +434,7 @@ impl CrontabExpr {
     }
 }
 
-/// Parse and validate a five-field crontab expression.
-pub fn parse_crontab_expr(expr: &str) -> Option<CrontabExpr> {
+fn parse_crontab_expr(expr: &str) -> Option<CrontabExpr> {
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != 5 {
         return None;
@@ -686,7 +696,7 @@ mod tests {
         let schedule = CrontabSchedule::parse(" */5   * * *  mon-fri ").unwrap();
 
         assert_eq!(schedule.as_str(), "*/5 * * * mon-fri");
-        assert!(schedule.matcher().matches(10, 0, 1, 1, 1));
+        assert!(schedule.matches(10, 0, 1, 1, 1));
         assert!(CrontabSchedule::parse("cron */5 * * * *").is_none());
         assert!(CrontabSchedule::parse("60 * * * *").is_none());
     }
@@ -711,24 +721,24 @@ mod tests {
     }
 
     #[test]
-    fn crontab_expr_matches_supported_steps_names_and_sunday_alias() {
-        let weekday_workday = parse_crontab_expr("*/15 9-17 * jan mon-fri").unwrap();
+    fn crontab_schedule_matches_supported_steps_names_and_sunday_alias() {
+        let weekday_workday = CrontabSchedule::parse("*/15 9-17 * jan mon-fri").unwrap();
         assert!(weekday_workday.matches(30, 10, 12, 1, 1));
         assert!(!weekday_workday.matches(31, 10, 12, 1, 1));
         assert!(!weekday_workday.matches(30, 10, 12, 1, 0));
 
-        let sunday_alias = parse_crontab_expr("0 0 * * 7").unwrap();
+        let sunday_alias = CrontabSchedule::parse("0 0 * * 7").unwrap();
         assert!(sunday_alias.matches(0, 0, 1, 1, 0));
     }
 
     #[test]
-    fn crontab_expr_uses_standard_day_of_month_or_day_of_week_semantics() {
-        let first_of_month_or_monday = parse_crontab_expr("0 0 1 * mon").unwrap();
+    fn crontab_schedule_uses_standard_day_of_month_or_day_of_week_semantics() {
+        let first_of_month_or_monday = CrontabSchedule::parse("0 0 1 * mon").unwrap();
         assert!(first_of_month_or_monday.matches(0, 0, 1, 1, 2));
         assert!(first_of_month_or_monday.matches(0, 0, 2, 1, 1));
         assert!(!first_of_month_or_monday.matches(0, 0, 2, 1, 2));
 
-        let monday_only = parse_crontab_expr("0 0 * * mon").unwrap();
+        let monday_only = CrontabSchedule::parse("0 0 * * mon").unwrap();
         assert!(monday_only.matches(0, 0, 1, 1, 1));
         assert!(!monday_only.matches(0, 0, 1, 1, 2));
     }

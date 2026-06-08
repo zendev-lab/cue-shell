@@ -3,12 +3,11 @@
 //! `cue` and `cued` are versioned together as a single workspace. When the
 //! daemon binary on a host falls behind — for example when a developer
 //! upgrades their `cue` binary but leaves an older `cued` running under
-//! launchd/systemd — IPC stays mostly compatible but new features can quietly
-//! degrade. This module centralises the detection logic so the TUI entry can:
+//! launchd/systemd — the version check detects the mismatch before startup
+//! proceeds silently. This module centralises the detection logic so the TUI entry can:
 //!
-//! 1. Ask the running `cued` for its version via `Ping`/`Pong` (the `Pong`
-//!    payload now carries a `version` field; older daemons send `None`, which
-//!    we treat as "outdated, version unknown").
+//! 1. Ask the running `cued` for its version via `Ping`/`Pong`; the `Pong`
+//!    payload carries a required `version` field.
 //! 2. Compare against the `cue` build's `CARGO_PKG_VERSION` and emit a
 //!    one-shot stderr warning when they disagree.
 //! 3. Optionally let the TUI startup layer auto-restart the local `cued` when
@@ -30,12 +29,7 @@ pub fn local_version() -> &'static str {
 
 /// Outcome of querying the running daemon's version.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DaemonVersion {
-    /// Daemon reported a concrete version string.
-    Reported(String),
-    /// Daemon predates Pong-version reporting (`Pong {}` with no `version`).
-    Unknown,
-}
+pub struct DaemonVersion(pub String);
 
 /// Compare a daemon version against the local `cue` version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,21 +38,17 @@ pub enum VersionMatch {
     Match,
     /// Daemon is on a different reported version.
     Mismatch { daemon: String, local: String },
-    /// Daemon predates version reporting; cannot prove a match.
-    DaemonUnknown { local: String },
 }
 
 impl VersionMatch {
     pub fn classify(daemon: &DaemonVersion, local: &str) -> Self {
-        match daemon {
-            DaemonVersion::Reported(v) if v == local => Self::Match,
-            DaemonVersion::Reported(v) => Self::Mismatch {
-                daemon: v.clone(),
+        if daemon.0 == local {
+            Self::Match
+        } else {
+            Self::Mismatch {
+                daemon: daemon.0.clone(),
                 local: local.to_string(),
-            },
-            DaemonVersion::Unknown => Self::DaemonUnknown {
-                local: local.to_string(),
-            },
+            }
         }
     }
 
@@ -71,11 +61,8 @@ impl VersionMatch {
 pub fn render_warning(verdict: &VersionMatch, suggest_auto_update: bool) -> Option<String> {
     let body = match verdict {
         VersionMatch::Match => return None,
-        VersionMatch::Mismatch { daemon, local } => format!(
-            "warning: cued is running an older/different version (cued={daemon}, cue={local}).",
-        ),
-        VersionMatch::DaemonUnknown { local } => {
-            format!("warning: cued does not report its version (likely older than cue={local}).",)
+        VersionMatch::Mismatch { daemon, local } => {
+            format!("warning: cued is running a different version (cued={daemon}, cue={local}).",)
         }
     };
     let mut lines = vec![body];
@@ -112,11 +99,7 @@ pub fn auto_update_enabled() -> bool {
 ///
 /// Returns `Err` only when the IPC roundtrip itself failed.
 pub async fn query_daemon_version(client: &mut CuedClient) -> anyhow::Result<DaemonVersion> {
-    let version = client.ping_for_version().await?;
-    Ok(match version {
-        Some(v) => DaemonVersion::Reported(v),
-        None => DaemonVersion::Unknown,
-    })
+    Ok(DaemonVersion(client.ping_for_version().await?))
 }
 
 /// Print the warning to stderr if the daemon is not on the local version.
@@ -133,7 +116,7 @@ mod tests {
     #[test]
     fn classify_match_when_versions_equal() {
         assert_eq!(
-            VersionMatch::classify(&DaemonVersion::Reported("0.1.0".into()), "0.1.0"),
+            VersionMatch::classify(&DaemonVersion("0.1.0".into()), "0.1.0"),
             VersionMatch::Match
         );
     }
@@ -141,20 +124,10 @@ mod tests {
     #[test]
     fn classify_mismatch_when_versions_differ() {
         assert_eq!(
-            VersionMatch::classify(&DaemonVersion::Reported("0.0.9".into()), "0.1.0"),
+            VersionMatch::classify(&DaemonVersion("0.0.9".into()), "0.1.0"),
             VersionMatch::Mismatch {
                 daemon: "0.0.9".into(),
                 local: "0.1.0".into(),
-            }
-        );
-    }
-
-    #[test]
-    fn classify_unknown_when_daemon_predates_reporting() {
-        assert_eq!(
-            VersionMatch::classify(&DaemonVersion::Unknown, "0.1.0"),
-            VersionMatch::DaemonUnknown {
-                local: "0.1.0".into()
             }
         );
     }
@@ -181,20 +154,6 @@ mod tests {
     }
 
     #[test]
-    fn render_warning_for_unknown_omits_daemon_version() {
-        let msg = render_warning(
-            &VersionMatch::DaemonUnknown {
-                local: "0.1.0".into(),
-            },
-            true,
-        )
-        .unwrap();
-        assert!(msg.contains("does not report its version"), "{msg}");
-        assert!(msg.contains("CUE_AUTO_UPDATE_CUED=1"), "{msg}");
-        assert!(msg.contains("CUE_NO_VERSION_CHECK=1"), "{msg}");
-    }
-
-    #[test]
     fn is_actionable_only_for_non_match() {
         assert!(!VersionMatch::Match.is_actionable());
         assert!(
@@ -204,6 +163,5 @@ mod tests {
             }
             .is_actionable()
         );
-        assert!(VersionMatch::DaemonUnknown { local: "b".into() }.is_actionable());
     }
 }

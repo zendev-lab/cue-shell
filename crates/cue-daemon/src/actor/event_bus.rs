@@ -100,7 +100,7 @@ impl EventSubscriptions {
 }
 
 /// Spawn the EventBus actor task.
-pub fn spawn(mut rx: mpsc::Receiver<EventBusMsg>) {
+pub(super) fn spawn(mut rx: mpsc::Receiver<EventBusMsg>) {
     tokio::spawn(async move {
         let mut subs = EventSubscriptions::default();
 

@@ -15,8 +15,11 @@ use crate::mode::Mode;
 // ── Message Envelope ──
 
 /// Top-level message, length-prefixed JSON over Unix socket.
+///
+/// The envelope schema is fixed. Unknown envelope fields are rejected instead
+/// of being silently ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
     Request { id: u32, payload: RequestPayload },
     Response { id: u32, payload: ResponsePayload },
@@ -27,7 +30,10 @@ pub enum Message {
 
 /// All user commands go through `Eval`. Structured requests are only for
 /// protocol-level operations not typed by the user.
+/// Daemon input boundary. Unknown request fields are rejected so typed clients
+/// cannot accidentally depend on parameters the daemon silently ignores.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum RequestPayload {
     // User commands (raw string, parsed by cued)
     Eval {
@@ -37,7 +43,6 @@ pub enum RequestPayload {
     RunScript {
         path: String,
         input: String,
-        mode: Mode,
     },
 
     // Connection management
@@ -65,7 +70,6 @@ pub enum RequestPayload {
     Complete {
         input: String,
         cursor: usize,
-        mode: Mode,
     },
     Highlight {
         input: String,
@@ -140,7 +144,6 @@ pub enum OkPayload {
     Ack {},
     ScriptCreated {
         script_id: String,
-        #[serde(default)]
         source: ScriptSource,
         items: Vec<ScriptItemInfo>,
         submit_error: Option<ScriptSubmitError>,
@@ -219,12 +222,7 @@ pub enum OkPayload {
     },
     Pong {
         /// Daemon `cued` build version reported by the running daemon.
-        ///
-        /// `None` when responding from a daemon that predates Pong-version
-        /// reporting; clients use this to detect outdated daemons and warn or
-        /// auto-restart.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        version: Option<String>,
+        version: String,
     },
 }
 
@@ -548,19 +546,10 @@ mod serde_bytes_base64 {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum EncodedBytes {
-            Base64(String),
-            LegacyArray(Vec<u8>),
-        }
-
-        match EncodedBytes::deserialize(deserializer)? {
-            EncodedBytes::Base64(text) => base64::engine::general_purpose::STANDARD
-                .decode(text)
-                .map_err(serde::de::Error::custom),
-            EncodedBytes::LegacyArray(bytes) => Ok(bytes),
-        }
+        let text = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -594,6 +583,19 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn request_message_rejects_unknown_envelope_fields() {
+        let json = r#"{"type":"request","id":1,"payload":{"Ping":{}},"trace_id":"abc"}"#;
+
+        let error = serde_json::from_str::<Message>(json)
+            .expect_err("unknown top-level message fields must not be ignored");
+
+        assert!(
+            error.to_string().contains("unknown field `trace_id`"),
+            "wrong error: {error}"
+        );
     }
 
     #[test]
@@ -710,7 +712,6 @@ mod tests {
             payload: RequestPayload::RunScript {
                 path: "scripts/build.cue".into(),
                 input: ":run cargo build".into(),
-                mode: Mode::Job,
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -718,12 +719,50 @@ mod tests {
         match decoded {
             Message::Request {
                 id,
-                payload: RequestPayload::RunScript { path, input, mode },
+                payload: RequestPayload::RunScript { path, input },
             } => {
                 assert_eq!(id, 9);
                 assert_eq!(path, "scripts/build.cue");
                 assert_eq!(input, ":run cargo build");
-                assert_eq!(mode, Mode::Job);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn run_script_request_rejects_unknown_fields() {
+        let json = r#"{"type":"request","id":9,"payload":{"RunScript":{"path":"scripts/build.cue","input":":run cargo build","mode":"job"}}}"#;
+
+        let error = serde_json::from_str::<Message>(json)
+            .expect_err("unknown request fields must not be ignored");
+
+        assert!(
+            error.to_string().contains("unknown field `mode`"),
+            "wrong error: {error}"
+        );
+    }
+
+    #[test]
+    fn complete_request_roundtrips_without_mode() {
+        let msg = Message::Request {
+            id: 3,
+            payload: RequestPayload::Complete {
+                input: ":ru".into(),
+                cursor: 3,
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("mode"));
+
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Message::Request {
+                id,
+                payload: RequestPayload::Complete { input, cursor },
+            } => {
+                assert_eq!(id, 3);
+                assert_eq!(input, ":ru");
+                assert_eq!(cursor, 3);
             }
             _ => panic!("wrong variant"),
         }
@@ -823,18 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_script_created_defaults_to_inline_source() {
-        let json = r#"{"Ok":{"ScriptCreated":{"script_id":"R1","items":[],"submit_error":null}}}"#;
-        let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
-        match decoded {
-            ResponsePayload::Ok(OkPayload::ScriptCreated { source, .. }) => {
-                assert_eq!(source, ScriptSource::Inline);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn binary_payloads_serialize_as_base64_strings() {
         let msg = Message::Event {
             payload: EventPayload::FgOutput {
@@ -846,29 +873,39 @@ mod tests {
     }
 
     #[test]
-    fn binary_payloads_accept_legacy_arrays() {
+    fn binary_payloads_reject_array_encoding() {
         let json = r#"{"type":"event","payload":{"FgOutput":{"data":[65,66,67]}}}"#;
-        let decoded: Message = serde_json::from_str(json).unwrap();
-        match decoded {
-            Message::Event {
-                payload: EventPayload::FgOutput { data },
-            } => assert_eq!(data, b"ABC"),
-            _ => panic!("wrong variant"),
-        }
+        let error = serde_json::from_str::<Message>(json)
+            .expect_err("binary payloads must use base64 string encoding");
+
+        assert!(
+            error.to_string().contains("invalid type"),
+            "wrong error: {error}"
+        );
     }
 
     #[test]
-    fn pong_decodes_legacy_empty_payload_as_no_version() {
-        // Older `cued` builds (predating Pong version reporting) sent `"Pong":{}`
-        // with no fields. New clients must decode that as `version = None`.
+    fn script_created_requires_source() {
+        let json = r#"{"Ok":{"ScriptCreated":{"script_id":"R1","items":[],"submit_error":null}}}"#;
+        let error = serde_json::from_str::<ResponsePayload>(json)
+            .expect_err("ScriptCreated must carry an explicit source");
+
+        assert!(
+            error.to_string().contains("missing field `source`"),
+            "wrong error: {error}"
+        );
+    }
+
+    #[test]
+    fn pong_requires_version_field() {
         let json = r#"{"Ok":{"Pong":{}}}"#;
-        let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
-        match decoded {
-            ResponsePayload::Ok(OkPayload::Pong { version }) => {
-                assert!(version.is_none(), "legacy Pong must decode as no version");
-            }
-            _ => panic!("wrong variant"),
-        }
+        let error = serde_json::from_str::<ResponsePayload>(json)
+            .expect_err("Pong must carry a daemon version");
+
+        assert!(
+            error.to_string().contains("missing field `version`"),
+            "wrong error: {error}"
+        );
     }
 
     #[test]
@@ -877,18 +914,18 @@ mod tests {
         let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
         match decoded {
             ResponsePayload::Ok(OkPayload::Pong { version }) => {
-                assert_eq!(version.as_deref(), Some("0.1.0"));
+                assert_eq!(version, "0.1.0");
             }
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn pong_omits_version_when_none() {
-        let payload = ResponsePayload::Ok(OkPayload::Pong { version: None });
+    fn pong_serializes_reported_version() {
+        let payload = ResponsePayload::Ok(OkPayload::Pong {
+            version: "0.1.0".into(),
+        });
         let json = serde_json::to_string(&payload).unwrap();
-        // Older clients tolerate extra fields, but absent `version` keeps the
-        // wire format identical to legacy daemons that never sent the field.
-        assert_eq!(json, r#"{"Ok":{"Pong":{}}}"#);
+        assert_eq!(json, r#"{"Ok":{"Pong":{"version":"0.1.0"}}}"#);
     }
 }

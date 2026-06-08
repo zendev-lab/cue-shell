@@ -1,7 +1,7 @@
 //! Scheduler actor — command routing, ID assignment, chain execution, cron timer heap.
 
 use std::collections::{HashMap, VecDeque};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,10 +24,7 @@ use cue_core::scope::EnvSnapshot;
 use cue_core::{ChainId, CronId, EventChannel, JobId, ScopeHash, ScriptId};
 
 use crate::config::{BlockDecision, Config};
-use crate::parser::parse::Parser as CueParser;
-use crate::parser::resolver::{ResolvedCommand, Resolver};
-use crate::parser::token::Token;
-use crate::parser::tokenizer::Tokenizer;
+use crate::parser::{ResolvedCommand, ResolvedScriptItem, Token, Tokenizer, parse_command};
 use crate::storage;
 use crate::word_expansion::expand_command_line;
 
@@ -42,6 +39,8 @@ use super::{
     publish_event_except as publish_actor_event_except,
     send_gateway_event as send_actor_gateway_event,
 };
+
+const MAX_OUTPUT_TAIL_BYTES: usize = cue_core::ipc::MAX_MESSAGE_SIZE / 4;
 
 // ── Leaf status within a chain ──────────────────────────────────────────────
 
@@ -151,7 +150,7 @@ struct PendingScriptRun {
     script_id: ScriptId,
     mode: Mode,
     source: ScriptSource,
-    items: VecDeque<crate::parser::resolver::ResolvedScriptItem>,
+    items: VecDeque<ResolvedScriptItem>,
     next_index: usize,
     item_scope: ScopeHash,
     created_items: Vec<ScriptItemInfo>,
@@ -197,6 +196,33 @@ struct SchedulerState {
     completed_chains: HashMap<ChainId, ChainCompletion>,
     /// Runtime wrapper toggle set by `:wrap on` / `:wrap off`.
     wrapper_enabled: Option<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerIo<'a> {
+    db: &'a Arc<Mutex<Connection>>,
+    sys: &'a ActorSystem,
+}
+
+impl<'a> SchedulerIo<'a> {
+    fn new(db: &'a Arc<Mutex<Connection>>, sys: &'a ActorSystem) -> Self {
+        Self { db, sys }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerRuntime<'a> {
+    io: SchedulerIo<'a>,
+    config: &'a Config,
+}
+
+impl<'a> SchedulerRuntime<'a> {
+    fn new(db: &'a Arc<Mutex<Connection>>, config: &'a Config, sys: &'a ActorSystem) -> Self {
+        Self {
+            io: SchedulerIo::new(db, sys),
+            config,
+        }
+    }
 }
 
 impl SchedulerState {
@@ -252,7 +278,7 @@ impl SchedulerState {
 // ── Spawn the actor ─────────────────────────────────────────────────────────
 
 /// Restore durable Scheduler state and spawn the actor task.
-pub async fn spawn(
+pub(super) async fn spawn(
     mut rx: mpsc::Receiver<SchedulerMsg>,
     conn: Connection,
     sys: ActorSystem,
@@ -321,9 +347,7 @@ pub async fn spawn(
                                         items,
                                         client_id,
                                         &mut state,
-                                        &db,
-                                        &config,
-                                        &sys,
+                                        SchedulerRuntime::new(&db, &config, &sys),
                                     )
                                     .await
                                     {
@@ -348,7 +372,13 @@ pub async fn spawn(
 
                         SchedulerMsg::JobFinished { job_id, exit_code } => {
                             handle_job_finished(job_id, exit_code, &mut state, &db, &sys).await;
-                            advance_pending_scripts_after_terminal_job(job_id, exit_code, &mut state, &db, &config, &sys).await;
+                            advance_pending_scripts_after_terminal_job(
+                                job_id,
+                                exit_code,
+                                &mut state,
+                                SchedulerRuntime::new(&db, &config, &sys),
+                            )
+                            .await;
                         }
 
                         SchedulerMsg::Shutdown => {
@@ -439,6 +469,11 @@ pub async fn spawn(
                                     warn!("scheduler: failed to persist shutdown job state: {error}");
                                 }
                             }
+                            fail_pending_scripts_on_shutdown(
+                                &mut state,
+                                SchedulerRuntime::new(&db, &config, &sys),
+                            )
+                            .await;
 
                             break;
                         }
@@ -702,6 +737,20 @@ async fn prune_retained_script_runs(db: &storage::SharedConnection, config: &Con
     }
 }
 
+async fn persist_script_finished_with_retention(
+    script_id: ScriptId,
+    mode: Mode,
+    created_items: &[ScriptItemInfo],
+    finish: ScriptFinish,
+    submit_error: Option<&ScriptSubmitError>,
+    db: &storage::SharedConnection,
+    config: &Config,
+) -> anyhow::Result<()> {
+    persist_script_finished(script_id, mode, created_items, finish, submit_error, db).await?;
+    prune_retained_script_runs(db, config).await;
+    Ok(())
+}
+
 fn stored_job_from_entry(entry: &JobEntry) -> storage::StoredJob {
     storage::StoredJob {
         id: entry.job_id.to_string(),
@@ -867,8 +916,7 @@ fn flatten_leaves_inner(node: &ChainNode, out: &mut Vec<FlatLeaf>) {
 }
 
 fn parse_chain_text(text: &str) -> Result<ChainNode, String> {
-    let ast = CueParser::parse(&format!(":run {text}")).map_err(|err| err.message)?;
-    match Resolver::resolve(ast, cue_core::Mode::Job).map_err(|err| err.message)? {
+    match parse_command(&format!(":run {text}"), cue_core::Mode::Job).map_err(|err| err.message)? {
         ResolvedCommand::Run { chain, .. } => Ok(chain),
         other => Err(format!("unexpected restore command: {other:?}")),
     }
@@ -1536,7 +1584,47 @@ struct TerminalStateUpdate {
     advance_chain: bool,
 }
 
-type ChainAdvance = (ChainId, Vec<(usize, ScopeHash)>, Vec<usize>);
+struct ChainSpawnOptions {
+    cwd_override: Option<std::path::PathBuf>,
+    scope_enabled: bool,
+    wrapper_enabled: bool,
+    pty_enabled: bool,
+    direct_output_client: Option<u64>,
+}
+
+impl ChainSpawnOptions {
+    fn process_job_options(&self) -> ProcessJobOptions {
+        ProcessJobOptions {
+            cwd_override: self.cwd_override.clone(),
+            wrapper_enabled: self.wrapper_enabled,
+            pty_enabled: self.pty_enabled,
+            direct_output_client: self.direct_output_client,
+        }
+    }
+}
+
+struct SpawnChainRequest {
+    chain: ChainNode,
+    scope_hash: ScopeHash,
+    options: ChainSpawnOptions,
+    warnings: Vec<String>,
+    retain_completed_chain: bool,
+}
+
+struct ChainAdvance {
+    chain_id: ChainId,
+    newly_ready: Vec<(usize, ScopeHash)>,
+    to_cancel: Vec<usize>,
+}
+
+struct ChainAdvanceRequest {
+    chain_id: ChainId,
+    newly_ready: Vec<(usize, ScopeHash)>,
+    to_cancel: Vec<usize>,
+    capture_first: usize,
+    cwd_override: Option<std::path::PathBuf>,
+    retain_completed_chain: bool,
+}
 
 #[derive(Default)]
 struct TerminalStateOutcome {
@@ -1681,14 +1769,14 @@ async fn set_job_terminal_state(
     };
     let (newly_ready, to_cancel) = advance_chain(&chain.node, leaf_idx, &chain.leaf_status);
     TerminalStateOutcome {
-        chain_advance: Some((
+        chain_advance: Some(ChainAdvance {
             chain_id,
-            newly_ready
+            newly_ready: newly_ready
                 .into_iter()
                 .map(|idx| (idx, next_scope))
                 .collect(),
             to_cancel,
-        )),
+        }),
         persist_error,
     }
 }
@@ -1808,18 +1896,21 @@ async fn fire_due_crons(
 
         // Spawn the chain just like `:run`.
         let response = spawn_chain(
-            chain,
-            scope_hash,
-            cwd_override,
-            scope_enabled,
-            wrapper_enabled,
-            true,
-            None,
+            SpawnChainRequest {
+                chain,
+                scope_hash,
+                options: ChainSpawnOptions {
+                    cwd_override,
+                    scope_enabled,
+                    wrapper_enabled,
+                    pty_enabled: true,
+                    direct_output_client: None,
+                },
+                warnings,
+                retain_completed_chain: false,
+            },
             state,
-            db,
-            sys,
-            warnings,
-            false,
+            SchedulerIo::new(db, sys),
         )
         .await;
         let first_job_id = match &response {
@@ -1873,7 +1964,7 @@ fn check_chain_guardrails(chain: &ChainNode, config: &Config) -> Result<Vec<Stri
     for leaf in &leaves {
         for pipeline in leaf.plan.pipelines() {
             for segment in &pipeline.segments {
-                match config.block.check(&segment.command) {
+                match config.check_command_guardrail(&segment.command) {
                     Some(BlockDecision::Block(reason)) => return Err(reason),
                     Some(BlockDecision::Warn(hint)) => warnings.push(hint),
                     None => {}
@@ -1885,22 +1976,22 @@ fn check_chain_guardrails(chain: &ChainNode, config: &Config) -> Result<Vec<Stri
 }
 
 /// Spawn a chain (or a single job) from a `ChainNode`, returning the response payload.
-#[allow(clippy::too_many_arguments)]
 async fn spawn_chain(
-    chain: ChainNode,
-    scope_hash: ScopeHash,
-    cwd_override: Option<std::path::PathBuf>,
-    scope_enabled: bool,
-    wrapper_enabled: bool,
-    pty_enabled: bool,
-    direct_output_client: Option<u64>,
+    request: SpawnChainRequest,
     state: &mut SchedulerState,
-    db: &Arc<Mutex<Connection>>,
-    sys: &ActorSystem,
-    warnings: Vec<String>,
-    retain_completed_chain: bool,
+    io: SchedulerIo<'_>,
 ) -> ResponsePayload {
-    if scope_enabled && let Err(message) = validate_scope_transform_support(&chain) {
+    let SpawnChainRequest {
+        chain,
+        scope_hash,
+        options,
+        warnings,
+        retain_completed_chain,
+    } = request;
+
+    if options.scope_enabled
+        && let Err(message) = validate_scope_transform_support(&chain)
+    {
         return ResponsePayload::err(error_code::INVALID_SYNTAX, message);
     }
 
@@ -1927,15 +2018,24 @@ async fn spawn_chain(
             },
         );
 
-        publish_job_created(sys, state, jid, &leaf.pipeline_text, scope_hash, open_hint).await;
+        publish_job_created(
+            io.sys,
+            state,
+            jid,
+            &leaf.pipeline_text,
+            scope_hash,
+            open_hint,
+        )
+        .await;
 
-        match scope_enabled
+        match options
+            .scope_enabled
             .then(|| scope_transform_from_command(leaf.command()))
             .transpose()
         {
             Ok(Some(_)) => {
                 info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: applying single scope-transform job");
-                match apply_scope_transform(sys, scope_hash, leaf.command()).await {
+                match apply_scope_transform(io.sys, scope_hash, leaf.command()).await {
                     Ok(end_scope) => {
                         let terminal = set_job_terminal_state(
                             jid,
@@ -1946,8 +2046,8 @@ async fn spawn_chain(
                                 advance_chain: true,
                             },
                             state,
-                            db,
-                            sys,
+                            io.db,
+                            io.sys,
                         )
                         .await;
                         if let Some(error) = terminal.persist_error {
@@ -1965,8 +2065,8 @@ async fn spawn_chain(
                                 advance_chain: true,
                             },
                             state,
-                            db,
-                            sys,
+                            io.db,
+                            io.sys,
                         )
                         .await;
                         if let Some(error) = terminal.persist_error {
@@ -1978,16 +2078,11 @@ async fn spawn_chain(
             Ok(None) => {
                 info!(%jid, pipeline = %leaf.pipeline_text, "scheduler: spawning single job");
                 if let Err(message) = spawn_process_job(
-                    sys,
+                    io.sys,
                     jid,
                     leaf.plan.clone(),
                     scope_hash,
-                    process_job_options(
-                        cwd_override.clone(),
-                        wrapper_enabled,
-                        pty_enabled,
-                        direct_output_client,
-                    ),
+                    options.process_job_options(),
                 )
                 .await
                 {
@@ -2000,8 +2095,8 @@ async fn spawn_chain(
                             advance_chain: true,
                         },
                         state,
-                        db,
-                        sys,
+                        io.db,
+                        io.sys,
                     )
                     .await;
                     if let Some(error) = terminal.persist_error {
@@ -2023,8 +2118,8 @@ async fn spawn_chain(
                         advance_chain: true,
                     },
                     state,
-                    db,
-                    sys,
+                    io.db,
+                    io.sys,
                 )
                 .await;
                 if let Some(error) = terminal.persist_error {
@@ -2060,28 +2155,29 @@ async fn spawn_chain(
         leaf_status,
         scope_hash,
         pipeline_text: chain_text,
-        cwd_override: cwd_override.clone(),
-        scope_enabled,
-        wrapper_enabled,
-        pty_enabled,
-        direct_output_client,
+        cwd_override: options.cwd_override.clone(),
+        scope_enabled: options.scope_enabled,
+        wrapper_enabled: options.wrapper_enabled,
+        pty_enabled: options.pty_enabled,
+        direct_output_client: options.direct_output_client,
     };
     state.chains.insert(chain_id, chain_state);
 
     let outcome = process_chain_advance(
-        chain_id,
-        ready_indices
-            .iter()
-            .copied()
-            .map(|idx| (idx, scope_hash))
-            .collect(),
-        &[],
-        ready_indices.len(),
-        cwd_override,
+        ChainAdvanceRequest {
+            chain_id,
+            newly_ready: ready_indices
+                .iter()
+                .copied()
+                .map(|idx| (idx, scope_hash))
+                .collect(),
+            to_cancel: Vec::new(),
+            capture_first: ready_indices.len(),
+            cwd_override: options.cwd_override,
+            retain_completed_chain,
+        },
         state,
-        db,
-        sys,
-        retain_completed_chain,
+        io,
     )
     .await;
     if let Some(error) = outcome.spawn_error {
@@ -2142,21 +2238,23 @@ async fn handle_job_finished(
         sys,
     )
     .await;
-    if let Some((chain_id, ready_queue, to_cancel)) = outcome.chain_advance {
+    if let Some(chain_advance) = outcome.chain_advance {
+        let chain_id = chain_advance.chain_id;
         let cwd_override = state
             .chains
             .get(&chain_id)
             .and_then(|c| c.cwd_override.clone());
         let advance = process_chain_advance(
-            chain_id,
-            ready_queue,
-            &to_cancel,
-            0,
-            cwd_override,
+            ChainAdvanceRequest {
+                chain_id,
+                newly_ready: chain_advance.newly_ready,
+                to_cancel: chain_advance.to_cancel,
+                capture_first: 0,
+                cwd_override,
+                retain_completed_chain: false,
+            },
             state,
-            db,
-            sys,
-            false,
+            SchedulerIo::new(db, sys),
         )
         .await;
         if let Some(error) = advance.persist_error {
@@ -2165,61 +2263,61 @@ async fn handle_job_finished(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn apply_user_terminal_job_update(
     job_id: JobId,
     update: TerminalStateUpdate,
     state: &mut SchedulerState,
-    db: &Arc<Mutex<Connection>>,
-    config: &Config,
-    sys: &ActorSystem,
+    runtime: SchedulerRuntime<'_>,
 ) -> Option<String> {
     let reported_exit_code = update.exit_code;
-    let outcome = set_job_terminal_state(job_id, update, state, db, sys).await;
+    let outcome =
+        set_job_terminal_state(job_id, update, state, runtime.io.db, runtime.io.sys).await;
     let mut persist_error = outcome.persist_error.clone();
-    if let Some((chain_id, ready_queue, to_cancel)) = outcome.chain_advance {
+    if let Some(chain_advance) = outcome.chain_advance {
+        let chain_id = chain_advance.chain_id;
         let cwd_override = state
             .chains
             .get(&chain_id)
             .and_then(|c| c.cwd_override.clone());
         let advance = process_chain_advance(
-            chain_id,
-            ready_queue,
-            &to_cancel,
-            0,
-            cwd_override,
+            ChainAdvanceRequest {
+                chain_id,
+                newly_ready: chain_advance.newly_ready,
+                to_cancel: chain_advance.to_cancel,
+                capture_first: 0,
+                cwd_override,
+                retain_completed_chain: false,
+            },
             state,
-            db,
-            sys,
-            false,
+            runtime.io,
         )
         .await;
         if persist_error.is_none() {
             persist_error = advance.persist_error;
         }
     }
-    advance_pending_scripts_after_terminal_job(job_id, reported_exit_code, state, db, config, sys)
-        .await;
+    advance_pending_scripts_after_terminal_job(job_id, reported_exit_code, state, runtime).await;
     persist_error
 }
 
 /// Shared logic for processing chain advancement results (cancels + spawns + cleanup).
 ///
 /// Used by `handle_job_finished`, `:kill`, and `:cancel` handlers.
-#[allow(clippy::too_many_arguments)]
 async fn process_chain_advance(
-    chain_id: ChainId,
-    newly_ready: Vec<(usize, ScopeHash)>,
-    to_cancel: &[usize],
-    capture_first: usize,
-    cwd_override: Option<std::path::PathBuf>,
+    request: ChainAdvanceRequest,
     state: &mut SchedulerState,
-    db: &Arc<Mutex<Connection>>,
-    sys: &ActorSystem,
-    retain_completed_chain: bool,
+    io: SchedulerIo<'_>,
 ) -> ChainAdvanceOutcome {
+    let ChainAdvanceRequest {
+        chain_id,
+        newly_ready,
+        to_cancel,
+        capture_first,
+        cwd_override,
+        retain_completed_chain,
+    } = request;
     let mut outcome = ChainAdvanceOutcome::default();
-    if let Some(error) = cancel_chain_leaves(chain_id, to_cancel, state, db, sys).await {
+    if let Some(error) = cancel_chain_leaves(chain_id, &to_cancel, state, io.db, io.sys).await {
         outcome.record_persist_error(error);
     }
 
@@ -2271,7 +2369,7 @@ async fn process_chain_advance(
 
         info!(%chain_id, %jid, leaf_idx = idx, "scheduler: spawning next chain leaf");
         publish_job_created(
-            sys,
+            io.sys,
             state,
             jid,
             &leaves[idx].pipeline_text,
@@ -2285,7 +2383,7 @@ async fn process_chain_advance(
             .transpose()
         {
             Ok(Some(_)) => {
-                match apply_scope_transform(sys, start_scope, leaves[idx].command()).await {
+                match apply_scope_transform(io.sys, start_scope, leaves[idx].command()).await {
                     Ok(end_scope) => {
                         let terminal = set_job_terminal_state(
                             jid,
@@ -2296,19 +2394,19 @@ async fn process_chain_advance(
                                 advance_chain: true,
                             },
                             state,
-                            db,
-                            sys,
+                            io.db,
+                            io.sys,
                         )
                         .await;
-                        outcome.record_terminal_state(&terminal);
-                        if let Some((_, ready_queue, more_cancel)) = terminal.chain_advance {
-                            if let Some(error) =
-                                cancel_chain_leaves(chain_id, &more_cancel, state, db, sys).await
-                            {
-                                outcome.record_persist_error(error);
-                            }
-                            queue.extend(ready_queue);
-                        }
+                        apply_terminal_chain_advance(
+                            chain_id,
+                            terminal,
+                            &mut outcome,
+                            &mut queue,
+                            state,
+                            io,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         warn!(%jid, pipeline = %leaves[idx].pipeline_text, "scheduler: scope-transform failed: {error}");
@@ -2321,25 +2419,25 @@ async fn process_chain_advance(
                                 advance_chain: true,
                             },
                             state,
-                            db,
-                            sys,
+                            io.db,
+                            io.sys,
                         )
                         .await;
-                        outcome.record_terminal_state(&terminal);
-                        if let Some((_, ready_queue, more_cancel)) = terminal.chain_advance {
-                            if let Some(error) =
-                                cancel_chain_leaves(chain_id, &more_cancel, state, db, sys).await
-                            {
-                                outcome.record_persist_error(error);
-                            }
-                            queue.extend(ready_queue);
-                        }
+                        apply_terminal_chain_advance(
+                            chain_id,
+                            terminal,
+                            &mut outcome,
+                            &mut queue,
+                            state,
+                            io,
+                        )
+                        .await;
                     }
                 }
             }
             Ok(None) => {
                 if let Err(error) = spawn_process_job(
-                    sys,
+                    io.sys,
                     jid,
                     leaves[idx].plan.clone(),
                     start_scope,
@@ -2363,19 +2461,19 @@ async fn process_chain_advance(
                             advance_chain: true,
                         },
                         state,
-                        db,
-                        sys,
+                        io.db,
+                        io.sys,
                     )
                     .await;
-                    outcome.record_terminal_state(&terminal);
-                    if let Some((_, ready_queue, more_cancel)) = terminal.chain_advance {
-                        if let Some(error) =
-                            cancel_chain_leaves(chain_id, &more_cancel, state, db, sys).await
-                        {
-                            outcome.record_persist_error(error);
-                        }
-                        queue.extend(ready_queue);
-                    }
+                    apply_terminal_chain_advance(
+                        chain_id,
+                        terminal,
+                        &mut outcome,
+                        &mut queue,
+                        state,
+                        io,
+                    )
+                    .await;
                 }
             }
             Err(error) => {
@@ -2389,24 +2487,24 @@ async fn process_chain_advance(
                         advance_chain: true,
                     },
                     state,
-                    db,
-                    sys,
+                    io.db,
+                    io.sys,
                 )
                 .await;
-                outcome.record_terminal_state(&terminal);
-                if let Some((_, ready_queue, more_cancel)) = terminal.chain_advance {
-                    if let Some(error) =
-                        cancel_chain_leaves(chain_id, &more_cancel, state, db, sys).await
-                    {
-                        outcome.record_persist_error(error);
-                    }
-                    queue.extend(ready_queue);
-                }
+                apply_terminal_chain_advance(
+                    chain_id,
+                    terminal,
+                    &mut outcome,
+                    &mut queue,
+                    state,
+                    io,
+                )
+                .await;
             }
         }
     }
 
-    publish_chain_progress(sys, state, chain_id).await;
+    publish_chain_progress(io.sys, state, chain_id).await;
 
     if let Some(chain) = state.chains.get(&chain_id)
         && all_leaves_terminal(&chain.node, 0, &chain.leaf_status)
@@ -2431,6 +2529,28 @@ async fn process_chain_advance(
     }
 
     outcome
+}
+
+async fn apply_terminal_chain_advance(
+    chain_id: ChainId,
+    terminal: TerminalStateOutcome,
+    outcome: &mut ChainAdvanceOutcome,
+    queue: &mut VecDeque<(usize, ScopeHash)>,
+    state: &mut SchedulerState,
+    io: SchedulerIo<'_>,
+) {
+    outcome.record_terminal_state(&terminal);
+    let Some(chain_advance) = terminal.chain_advance else {
+        return;
+    };
+
+    debug_assert_eq!(chain_advance.chain_id, chain_id);
+    if let Some(error) =
+        cancel_chain_leaves(chain_id, &chain_advance.to_cancel, state, io.db, io.sys).await
+    {
+        outcome.record_persist_error(error);
+    }
+    queue.extend(chain_advance.newly_ready);
 }
 
 // ── Command dispatch ────────────────────────────────────────────────────────
@@ -2477,19 +2597,16 @@ async fn handle_wait_command(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn start_pending_script_run(
     mode: Mode,
     source: ScriptSource,
-    items: Vec<crate::parser::resolver::ResolvedScriptItem>,
+    items: Vec<ResolvedScriptItem>,
     client_id: u64,
     state: &mut SchedulerState,
-    db: &Arc<Mutex<Connection>>,
-    config: &Config,
-    sys: &ActorSystem,
+    runtime: SchedulerRuntime<'_>,
 ) -> Option<ResponsePayload> {
     let script_id = state.alloc_script();
-    let item_scope = match create_isolated_script_scope(sys).await {
+    let item_scope = match create_isolated_script_scope(runtime.io.sys).await {
         Ok(scope) => scope,
         Err(response) => return Some(response),
     };
@@ -2505,19 +2622,15 @@ async fn start_pending_script_run(
         last_exit_code: 0,
         waiting_index: None,
     };
-    submit_pending_script_next(pending, true, state, db, config, sys).await
+    submit_pending_script_next(pending, true, state, runtime).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn continue_pending_script(
     pending: PendingScriptRun,
     state: &mut SchedulerState,
-    db: &Arc<Mutex<Connection>>,
-    config: &Config,
-    sys: &ActorSystem,
+    runtime: SchedulerRuntime<'_>,
 ) {
-    if let Some(response) = submit_pending_script_next(pending, false, state, db, config, sys).await
-    {
+    if let Some(response) = submit_pending_script_next(pending, false, state, runtime).await {
         warn!(
             ?response,
             "scheduler: script continuation produced an unexpected client response"
@@ -2525,14 +2638,11 @@ async fn continue_pending_script(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn submit_pending_script_next(
     mut pending: PendingScriptRun,
     respond_created: bool,
     state: &mut SchedulerState,
-    db: &Arc<Mutex<Connection>>,
-    config: &Config,
-    sys: &ActorSystem,
+    runtime: SchedulerRuntime<'_>,
 ) -> Option<ResponsePayload> {
     while let Some(item) = pending.items.pop_front() {
         let index = pending.next_index;
@@ -2542,9 +2652,9 @@ async fn submit_pending_script_next(
             *item.command,
             pending.client_id,
             state,
-            db,
-            config,
-            sys,
+            runtime.io.db,
+            runtime.config,
+            runtime.io.sys,
             CommandExecutionContext {
                 scope_override: Some(pending.item_scope),
                 direct_output_client: Some(pending.client_id),
@@ -2560,13 +2670,14 @@ async fn submit_pending_script_next(
                     code,
                     message,
                 });
-                if let Err(error) = persist_script_finished(
+                if let Err(error) = persist_script_finished_with_retention(
                     pending.script_id,
                     pending.mode,
                     &pending.created_items,
                     ScriptFinish::failed(EXIT_CODE_UNAVAILABLE, Some(index)),
                     submit_error.as_ref(),
-                    db,
+                    runtime.io.db,
+                    runtime.config,
                 )
                 .await
                 {
@@ -2577,7 +2688,7 @@ async fn submit_pending_script_next(
                     }
                 }
                 publish_script_finished(
-                    sys,
+                    runtime.io.sys,
                     pending.client_id,
                     pending.script_id,
                     ScriptRunStatus::Failed,
@@ -2608,13 +2719,14 @@ async fn submit_pending_script_next(
                 if let Some(exit_code) = immediate_script_item_exit_code(&payload, state) {
                     pending.last_exit_code = exit_code;
                     if exit_code != 0 {
-                        if let Err(error) = persist_script_finished(
+                        if let Err(error) = persist_script_finished_with_retention(
                             pending.script_id,
                             pending.mode,
                             &pending.created_items,
                             ScriptFinish::failed(exit_code, Some(index)),
                             None,
-                            db,
+                            runtime.io.db,
+                            runtime.config,
                         )
                         .await
                         {
@@ -2625,7 +2737,7 @@ async fn submit_pending_script_next(
                             }
                         }
                         publish_script_finished(
-                            sys,
+                            runtime.io.sys,
                             pending.client_id,
                             pending.script_id,
                             ScriptRunStatus::Failed,
@@ -2641,13 +2753,14 @@ async fn submit_pending_script_next(
                 match pending.created_items.last().map(|item| &item.result) {
                     Some(ScriptItemResult::Job { job_id, .. }) => {
                         let Some(job_id) = parse_job_id(job_id) else {
-                            if let Err(error) = persist_script_finished(
+                            if let Err(error) = persist_script_finished_with_retention(
                                 pending.script_id,
                                 pending.mode,
                                 &pending.created_items,
                                 ScriptFinish::failed(EXIT_CODE_UNAVAILABLE, Some(index)),
                                 None,
-                                db,
+                                runtime.io.db,
+                                runtime.config,
                             )
                             .await
                             {
@@ -2661,7 +2774,7 @@ async fn submit_pending_script_next(
                                 }
                             }
                             publish_script_finished(
-                                sys,
+                                runtime.io.sys,
                                 pending.client_id,
                                 pending.script_id,
                                 ScriptRunStatus::Failed,
@@ -2682,7 +2795,7 @@ async fn submit_pending_script_next(
                             pending.mode,
                             &pending.created_items,
                             None,
-                            db,
+                            runtime.io.db,
                         )
                         .await
                         .err()
@@ -2698,13 +2811,14 @@ async fn submit_pending_script_next(
                     }
                     Some(ScriptItemResult::Chain { chain_id, .. }) => {
                         let Some(chain_id) = parse_chain_id(chain_id) else {
-                            if let Err(error) = persist_script_finished(
+                            if let Err(error) = persist_script_finished_with_retention(
                                 pending.script_id,
                                 pending.mode,
                                 &pending.created_items,
                                 ScriptFinish::failed(EXIT_CODE_UNAVAILABLE, Some(index)),
                                 None,
-                                db,
+                                runtime.io.db,
+                                runtime.config,
                             )
                             .await
                             {
@@ -2718,7 +2832,7 @@ async fn submit_pending_script_next(
                                 }
                             }
                             publish_script_finished(
-                                sys,
+                                runtime.io.sys,
                                 pending.client_id,
                                 pending.script_id,
                                 ScriptRunStatus::Failed,
@@ -2741,8 +2855,7 @@ async fn submit_pending_script_next(
                                 finish_pending_script_failed(
                                     pending,
                                     completion.exit_code,
-                                    db,
-                                    sys,
+                                    runtime,
                                 )
                                 .await;
                                 return response;
@@ -2758,7 +2871,7 @@ async fn submit_pending_script_next(
                             pending.mode,
                             &pending.created_items,
                             None,
-                            db,
+                            runtime.io.db,
                         )
                         .await
                         .err()
@@ -2778,13 +2891,14 @@ async fn submit_pending_script_next(
         }
     }
 
-    if let Err(error) = persist_script_finished(
+    if let Err(error) = persist_script_finished_with_retention(
         pending.script_id,
         pending.mode,
         &pending.created_items,
         ScriptFinish::done(pending.last_exit_code),
         None,
-        db,
+        runtime.io.db,
+        runtime.config,
     )
     .await
     {
@@ -2795,7 +2909,7 @@ async fn submit_pending_script_next(
         }
     }
     publish_script_finished(
-        sys,
+        runtime.io.sys,
         pending.client_id,
         pending.script_id,
         ScriptRunStatus::Done,
@@ -2814,9 +2928,7 @@ async fn advance_pending_scripts_after_terminal_job(
     job_id: JobId,
     reported_exit_code: i32,
     state: &mut SchedulerState,
-    db: &Arc<Mutex<Connection>>,
-    config: &Config,
-    sys: &ActorSystem,
+    runtime: SchedulerRuntime<'_>,
 ) {
     if let Some(script_id) = state.pending_script_jobs.remove(&job_id)
         && let Some(mut pending) = state.pending_scripts.remove(&script_id)
@@ -2829,9 +2941,9 @@ async fn advance_pending_scripts_after_terminal_job(
         }
         pending.last_exit_code = exit_code;
         if exit_code != 0 {
-            finish_pending_script_failed(pending, exit_code, db, sys).await;
+            finish_pending_script_failed(pending, exit_code, runtime).await;
         } else {
-            continue_pending_script(pending, state, db, config, sys).await;
+            continue_pending_script(pending, state, runtime).await;
         }
     }
 
@@ -2856,9 +2968,9 @@ async fn advance_pending_scripts_after_terminal_job(
         }
         pending.last_exit_code = completion.exit_code;
         if completion.exit_code != 0 {
-            finish_pending_script_failed(pending, completion.exit_code, db, sys).await;
+            finish_pending_script_failed(pending, completion.exit_code, runtime).await;
         } else {
-            continue_pending_script(pending, state, db, config, sys).await;
+            continue_pending_script(pending, state, runtime).await;
         }
     }
 }
@@ -2879,24 +2991,24 @@ fn script_exit_code_for_job(state: &SchedulerState, job_id: JobId, reported_exit
 async fn finish_pending_script_failed(
     pending: PendingScriptRun,
     exit_code: i32,
-    db: &Arc<Mutex<Connection>>,
-    sys: &ActorSystem,
+    runtime: SchedulerRuntime<'_>,
 ) {
     let failed_index = pending.waiting_index;
-    if let Err(error) = persist_script_finished(
+    if let Err(error) = persist_script_finished_with_retention(
         pending.script_id,
         pending.mode,
         &pending.created_items,
         ScriptFinish::failed(exit_code, failed_index),
         None,
-        db,
+        runtime.io.db,
+        runtime.config,
     )
     .await
     {
         warn!(script = %pending.script_id, "scheduler: failed to persist script completion: {error}");
     }
     publish_script_finished(
-        sys,
+        runtime.io.sys,
         pending.client_id,
         pending.script_id,
         ScriptRunStatus::Failed,
@@ -2904,6 +3016,23 @@ async fn finish_pending_script_failed(
         failed_index,
     )
     .await;
+}
+
+async fn fail_pending_scripts_on_shutdown(
+    state: &mut SchedulerState,
+    runtime: SchedulerRuntime<'_>,
+) {
+    let mut pending = std::mem::take(&mut state.pending_scripts)
+        .into_values()
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|pending| pending.script_id.0);
+    state.pending_script_jobs.clear();
+    state.pending_script_chains.clear();
+    state.completed_chains.clear();
+
+    for pending in pending {
+        finish_pending_script_failed(pending, EXIT_CODE_UNAVAILABLE, runtime).await;
+    }
 }
 
 fn immediate_script_item_exit_code(payload: &OkPayload, state: &SchedulerState) -> Option<i32> {
@@ -2985,78 +3114,10 @@ async fn handle_command_with_scope(
     context: CommandExecutionContext,
 ) -> ResponsePayload {
     match cmd {
-        ResolvedCommand::Script {
-            mode,
-            source,
-            items,
-        } => {
-            let script_id = state.alloc_script();
-            let total_items = items.len();
-            let mut created_items = Vec::with_capacity(total_items);
-            let mut submit_error = None;
-            let mut item_scope = match create_isolated_script_scope(sys).await {
-                Ok(scope) => scope,
-                Err(response) => return response,
-            };
-
-            for (index, item) in items.into_iter().enumerate() {
-                let source = item.source;
-                let response = Box::pin(handle_command_with_scope(
-                    *item.command,
-                    client_id,
-                    state,
-                    db,
-                    config,
-                    sys,
-                    CommandExecutionContext {
-                        scope_override: Some(item_scope),
-                        direct_output_client: Some(client_id),
-                    },
-                ))
-                .await;
-                match response {
-                    ResponsePayload::Ok(payload) => {
-                        if let Some(next_scope) = script_item_end_scope_from_ok(&payload, state) {
-                            item_scope = next_scope;
-                        }
-                        created_items.push(ScriptItemInfo {
-                            index,
-                            source,
-                            result: script_item_result_from_ok(&payload),
-                        });
-                    }
-                    ResponsePayload::Err { code, message } => {
-                        submit_error = Some(ScriptSubmitError {
-                            index,
-                            source,
-                            code,
-                            message,
-                        });
-                        break;
-                    }
-                }
-            }
-
-            if let Err(error) = persist_script_submission(
-                script_id,
-                mode,
-                &created_items,
-                submit_error.as_ref(),
-                db,
-            )
-            .await
-            {
-                return ResponsePayload::err(error_code::INTERNAL, error.to_string());
-            }
-            prune_retained_script_runs(db, config).await;
-
-            ResponsePayload::Ok(OkPayload::ScriptCreated {
-                script_id: script_id.to_string(),
-                source,
-                items: created_items,
-                submit_error,
-            })
-        }
+        ResolvedCommand::Script { .. } => ResponsePayload::err(
+            error_code::NOT_SUPPORTED,
+            "script commands must enter the scheduler through the file-script runner",
+        ),
         ResolvedCommand::Run { chain, params } => {
             let scope_hash = match resolve_command_scope(sys, context.scope_override).await {
                 Ok(h) => h,
@@ -3073,18 +3134,21 @@ async fn handle_command_with_scope(
                 .unwrap_or_else(|| state.wrapper_enabled(config));
             let pty_enabled = params.pty_enabled();
             spawn_chain(
-                chain,
-                scope_hash,
-                cwd_override,
-                scope_enabled,
-                wrapper_enabled,
-                pty_enabled,
-                context.direct_output_client,
+                SpawnChainRequest {
+                    chain,
+                    scope_hash,
+                    options: ChainSpawnOptions {
+                        cwd_override,
+                        scope_enabled,
+                        wrapper_enabled,
+                        pty_enabled,
+                        direct_output_client: context.direct_output_client,
+                    },
+                    warnings,
+                    retain_completed_chain: context.scope_override.is_some(),
+                },
                 state,
-                db,
-                sys,
-                warnings,
-                context.scope_override.is_some(),
+                SchedulerIo::new(db, sys),
             )
             .await
         }
@@ -3193,9 +3257,7 @@ async fn handle_command_with_scope(
                                 advance_chain: true,
                             },
                             state,
-                            db,
-                            config,
-                            sys,
+                            SchedulerRuntime::new(db, config, sys),
                         )
                         .await
                         {
@@ -3249,9 +3311,7 @@ async fn handle_command_with_scope(
                             advance_chain: true,
                         },
                         state,
-                        db,
-                        config,
-                        sys,
+                        SchedulerRuntime::new(db, config, sys),
                     )
                     .await
                     {
@@ -3304,9 +3364,7 @@ async fn handle_command_with_scope(
                                 advance_chain: true,
                             },
                             state,
-                            db,
-                            config,
-                            sys,
+                            SchedulerRuntime::new(db, config, sys),
                         )
                         .await
                         {
@@ -3463,6 +3521,9 @@ async fn handle_command_with_scope(
                 Ok(snapshot) => snapshot,
                 Err(response) => return response,
             };
+            if let Some(response) = invalid_tail_bytes_response("tail_bytes", tail_bytes) {
+                return response;
+            }
             let text = format_snapshot_env(&snapshot);
             let (text, truncated) = limit_text(text, None, tail_bytes);
             ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
@@ -3591,6 +3652,9 @@ async fn handle_command_with_scope(
                     format!("invalid job id: {id}"),
                 );
             };
+            if let Some(response) = invalid_tail_bytes_response("tail_bytes", tail_bytes) {
+                return response;
+            }
             let request_bytes = tail_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
             read_job_output(sys, job_id, &id, request_bytes).await
         }
@@ -3682,18 +3746,21 @@ async fn handle_command_with_scope(
             tokio::time::sleep(delay).await;
             let wrapper_enabled = state.wrapper_enabled(config);
             spawn_chain(
-                chain,
-                start_scope,
-                None,
-                false,
-                wrapper_enabled,
-                true,
-                None,
+                SpawnChainRequest {
+                    chain,
+                    scope_hash: start_scope,
+                    options: ChainSpawnOptions {
+                        cwd_override: None,
+                        scope_enabled: false,
+                        wrapper_enabled,
+                        pty_enabled: true,
+                        direct_output_client: None,
+                    },
+                    warnings: Vec::new(),
+                    retain_completed_chain: false,
+                },
                 state,
-                db,
-                sys,
-                Vec::new(),
-                false,
+                SchedulerIo::new(db, sys),
             )
             .await
         }
@@ -3713,6 +3780,9 @@ async fn handle_command_with_scope(
             limit,
             tail_bytes,
         } => {
+            if let Some(response) = invalid_tail_bytes_response("tail_bytes", tail_bytes) {
+                return response;
+            }
             let text = format_log_text(state, id.as_deref());
             let (text, truncated) = limit_text(text, limit, tail_bytes);
             ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
@@ -3741,6 +3811,9 @@ async fn handle_command_with_scope(
         }
 
         ResolvedCommand::ShowConfig { tail_bytes } => {
+            if let Some(response) = invalid_tail_bytes_response("tail_bytes", tail_bytes) {
+                return response;
+            }
             let text = format_config_text(config);
             let (text, truncated) = limit_text(text, None, tail_bytes);
             ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
@@ -3868,8 +3941,15 @@ fn parse_cron_id(s: &str) -> Option<CronId> {
 
 async fn remove_job_logs(job_id: JobId) {
     if let Err(error) = tokio::task::spawn_blocking(move || {
+        let dir = match crate::dirs::output_dir() {
+            Ok(dir) => dir,
+            Err(error) => {
+                warn!(%job_id, err = %error, "scheduler: cannot resolve output dir for cleanup");
+                return;
+            }
+        };
         for suffix in [".log", ".stderr"] {
-            let path = crate::dirs::output_dir().join(format!("{job_id}{suffix}"));
+            let path = dir.join(format!("{job_id}{suffix}"));
             if let Err(error) = std::fs::remove_file(&path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {
@@ -4201,8 +4281,23 @@ fn limit_text(
     (lines[start..].join("\n"), true)
 }
 
+fn invalid_tail_bytes_response(field: &str, tail_bytes: Option<usize>) -> Option<ResponsePayload> {
+    if let Some(bytes) = tail_bytes
+        && bytes > MAX_OUTPUT_TAIL_BYTES
+    {
+        return Some(ResponsePayload::err(
+            error_code::INVALID_SYNTAX,
+            format!("{field} must be <= {MAX_OUTPUT_TAIL_BYTES} bytes"),
+        ));
+    }
+    None
+}
+
 fn tail_utf8(text: &str, max_bytes: usize) -> (String, bool) {
-    if max_bytes == 0 || text.len() <= max_bytes {
+    if max_bytes == 0 {
+        return (String::new(), !text.is_empty());
+    }
+    if text.len() <= max_bytes {
         return (text.to_string(), false);
     }
     let mut start = text.len() - max_bytes;
@@ -4334,8 +4429,17 @@ async fn read_output_from_log(
     tail_bytes: usize,
 ) -> ResponsePayload {
     let id = display_id.to_owned();
+    let output_dir = match crate::dirs::output_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            return ResponsePayload::err(
+                error_code::INTERNAL,
+                format!("resolve output directory: {error:#}"),
+            );
+        }
+    };
     match tokio::task::spawn_blocking(move || {
-        let path = crate::dirs::output_dir().join(format!("{job_id}.log"));
+        let path = output_dir.join(format!("{job_id}.log"));
         read_log_tail(path, tail_bytes)
     })
     .await
@@ -4352,6 +4456,12 @@ async fn read_job_output_pair(
     stdout_bytes: Option<usize>,
     stderr_bytes: Option<usize>,
 ) -> ResponsePayload {
+    if let Some(response) = invalid_tail_bytes_response("stdout_bytes", stdout_bytes) {
+        return response;
+    }
+    if let Some(response) = invalid_tail_bytes_response("stderr_bytes", stderr_bytes) {
+        return response;
+    }
     let stdout_limit = stdout_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
     let stderr_limit = stderr_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
     let stdout = match read_job_output(sys, job_id, display_id, stdout_limit).await {
@@ -4440,10 +4550,20 @@ async fn read_stderr_from_log(
     tail_bytes: usize,
 ) -> ResponsePayload {
     let id = display_id.to_owned();
+    let output_dir = match crate::dirs::output_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            return ResponsePayload::err(
+                error_code::INTERNAL,
+                format!("resolve output directory: {error:#}"),
+            );
+        }
+    };
 
     // Try the dedicated stderr log (pipe-mode jobs).
+    let stderr_dir = output_dir.clone();
     let stderr_data = tokio::task::spawn_blocking(move || {
-        let path = crate::dirs::output_dir().join(format!("{job_id}.stderr"));
+        let path = stderr_dir.join(format!("{job_id}.stderr"));
         read_log_tail(path, tail_bytes)
     })
     .await;
@@ -4468,7 +4588,7 @@ async fn read_stderr_from_log(
     // No dedicated stderr — return combined PTY log with notice.
     let id2 = id.clone();
     match tokio::task::spawn_blocking(move || {
-        let path = crate::dirs::output_dir().join(format!("{job_id}.log"));
+        let path = output_dir.join(format!("{job_id}.log"));
         read_log_tail(path, tail_bytes)
     })
     .await
@@ -4495,13 +4615,21 @@ struct LogTail {
 }
 
 fn read_log_tail(path: std::path::PathBuf, tail_bytes: usize) -> io::Result<LogTail> {
-    let data = std::fs::read(path)?;
-    let truncated = data.len() > tail_bytes;
-    let data = if truncated {
-        data[data.len() - tail_bytes..].to_vec()
-    } else {
-        data
-    };
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if tail_bytes == 0 {
+        return Ok(LogTail {
+            data: Vec::new(),
+            truncated: len > 0,
+        });
+    }
+
+    let read_len = len.min(tail_bytes as u64);
+    let truncated = len > read_len;
+    file.seek(SeekFrom::Start(len - read_len))?;
+
+    let mut data = Vec::with_capacity(read_len as usize);
+    file.take(read_len).read_to_end(&mut data)?;
     Ok(LogTail { data, truncated })
 }
 
@@ -4532,7 +4660,6 @@ fn output_log_error_response(id: &str, error: io::Error) -> ResponsePayload {
 mod tests {
     use super::super::EventBusMsg;
     use super::*;
-    use crate::parser::resolver::ResolvedScriptItem;
     use cue_core::ipc::ScriptSource;
     use cue_core::pipeline::{JobPlan, PipeSegment, Pipeline};
     use std::path::Path;
@@ -4582,6 +4709,56 @@ mod tests {
         ))
     }
 
+    fn test_runtime<'a>(
+        conn: &'a Arc<Mutex<Connection>>,
+        config: &'a Config,
+        sys: &'a ActorSystem,
+    ) -> SchedulerRuntime<'a> {
+        SchedulerRuntime::new(conn, config, sys)
+    }
+
+    fn test_chain_spawn(chain: ChainNode, scope_hash: ScopeHash) -> SpawnChainRequest {
+        test_chain_spawn_with_options(
+            chain,
+            scope_hash,
+            ChainSpawnOptions {
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+                pty_enabled: true,
+                direct_output_client: None,
+            },
+        )
+    }
+
+    fn test_scope_chain_spawn(chain: ChainNode, scope_hash: ScopeHash) -> SpawnChainRequest {
+        test_chain_spawn_with_options(
+            chain,
+            scope_hash,
+            ChainSpawnOptions {
+                cwd_override: None,
+                scope_enabled: true,
+                wrapper_enabled: false,
+                pty_enabled: true,
+                direct_output_client: None,
+            },
+        )
+    }
+
+    fn test_chain_spawn_with_options(
+        chain: ChainNode,
+        scope_hash: ScopeHash,
+        options: ChainSpawnOptions,
+    ) -> SpawnChainRequest {
+        SpawnChainRequest {
+            chain,
+            scope_hash,
+            options,
+            warnings: Vec::new(),
+            retain_completed_chain: false,
+        }
+    }
+
     fn drop_crons_table(conn: &Arc<Mutex<Connection>>) {
         conn.lock()
             .unwrap()
@@ -4616,6 +4793,17 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("script run exists")
+    }
+
+    fn persisted_script_ids(conn: &Arc<Mutex<Connection>>) -> Vec<String> {
+        let guard = conn.lock().unwrap();
+        let mut stmt = guard
+            .prepare("SELECT id FROM script_runs ORDER BY id")
+            .expect("prepare script id query");
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .expect("query script ids")
+            .map(|row| row.expect("read script id"))
+            .collect()
     }
 
     /// Spawn a fake scope_store that always replies with a zero hash.
@@ -4916,18 +5104,9 @@ mod tests {
         };
 
         let resp = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
 
@@ -4961,18 +5140,9 @@ mod tests {
         };
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -5004,18 +5174,9 @@ mod tests {
         };
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -5043,18 +5204,9 @@ mod tests {
         };
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -5082,18 +5234,9 @@ mod tests {
         };
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -5108,18 +5251,9 @@ mod tests {
         let conn = test_db();
         let mut state = SchedulerState::new();
         let resp = spawn_chain(
-            leaf("cd ."),
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(leaf("cd ."), ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         assert!(matches!(
@@ -5142,18 +5276,9 @@ mod tests {
         let conn = test_db();
         let mut state = SchedulerState::new();
         let resp = spawn_chain(
-            leaf("cd ."),
-            ScopeHash([0; 32]),
-            None,
-            true,
-            false,
-            true,
-            None,
+            test_scope_chain_spawn(leaf("cd ."), ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         assert!(matches!(
@@ -5178,18 +5303,12 @@ mod tests {
         let mut state = SchedulerState::new();
         let temp_dir = std::env::temp_dir();
         let resp = spawn_chain(
-            leaf(&format!("cd {}", temp_dir.display())),
-            ScopeHash([0; 32]),
-            None,
-            true,
-            false,
-            true,
-            None,
+            test_scope_chain_spawn(
+                leaf(&format!("cd {}", temp_dir.display())),
+                ScopeHash([0; 32]),
+            ),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
 
@@ -5216,18 +5335,9 @@ mod tests {
         let conn = test_db();
         let mut state = SchedulerState::new();
         let resp = spawn_chain(
-            leaf("echo hello"),
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(leaf("echo hello"), ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
 
@@ -5258,18 +5368,9 @@ mod tests {
         };
 
         let resp = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
 
@@ -5303,18 +5404,9 @@ mod tests {
         };
 
         let resp = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            true,
-            false,
-            true,
-            None,
+            test_scope_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
 
@@ -5345,18 +5437,9 @@ mod tests {
         };
 
         let resp = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            true,
-            false,
-            true,
-            None,
+            test_scope_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
 
@@ -5373,9 +5456,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn script_run_uses_isolated_scope_not_head() {
-        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
+    async fn direct_script_command_is_rejected_before_scheduler_execution() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, _ss_rx, _eb_rx) = test_actor_system();
 
         let conn = test_db();
         let config = Config::default();
@@ -5400,68 +5482,15 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(
-            resp,
-            ResponsePayload::Ok(OkPayload::ScriptCreated { .. })
-        ));
-        let scopes = drain_spawn_scopes(&mut pm_rx).await;
-        assert_eq!(scopes.len(), 1);
-        assert_ne!(scopes[0], ScopeHash([0u8; 32]));
-    }
-
-    #[tokio::test]
-    async fn script_scope_transform_feeds_following_immediate_item() {
-        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_fake_scope_store(ss_rx);
-
-        let conn = test_db();
-        let config = Config::default();
-        let mut state = SchedulerState::new();
-        let mut scope_params = cue_core::command::ModeParams::new();
-        scope_params.insert("scope", cue_core::command::ParamValue::Bool(true));
-        let temp_dir = std::env::temp_dir();
-        let cd_command = format!("cd {}", temp_dir.display());
-
-        let resp = handle_command(
-            ResolvedCommand::Script {
-                mode: Mode::Job,
-                source: ScriptSource::Inline,
-                items: vec![
-                    ResolvedScriptItem {
-                        source: cd_command.clone(),
-                        command: Box::new(ResolvedCommand::Run {
-                            chain: leaf(&cd_command),
-                            params: scope_params,
-                        }),
-                    },
-                    ResolvedScriptItem {
-                        source: "echo after".into(),
-                        command: Box::new(ResolvedCommand::Run {
-                            chain: leaf("echo after"),
-                            params: cue_core::command::ModeParams::new(),
-                        }),
-                    },
-                ],
-            },
-            0,
-            &mut state,
-            &conn,
-            &config,
-            &sys,
-        )
-        .await;
-
-        assert!(matches!(
-            resp,
-            ResponsePayload::Ok(OkPayload::ScriptCreated { .. })
-        ));
-        let first_end_scope = state
-            .jobs
-            .get(&JobId(1))
-            .and_then(|entry| entry.end_scope)
-            .expect("scope-transform end scope");
-        let scopes = drain_spawn_scopes(&mut pm_rx).await;
-        assert_eq!(scopes, vec![first_end_scope]);
+        match resp {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, error_code::NOT_SUPPORTED);
+                assert!(message.contains("file-script runner"));
+            }
+            other => panic!("expected script command rejection, got {other:?}"),
+        }
+        assert!(state.jobs.is_empty());
+        assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
     }
 
     #[tokio::test]
@@ -5505,9 +5534,7 @@ mod tests {
             ],
             0,
             &mut state,
-            &conn,
-            &config,
-            &sys,
+            test_runtime(&conn, &config, &sys),
         )
         .await
         .expect("created response");
@@ -5551,9 +5578,7 @@ mod tests {
             }],
             0,
             &mut state,
-            &conn,
-            &config,
-            &sys,
+            test_runtime(&conn, &config, &sys),
         )
         .await
         .expect("response");
@@ -5605,9 +5630,7 @@ mod tests {
             }],
             42,
             &mut state,
-            &conn,
-            &config,
-            &sys,
+            test_runtime(&conn, &config, &sys),
         )
         .await
         .expect("created response");
@@ -5646,9 +5669,7 @@ mod tests {
             }],
             42,
             &mut state,
-            &conn,
-            &config,
-            &sys,
+            test_runtime(&conn, &config, &sys),
         )
         .await
         .expect("created response");
@@ -5705,6 +5726,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_file_script_finish_applies_retention_policy() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let mut config = Config::default();
+        config.retention.max_script_runs = 1;
+        let mut state = SchedulerState::new();
+
+        for path in ["first.cue", "second.cue"] {
+            let response = start_pending_script_run(
+                Mode::Job,
+                ScriptSource::File { path: path.into() },
+                vec![ResolvedScriptItem {
+                    source: ":help".into(),
+                    command: Box::new(ResolvedCommand::Help { topic: None }),
+                }],
+                42,
+                &mut state,
+                test_runtime(&conn, &config, &sys),
+            )
+            .await
+            .expect("created response");
+            assert!(matches!(
+                response,
+                ResponsePayload::Ok(OkPayload::ScriptCreated { .. })
+            ));
+        }
+
+        assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
+        assert_eq!(persisted_script_ids(&conn), vec!["R2"]);
+    }
+
+    #[tokio::test]
     async fn pending_file_script_fail_fast_stops_following_items() {
         let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, mut eb_rx) = test_actor_system();
         spawn_fake_scope_store(ss_rx);
@@ -5735,9 +5790,7 @@ mod tests {
             ],
             0,
             &mut state,
-            &conn,
-            &config,
-            &sys,
+            test_runtime(&conn, &config, &sys),
         )
         .await
         .expect("created response");
@@ -5749,8 +5802,13 @@ mod tests {
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(spawned.len(), 1);
         handle_job_finished(spawned[0], 7, &mut state, &conn, &sys).await;
-        advance_pending_scripts_after_terminal_job(spawned[0], 7, &mut state, &conn, &config, &sys)
-            .await;
+        advance_pending_scripts_after_terminal_job(
+            spawned[0],
+            7,
+            &mut state,
+            test_runtime(&conn, &config, &sys),
+        )
+        .await;
 
         assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
         let events = drain_script_finished_events(&mut eb_rx).await;
@@ -5797,9 +5855,7 @@ mod tests {
             ],
             0,
             &mut state,
-            &conn,
-            &config,
-            &sys,
+            test_runtime(&conn, &config, &sys),
         )
         .await
         .expect("created response");
@@ -5840,7 +5896,13 @@ mod tests {
         );
 
         handle_job_finished(jid, 0, &mut state, &conn, &sys).await;
-        advance_pending_scripts_after_terminal_job(jid, 0, &mut state, &conn, &config, &sys).await;
+        advance_pending_scripts_after_terminal_job(
+            jid,
+            0,
+            &mut state,
+            test_runtime(&conn, &config, &sys),
+        )
+        .await;
 
         assert_eq!(
             state.jobs[&jid].status,
@@ -5849,6 +5911,69 @@ mod tests {
         assert_eq!(state.jobs[&jid].exit_code, Some(EXIT_CODE_UNAVAILABLE));
         assert!(drain_spawn_jobs(&mut pm_rx).await.is_empty());
         assert!(drain_script_finished_events(&mut eb_rx).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_fails_pending_file_scripts_and_clears_tracking() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, mut eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        let _ = start_pending_script_run(
+            Mode::Job,
+            ScriptSource::File {
+                path: "shutdown.cue".into(),
+            },
+            vec![
+                ResolvedScriptItem {
+                    source: "long-running".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("long-running"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+                ResolvedScriptItem {
+                    source: "echo never".into(),
+                    command: Box::new(ResolvedCommand::Run {
+                        chain: leaf("echo never"),
+                        params: cue_core::command::ModeParams::new(),
+                    }),
+                },
+            ],
+            0,
+            &mut state,
+            test_runtime(&conn, &config, &sys),
+        )
+        .await
+        .expect("created response");
+
+        assert_eq!(drain_spawn_jobs(&mut pm_rx).await, vec![JobId(1)]);
+        assert_eq!(state.pending_script_jobs.get(&JobId(1)), Some(&ScriptId(1)));
+        assert!(state.pending_scripts.contains_key(&ScriptId(1)));
+
+        fail_pending_scripts_on_shutdown(&mut state, test_runtime(&conn, &config, &sys)).await;
+
+        assert!(state.pending_script_jobs.is_empty());
+        assert!(state.pending_script_chains.is_empty());
+        assert!(state.pending_scripts.is_empty());
+        assert!(state.completed_chains.is_empty());
+        assert_eq!(
+            drain_script_finished_events(&mut eb_rx).await,
+            vec![(
+                "R1".into(),
+                ScriptRunStatus::Failed,
+                EXIT_CODE_UNAVAILABLE,
+                Some(0)
+            )]
+        );
+        let (status, exit_code, failed_item_index, finished_at) =
+            persisted_script_state(&conn, "R1");
+        assert_eq!(status, "failed");
+        assert_eq!(exit_code, Some(EXIT_CODE_UNAVAILABLE));
+        assert_eq!(failed_item_index, Some(0));
+        assert!(finished_at.is_some());
     }
 
     #[tokio::test]
@@ -5882,9 +6007,7 @@ mod tests {
             ],
             42,
             &mut state,
-            &conn,
-            &config,
-            &sys,
+            test_runtime(&conn, &config, &sys),
         )
         .await
         .expect("created response");
@@ -5892,14 +6015,24 @@ mod tests {
         let first = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(first.len(), 1);
         handle_job_finished(first[0], 0, &mut state, &conn, &sys).await;
-        advance_pending_scripts_after_terminal_job(first[0], 0, &mut state, &conn, &config, &sys)
-            .await;
+        advance_pending_scripts_after_terminal_job(
+            first[0],
+            0,
+            &mut state,
+            test_runtime(&conn, &config, &sys),
+        )
+        .await;
 
         let second = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(second.len(), 1);
         handle_job_finished(second[0], 0, &mut state, &conn, &sys).await;
-        advance_pending_scripts_after_terminal_job(second[0], 0, &mut state, &conn, &config, &sys)
-            .await;
+        advance_pending_scripts_after_terminal_job(
+            second[0],
+            0,
+            &mut state,
+            test_runtime(&conn, &config, &sys),
+        )
+        .await;
 
         match recv_gateway_msg(&mut gw_rx).await {
             GatewayMsg::SendEvent {
@@ -5938,8 +6071,8 @@ mod tests {
         let conn = test_db();
         let mut config = Config::default();
         config
-            .block
-            .warn_commands
+            .warn
+            .commands
             .insert("cd".into(), "review before changing directory".into());
         let mut state = SchedulerState::new();
         let chain = ChainNode::Serial {
@@ -6327,18 +6460,9 @@ mod tests {
         let chain = leaf("ls -la");
 
         let resp = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         assert!(matches!(
@@ -6384,18 +6508,9 @@ mod tests {
         let mut state = SchedulerState::new();
         for command in ["echo one", "echo two"] {
             let _ = spawn_chain(
-                leaf(command),
-                ScopeHash([0; 32]),
-                None,
-                false,
-                false,
-                true,
-                None,
+                test_chain_spawn(leaf(command), ScopeHash([0; 32])),
                 &mut state,
-                &conn,
-                &sys,
-                Vec::new(),
-                false,
+                SchedulerIo::new(&conn, &sys),
             )
             .await;
         }
@@ -6547,6 +6662,89 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn out_rejects_tail_limit_above_response_boundary_before_process_lookup() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, _ss_rx, _eb_rx) = test_actor_system();
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+
+        let resp = handle_command(
+            ResolvedCommand::Out {
+                id: "J1".into(),
+                tail_bytes: Some(MAX_OUTPUT_TAIL_BYTES + 1),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+
+        assert_invalid_tail_limit(resp, "tail_bytes");
+        assert!(
+            pm_rx.try_recv().is_err(),
+            "invalid output tail request must not reach process manager"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_job_output_rejects_tail_limits_above_response_boundary_before_process_lookup() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, _ss_rx, _eb_rx) = test_actor_system();
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+
+        let oversized_stdout = handle_command(
+            ResolvedCommand::JobOutput {
+                id: "J1".into(),
+                stdout_bytes: Some(MAX_OUTPUT_TAIL_BYTES + 1),
+                stderr_bytes: Some(1),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert_invalid_tail_limit(oversized_stdout, "stdout_bytes");
+
+        let oversized_stderr = handle_command(
+            ResolvedCommand::JobOutput {
+                id: "J1".into(),
+                stdout_bytes: Some(1),
+                stderr_bytes: Some(MAX_OUTPUT_TAIL_BYTES + 1),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert_invalid_tail_limit(oversized_stderr, "stderr_bytes");
+        assert!(
+            pm_rx.try_recv().is_err(),
+            "invalid typed output tail requests must not reach process manager"
+        );
+    }
+
+    fn assert_invalid_tail_limit(resp: ResponsePayload, field: &str) {
+        match resp {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, error_code::INVALID_SYNTAX);
+                assert!(message.contains(field), "{message}");
+                assert!(
+                    message.contains(&MAX_OUTPUT_TAIL_BYTES.to_string()),
+                    "{message}"
+                );
+            }
+            other => panic!("expected invalid tail limit error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn log_result_reports_missing_output_only_for_not_found() {
         let missing = output_from_log_result(
@@ -6567,10 +6765,48 @@ mod tests {
     }
 
     #[test]
+    fn read_log_tail_reads_requested_suffix_without_loading_full_file_contract() {
+        let path = std::env::temp_dir().join(format!(
+            "cue-read-log-tail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"abcdefghij").expect("write temp log");
+
+        let tail = read_log_tail(path.clone(), 4).expect("read tail");
+        assert_eq!(tail.data, b"ghij");
+        assert!(tail.truncated);
+
+        let all = read_log_tail(path.clone(), 20).expect("read full log through tail helper");
+        assert_eq!(all.data, b"abcdefghij");
+        assert!(!all.truncated);
+
+        let empty_tail = read_log_tail(path.clone(), 0).expect("read empty tail");
+        assert_eq!(empty_tail.data, b"");
+        assert!(empty_tail.truncated);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn typed_text_limit_applies_tail_then_line_limit() {
         let (text, truncated) = limit_text("a\nb\nc\nd".to_string(), Some(2), Some(5));
         assert_eq!(text, "c\nd");
         assert!(truncated);
+    }
+
+    #[test]
+    fn typed_text_tail_zero_returns_empty_text() {
+        let (text, truncated) = limit_text("abc".to_string(), None, Some(0));
+        assert_eq!(text, "");
+        assert!(truncated);
+
+        let (text, truncated) = limit_text(String::new(), None, Some(0));
+        assert_eq!(text, "");
+        assert!(!truncated);
     }
 
     #[test]
@@ -6704,7 +6940,7 @@ mod tests {
         guard
             .execute(
                 "UPDATE crons
-                 SET created_at = datetime('now', '-5 seconds'), created_at_ms = NULL
+                 SET created_at_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 5000
                  WHERE id = 'C1'",
                 [],
             )
@@ -6797,8 +7033,8 @@ mod tests {
         conn.lock()
             .unwrap()
             .execute(
-                "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status)
-                 VALUES ('not-a-cron', 'every 5m', 'echo hi', 1, ?1, 'scheduled')",
+                "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status, created_at_ms)
+                 VALUES ('not-a-cron', 'every 5m', 'echo hi', 1, ?1, '\"scheduled\"', CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))",
                 rusqlite::params![vec![9u8; 32]],
             )
             .unwrap();
@@ -6824,18 +7060,9 @@ mod tests {
         let chain = leaf("echo hello");
 
         let resp = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         // Single leaf → JobCreated, not ChainCreated.
@@ -6863,18 +7090,9 @@ mod tests {
         };
 
         let resp = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let chain = match resp {
@@ -6899,18 +7117,9 @@ mod tests {
         let conn = test_db();
         let mut state = SchedulerState::new();
         let resp = spawn_chain(
-            leaf("echo hello"),
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(leaf("echo hello"), ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let job_id = match resp {
@@ -6954,18 +7163,9 @@ mod tests {
         let mut state = SchedulerState::new();
 
         let resp = spawn_chain(
-            leaf("echo hello"),
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(leaf("echo hello"), ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let job_id = match resp {
@@ -7084,18 +7284,9 @@ mod tests {
         };
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -7144,18 +7335,9 @@ mod tests {
         };
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -7308,18 +7490,9 @@ mod tests {
         };
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;
@@ -7365,18 +7538,9 @@ mod tests {
         let chain = leaf("long-running");
 
         let _ = spawn_chain(
-            chain,
-            ScopeHash([0; 32]),
-            None,
-            false,
-            false,
-            true,
-            None,
+            test_chain_spawn(chain, ScopeHash([0; 32])),
             &mut state,
-            &conn,
-            &sys,
-            Vec::new(),
-            false,
+            SchedulerIo::new(&conn, &sys),
         )
         .await;
         let spawned = drain_spawn_jobs(&mut pm_rx).await;

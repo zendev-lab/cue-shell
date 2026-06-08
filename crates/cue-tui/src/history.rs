@@ -1,26 +1,36 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 const APP_DIR: &str = "cue-shell";
 const HISTORY_FILE: &str = "input-history.json";
 
-fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+fn home_dir_from_env(home: Option<OsString>) -> Result<PathBuf> {
+    let Some(home) = non_empty_env(home) else {
+        bail!("HOME is not set; set HOME or XDG_DATA_HOME to resolve cue-tui history path");
+    };
+    Ok(PathBuf::from(home))
 }
 
-fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(dir).join(APP_DIR)
+fn data_dir() -> Result<PathBuf> {
+    data_dir_from_env(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+fn data_dir_from_env(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
+    if let Some(dir) = non_empty_env(xdg_data_home) {
+        Ok(PathBuf::from(dir).join(APP_DIR))
     } else {
-        home_dir().join(".local/share").join(APP_DIR)
+        Ok(home_dir_from_env(home)?.join(".local/share").join(APP_DIR))
     }
 }
 
-pub fn history_path() -> PathBuf {
-    data_dir().join(HISTORY_FILE)
+fn non_empty_env(value: Option<OsString>) -> Option<OsString> {
+    value.filter(|value| !value.is_empty())
+}
+
+pub(crate) fn history_path() -> Result<PathBuf> {
+    Ok(data_dir()?.join(HISTORY_FILE))
 }
 
 fn load_history_from(path: &Path) -> Result<Vec<String>> {
@@ -41,12 +51,12 @@ fn save_history_to(path: &Path, history: &[String]) -> Result<()> {
     std::fs::write(path, content).with_context(|| format!("write history file {}", path.display()))
 }
 
-pub fn load_history() -> Result<Vec<String>> {
-    load_history_from(&history_path())
+pub(crate) fn load_history() -> Result<Vec<String>> {
+    load_history_from(&history_path()?)
 }
 
-pub fn save_history(history: &[String]) -> Result<()> {
-    save_history_to(&history_path(), history)
+pub(crate) fn save_history(history: &[String]) -> Result<()> {
+    save_history_to(&history_path()?, history)
 }
 
 #[cfg(test)]
@@ -78,5 +88,27 @@ mod tests {
         save_history_to(&path, &history).unwrap();
         assert_eq!(load_history_from(&path).unwrap(), history);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn history_path_requires_home_when_xdg_data_home_is_missing() {
+        let error = data_dir_from_env(None, None).expect_err("missing HOME and XDG should fail");
+
+        assert!(format!("{error:#}").contains("HOME is not set"));
+    }
+
+    #[test]
+    fn history_path_uses_xdg_data_home_without_home() {
+        assert_eq!(
+            data_dir_from_env(Some(OsString::from("/xdg-data")), None).unwrap(),
+            PathBuf::from("/xdg-data").join(APP_DIR)
+        );
+    }
+
+    #[test]
+    fn history_path_rejects_empty_home() {
+        let error = home_dir_from_env(Some(OsString::new())).expect_err("empty HOME should fail");
+
+        assert!(format!("{error:#}").contains("HOME is not set"));
     }
 }

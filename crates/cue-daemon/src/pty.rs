@@ -87,6 +87,7 @@ pub fn open_pty() -> Result<PtyPair> {
 /// Query the slave device path for diagnostic / logging purposes.
 ///
 /// Returns `None` if the fd is not a valid master pty.
+#[cfg(test)]
 pub fn slave_name(master: &OwnedFd) -> Option<String> {
     use std::os::fd::AsRawFd;
     let _guard = PTY_LOCK.lock().unwrap();

@@ -1,24 +1,38 @@
 //! cue-daemon — background daemon for cue-shell.
 //!
-//! This crate contains the parser, actor system, and process manager.
+//! Public entry points are intentionally narrow: the daemon binary launcher,
+//! the gateway-stdio bridge used by integration tests, and version reporting.
 
-pub mod actor;
-pub mod cli;
+mod actor;
+mod cli;
 pub(crate) mod command_util;
-pub mod config;
-pub mod dirs;
-pub mod gateway_stdio;
-pub mod parser;
-pub mod pty;
-pub mod ring_buffer;
-pub mod runtime_env;
-pub mod service;
-pub mod storage;
-pub mod upgrade;
-pub mod word_expansion;
+mod config;
+mod dirs;
+mod gateway_stdio;
+mod parser;
+mod pty;
+mod ring_buffer;
+mod runtime_env;
+mod service;
+mod storage;
+mod upgrade;
+mod word_expansion;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+pub fn run_cli() -> i32 {
+    cli::run()
+}
+
+pub async fn relay_gateway_stdio<R, W, S>(stdin: R, stdout: W, socket: S) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    gateway_stdio::relay(stdin, stdout, socket).await
 }
 
 #[cfg(test)]

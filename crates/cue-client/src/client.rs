@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -62,11 +63,10 @@ impl CuedClient {
     }
 
     /// Convenience: send a file-script request.
-    pub async fn run_script(&mut self, path: &str, input: &str, mode: Mode) -> Result<u32> {
+    pub async fn run_script(&mut self, path: &str, input: &str) -> Result<u32> {
         self.send(RequestPayload::RunScript {
             path: path.to_string(),
             input: input.to_string(),
-            mode,
         })
         .await
     }
@@ -91,11 +91,8 @@ impl CuedClient {
         self.ping_for_version().await.map(|_| ())
     }
 
-    /// Send a `Ping` and return the daemon-reported version, if any.
-    ///
-    /// Pre-version-reporting daemons reply with an empty `Pong {}` payload
-    /// and yield `Ok(None)`; current daemons return `Ok(Some(version))`.
-    pub async fn ping_for_version(&mut self) -> Result<Option<String>> {
+    /// Send a `Ping` and return the daemon-reported version.
+    pub async fn ping_for_version(&mut self) -> Result<String> {
         let ping_id = self.ping().await?;
         match self.recv().await? {
             Message::Response {
@@ -106,11 +103,19 @@ impl CuedClient {
         }
     }
 
-    /// Split the client into read/write halves for concurrent use.
+    /// Split the client into a reader and cloneable writer handle for
+    /// concurrent use by frontends.
+    pub fn into_reader_and_writer_handle(self) -> (ClientReader, WriterHandle) {
+        let (reader, writer) = self.into_split();
+        (reader, spawn_writer_task(writer))
+    }
+
+    /// Split the client into raw read/write halves for internal connection
+    /// managers.
     ///
     /// Returns `(reader, writer_stream)` where the reader can call `recv()`
     /// and the writer keeps the `next_id` counter.
-    pub fn into_split(self) -> (ClientReader, ClientWriter) {
+    pub(crate) fn into_split(self) -> (ClientReader, ClientWriter) {
         let (read_half, write_half) = io::split(self.stream);
         (
             ClientReader { stream: read_half },
@@ -135,22 +140,15 @@ impl ClientReader {
 }
 
 /// Write half of a split client connection.
-pub struct ClientWriter {
+pub(crate) struct ClientWriter {
     stream: io::WriteHalf<BoxedClientStream>,
     next_id: u32,
-}
-
-impl ClientWriter {
-    /// Send a request and return the assigned request ID.
-    pub async fn send(&mut self, payload: RequestPayload) -> Result<u32> {
-        send_request(&mut self.stream, &mut self.next_id, payload).await
-    }
 }
 
 /// A cloneable handle for sending requests to the daemon.
 ///
 /// Internally holds an [`mpsc::Sender`] that feeds a dedicated writer task
-/// which owns the actual [`ClientWriter`].
+/// which owns the actual split writer stream.
 #[derive(Clone)]
 pub struct WriterHandle {
     tx: mpsc::Sender<OutboundRequest>,
@@ -216,12 +214,12 @@ impl WriterHandle {
     }
 }
 
-/// Spawn a dedicated writer task that owns the [`ClientWriter`] and receives
+/// Spawn a dedicated writer task that owns the split writer stream and receives
 /// messages from a bounded channel. Returns a [`WriterHandle`] for sending
 /// requests.
 ///
 /// The task exits when all [`WriterHandle`] clones are dropped.
-pub fn spawn_writer_task(mut writer: ClientWriter) -> WriterHandle {
+pub(crate) fn spawn_writer_task(mut writer: ClientWriter) -> WriterHandle {
     let next_id = Arc::new(AtomicU32::new(writer.next_id));
     let (tx, mut rx) = mpsc::channel::<OutboundRequest>(64);
     tokio::spawn(async move {
@@ -301,12 +299,10 @@ impl MultiplexedClient {
         &self,
         path: impl Into<String>,
         input: impl Into<String>,
-        mode: Mode,
     ) -> Result<ResponsePayload> {
         self.call(RequestPayload::RunScript {
             path: path.into(),
             input: input.into(),
-            mode,
         })
         .await
     }
@@ -411,12 +407,20 @@ type BoxedClientStream = Box<dyn ClientStream>;
 
 /// Resolve the default socket path: `$XDG_RUNTIME_DIR/cue-shell/cued.sock`.
 pub fn default_socket_path() -> PathBuf {
-    let runtime_dir = if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+    default_socket_path_from_env(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir())
+}
+
+fn default_socket_path_from_env(xdg_runtime_dir: Option<OsString>, temp_dir: PathBuf) -> PathBuf {
+    let runtime_dir = if let Some(dir) = non_empty_env(xdg_runtime_dir) {
         PathBuf::from(dir).join(APP_DIR)
     } else {
-        std::env::temp_dir().join(APP_DIR)
+        temp_dir.join(APP_DIR)
     };
     runtime_dir.join("cued.sock")
+}
+
+fn non_empty_env(value: Option<OsString>) -> Option<OsString> {
+    value.filter(|value| !value.is_empty())
 }
 
 async fn read_message<R>(stream: &mut R) -> Result<Message>
@@ -583,6 +587,26 @@ mod tests {
         assert_eq!(next_id.load(Ordering::Relaxed), 2);
     }
 
+    #[test]
+    fn default_socket_path_uses_runtime_dir_when_present() {
+        assert_eq!(
+            default_socket_path_from_env(Some(OsString::from("/runtime")), PathBuf::from("/tmp")),
+            PathBuf::from("/runtime").join(APP_DIR).join("cued.sock")
+        );
+    }
+
+    #[test]
+    fn default_socket_path_uses_temp_dir_when_runtime_dir_is_missing_or_empty() {
+        assert_eq!(
+            default_socket_path_from_env(None, PathBuf::from("/tmp")),
+            PathBuf::from("/tmp").join(APP_DIR).join("cued.sock")
+        );
+        assert_eq!(
+            default_socket_path_from_env(Some(OsString::new()), PathBuf::from("/tmp")),
+            PathBuf::from("/tmp").join(APP_DIR).join("cued.sock")
+        );
+    }
+
     #[tokio::test]
     async fn cued_client_subscribe_uses_typed_channels_and_returns_request_id() {
         let (client_stream, mut server_stream) = duplex(4096);
@@ -656,6 +680,27 @@ mod tests {
 
         let error = writer.send(RequestPayload::Ping {}).unwrap_err();
         assert_eq!(error, WriterSendError::Closed);
+    }
+
+    #[tokio::test]
+    async fn reader_writer_handle_split_sends_requests_without_exposing_raw_writer() {
+        let (client_stream, mut server_stream) = duplex(4096);
+        let client = CuedClient::from_stream(client_stream);
+        let (_reader, writer) = client.into_reader_and_writer_handle();
+
+        let request_id = writer
+            .send_async(RequestPayload::Ping {})
+            .await
+            .expect("send ping through writer handle");
+
+        assert_eq!(request_id, 1);
+        match read_message(&mut server_stream).await.unwrap() {
+            Message::Request {
+                id,
+                payload: RequestPayload::Ping {},
+            } => assert_eq!(id, request_id),
+            other => panic!("unexpected request: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -884,13 +929,15 @@ mod tests {
             &mut server_stream,
             &Message::Response {
                 id: request_id,
-                payload: ResponsePayload::Ok(OkPayload::Pong { version: None }),
+                payload: ResponsePayload::Ok(OkPayload::Pong {
+                    version: "0.1.0".into(),
+                }),
             },
         )
         .await;
 
         match response_task.await.unwrap().unwrap() {
-            ResponsePayload::Ok(OkPayload::Pong { version: None }) => {}
+            ResponsePayload::Ok(OkPayload::Pong { version }) if version == "0.1.0" => {}
             other => panic!("unexpected response: {other:?}"),
         }
 

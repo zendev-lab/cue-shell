@@ -1,19 +1,22 @@
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Output, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use cue_client::{
-    CuedClient, ResolvedTransport, RestartHandle, default_socket_path, ssh_invocation,
-};
+use cue_client::{CuedClient, default_socket_path};
+#[cfg(feature = "tui")]
+use cue_client::{ResolvedTransport, RestartHandle};
 use tracing::info;
 
+#[cfg(feature = "tui")]
 pub(crate) fn restart_handle_for_transport(transport: &ResolvedTransport) -> RestartHandle {
     let transport = transport.clone();
     RestartHandle::new(move || restart_transport(&transport))
 }
 
+#[cfg(feature = "tui")]
 fn restart_transport(transport: &ResolvedTransport) -> Result<()> {
     match transport {
         ResolvedTransport::Unix { socket_path, .. } => restart_local_daemon(socket_path),
@@ -25,18 +28,19 @@ fn restart_transport(transport: &ResolvedTransport) -> Result<()> {
     }
 }
 
+#[cfg(feature = "tui")]
 fn restart_local_daemon(socket_path: &Path) -> Result<()> {
-    let candidates = daemon_bin_candidates();
+    let candidates = daemon_bin_candidates()?;
     restart_local_daemon_with_candidates(&candidates, socket_path)
 }
 
-fn restart_local_daemon_with_candidates(candidates: &[String], socket_path: &Path) -> Result<()> {
+fn restart_local_daemon_with_candidates(candidates: &[OsString], socket_path: &Path) -> Result<()> {
     let socket_override = socket_path != default_socket_path().as_path();
     let mut failures = Vec::new();
 
     for cued_bin in candidates {
         let args = local_restart_args(socket_override, socket_path);
-        let invocation = command_display(OsStr::new(cued_bin), &args);
+        let invocation = command_display(cued_bin.as_os_str(), &args);
 
         match StdCommand::new(cued_bin)
             .args(&args)
@@ -55,6 +59,7 @@ fn restart_local_daemon_with_candidates(candidates: &[String], socket_path: &Pat
     )
 }
 
+#[cfg(feature = "tui")]
 fn remote_restart_command(start_command: &str) -> String {
     let mut parts = start_command.split_whitespace();
     if matches!(parts.next(), Some("cued")) && matches!(parts.next(), Some("start")) {
@@ -76,9 +81,10 @@ fn remote_restart_command(start_command: &str) -> String {
     }
 }
 
+#[cfg(feature = "tui")]
 fn restart_remote_daemon(destination: &str, start_command: &str) -> Result<()> {
     let remote_command = remote_restart_command(start_command);
-    let invocation = ssh_invocation(destination, &remote_command);
+    let invocation = remote_restart_invocation(destination, &remote_command);
     let output = StdCommand::new("ssh")
         .arg(destination)
         .arg(&remote_command)
@@ -95,6 +101,14 @@ fn restart_remote_daemon(destination: &str, start_command: &str) -> Result<()> {
     }
 }
 
+#[cfg(feature = "tui")]
+fn remote_restart_invocation(destination: &str, remote_command: &str) -> String {
+    command_display(
+        OsStr::new("ssh"),
+        &[OsString::from(destination), OsString::from(remote_command)],
+    )
+}
+
 fn local_restart_args(socket_override: bool, socket_path: &Path) -> Vec<OsString> {
     let mut args = vec![OsString::from("restart")];
     if socket_override {
@@ -104,17 +118,12 @@ fn local_restart_args(socket_override: bool, socket_path: &Path) -> Vec<OsString
     args
 }
 
-fn start_local_daemon(socket_path: &Path) -> Result<()> {
-    let candidates = daemon_bin_candidates();
-    start_local_daemon_with_candidates(&candidates, socket_path)
-}
-
-fn start_local_daemon_with_candidates(candidates: &[String], socket_path: &Path) -> Result<()> {
+fn start_local_daemon_with_candidates(candidates: &[OsString], socket_path: &Path) -> Result<()> {
     let args = local_start_args(socket_path);
     let mut failures = Vec::new();
 
     for cued_bin in candidates {
-        let invocation = command_display(OsStr::new(cued_bin), &args);
+        let invocation = command_display(cued_bin.as_os_str(), &args);
         match StdCommand::new(cued_bin)
             .args(&args)
             .stdin(Stdio::null())
@@ -143,7 +152,9 @@ fn local_command_failures(action: &str, socket_path: &Path, failures: Vec<String
         socket_path.display()
     );
     if failures.is_empty() {
-        summary
+        format!(
+            "{summary}\nno first-party `cued` companion binary was found next to `cue`; set CUE_DAEMON_BIN to an explicit daemon path"
+        )
     } else {
         format!("{summary}\n{}", failures.join("\n"))
     }
@@ -189,43 +200,66 @@ fn append_command_output(summary: &mut String, label: &str, data: &[u8]) {
 ///
 /// Returns the connected client for the TUI to reuse (no double-connect).
 /// Returns `None` for offline mode with auto-reconnect.
+#[cfg(feature = "tui")]
 pub(crate) async fn ensure_daemon_running(socket_path: &Path) -> Option<CuedClient> {
-    if let Ok(client) = CuedClient::connect(socket_path).await {
-        info!("cued already running");
-        return Some(client);
+    match require_daemon_running(socket_path).await {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                socket_path = %socket_path.display(),
+                "local cued unavailable, entering offline mode"
+            );
+            eprintln!(
+                "cue: local cued is unavailable at {}:\n{error:#}",
+                socket_path.display()
+            );
+            None
+        }
     }
+}
 
-    if let Err(error) = remove_stale_socket(socket_path) {
-        tracing::warn!(
-            %error,
-            socket_path = %socket_path.display(),
-            "failed to remove stale cued socket"
-        );
-        return None;
-    }
+/// Connect to the local daemon, auto-starting it if needed.
+///
+/// Unlike [`ensure_daemon_running`], this returns the startup error to callers
+/// that cannot enter offline mode, such as `cue run`.
+pub(crate) async fn require_daemon_running(socket_path: &Path) -> Result<CuedClient> {
+    let candidates = daemon_bin_candidates()?;
+    require_daemon_running_with_candidates(socket_path, &candidates).await
+}
+
+async fn require_daemon_running_with_candidates(
+    socket_path: &Path,
+    candidates: &[OsString],
+) -> Result<CuedClient> {
+    let initial_error = match CuedClient::connect(socket_path).await {
+        Ok(client) => {
+            info!("cued already running");
+            return Ok(client);
+        }
+        Err(error) => error,
+    };
+
+    remove_stale_socket(socket_path)?;
 
     info!("cued not running, attempting to start");
-    if let Err(error) = start_local_daemon(socket_path) {
-        tracing::warn!(%error, "failed to run cued start");
-        eprintln!(
-            "cue: failed to auto-start cued for {}:\n{error:#}",
-            socket_path.display()
-        );
-        return None;
-    }
+    start_local_daemon_with_candidates(candidates, socket_path)
+        .with_context(|| format!("auto-start cued for {}", socket_path.display()))?;
 
     let mut delay = Duration::from_millis(100);
     for _ in 0..5 {
         tokio::time::sleep(delay).await;
         if let Ok(client) = CuedClient::connect(socket_path).await {
             info!("connected after auto-start");
-            return Some(client);
+            return Ok(client);
         }
         delay *= 2;
     }
 
-    tracing::warn!("cued did not start in time, entering offline mode");
-    None
+    bail!(
+        "cued did not accept connections at {} after auto-start; initial connection failed: {initial_error:#}",
+        socket_path.display()
+    )
 }
 
 fn remove_stale_socket(socket_path: &Path) -> Result<()> {
@@ -245,44 +279,54 @@ fn remove_stale_socket(socket_path: &Path) -> Result<()> {
 /// Query the freshly connected local `cued` for its version and warn if it
 /// disagrees with the running `cue` build. Optionally auto-restarts the
 /// daemon when `CUE_AUTO_UPDATE_CUED=1` is set, returning a fresh client.
+#[cfg(feature = "tui")]
 pub(crate) async fn check_local_daemon_version(
     client: Option<CuedClient>,
     socket_path: &Path,
 ) -> Option<CuedClient> {
+    let client = client?;
+    match check_required_local_daemon_version(client, socket_path).await {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(%error, "local cued IPC handshake failed");
+            eprintln!("cue: {error:#}");
+            None
+        }
+    }
+}
+
+pub(crate) async fn check_required_local_daemon_version(
+    mut client: CuedClient,
+    socket_path: &Path,
+) -> Result<CuedClient> {
     use crate::version_check::{
         VersionMatch, auto_update_enabled, check_disabled, local_version, query_daemon_version,
         warn_on_mismatch,
     };
 
-    let mut client = client?;
     if check_disabled() {
-        return Some(client);
+        return Ok(client);
     }
 
-    let daemon = match query_daemon_version(&mut client).await {
-        Ok(version) => version,
-        Err(error) => {
-            tracing::warn!(%error, "local cued IPC handshake failed");
-            eprintln!("cue: local cued did not complete the IPC handshake: {error:#}");
-            return None;
-        }
-    };
+    let daemon = query_daemon_version(&mut client)
+        .await
+        .context("local cued did not complete the IPC handshake")?;
     let verdict = VersionMatch::classify(&daemon, local_version());
     if !verdict.is_actionable() {
-        return Some(client);
+        return Ok(client);
     }
 
     // Restart only when a candidate on disk reports the same version as this
     // `cue` binary; otherwise restarting would just relaunch stale `cued`.
     if auto_update_enabled() {
-        let candidates = daemon_bin_candidates();
+        let candidates = daemon_bin_candidates()?;
         if !local_cued_disk_version_matches_cue(&candidates) {
             eprintln!(
                 "cue: CUE_AUTO_UPDATE_CUED=1 was set, but no local cued candidate reports version {}. Restart skipped.",
                 local_version()
             );
             warn_on_mismatch(&verdict, false);
-            return Some(client);
+            return Ok(client);
         }
 
         eprintln!(
@@ -293,34 +337,26 @@ pub(crate) async fn check_local_daemon_version(
         match restart_local_daemon_with_candidates(&candidates, socket_path) {
             Ok(()) => {
                 drop(client);
-                let new_client = ensure_daemon_running(socket_path).await?;
-                return Some(new_client);
+                return require_daemon_running(socket_path).await;
             }
             Err(error) => {
                 eprintln!("cue: auto-restart failed: {error:#}");
                 warn_on_mismatch(&verdict, false);
-                return Some(client);
+                return Ok(client);
             }
         }
     }
 
     warn_on_mismatch(&verdict, true);
-    Some(client)
+    Ok(client)
 }
 
-pub(crate) fn version_from_ping(version: Option<String>) -> crate::version_check::DaemonVersion {
-    match version {
-        Some(version) => crate::version_check::DaemonVersion::Reported(version),
-        None => crate::version_check::DaemonVersion::Unknown,
-    }
+pub(crate) fn version_from_ping(version: String) -> crate::version_check::DaemonVersion {
+    crate::version_check::DaemonVersion(version)
 }
 
 fn describe_daemon_version(version: &crate::version_check::DaemonVersion) -> String {
-    use crate::version_check::DaemonVersion;
-    match version {
-        DaemonVersion::Reported(v) => format!("v{v}"),
-        DaemonVersion::Unknown => "an unknown older version".to_string(),
-    }
+    format!("v{}", version.0)
 }
 
 /// Print a one-shot version-mismatch warning for an SSH-attached daemon.
@@ -337,7 +373,7 @@ pub(crate) fn warn_on_remote_version_mismatch(daemon: crate::version_check::Daem
     warn_on_mismatch(&verdict, false);
 }
 
-fn local_cued_disk_version_matches_cue(candidates: &[String]) -> bool {
+fn local_cued_disk_version_matches_cue(candidates: &[OsString]) -> bool {
     let target = crate::version_check::local_version();
     for cued_bin in candidates {
         let Ok(output) = StdCommand::new(cued_bin).arg("--version").output() else {
@@ -354,78 +390,63 @@ fn local_cued_disk_version_matches_cue(candidates: &[String]) -> bool {
     false
 }
 
-fn daemon_bin_candidates() -> Vec<String> {
-    daemon_bin_candidates_from_sources(
-        std::env::var("CUE_DAEMON_BIN").ok(),
-        std::env::current_exe().ok(),
-        argv0_path(),
+fn daemon_bin_candidates() -> Result<Vec<OsString>> {
+    daemon_bin_candidates_from_runtime_sources(
+        std::env::var_os("CUE_DAEMON_BIN"),
+        std::env::current_exe(),
+        crate::companion_binary::argv0_path,
     )
 }
 
+fn daemon_bin_candidates_from_runtime_sources(
+    env_override: Option<OsString>,
+    current_exe: io::Result<PathBuf>,
+    argv0_path: impl FnOnce() -> Result<Option<PathBuf>>,
+) -> Result<Vec<OsString>> {
+    if env_override.is_some() {
+        return Ok(daemon_bin_candidates_from_sources(env_override, None, None));
+    }
+
+    let current_exe =
+        current_exe.context("resolve current executable path for cued companion lookup")?;
+    let mut candidates = daemon_bin_candidates_from_sources(None, Some(current_exe.clone()), None);
+    if !candidates.is_empty() {
+        return Ok(candidates);
+    }
+
+    candidates = daemon_bin_candidates_from_sources(None, Some(current_exe), argv0_path()?);
+    Ok(candidates)
+}
+
 fn daemon_bin_candidates_from_sources(
-    env_override: Option<String>,
+    env_override: Option<OsString>,
     current_exe: Option<PathBuf>,
     argv0: Option<PathBuf>,
-) -> Vec<String> {
+) -> Vec<OsString> {
     if let Some(path) = env_override {
         return vec![path];
     }
 
     let mut candidates = Vec::new();
 
-    if let Some(path) = current_exe {
-        for candidate in daemon_candidates_for_path(&path) {
-            push_unique(&mut candidates, candidate);
-        }
-    }
-
-    if let Some(path) = argv0 {
-        for candidate in daemon_candidates_for_path(&path) {
-            push_unique(&mut candidates, candidate);
-        }
-    }
-
-    push_unique(&mut candidates, "cued".into());
-    candidates
-}
-
-fn daemon_candidates_for_path(path: &Path) -> Vec<String> {
-    let mut candidates = Vec::new();
-    let sibling = path.with_file_name("cued");
-    if sibling.is_file() {
-        push_unique(&mut candidates, sibling.display().to_string());
-    }
-
-    if let Some(parent) = path.parent()
-        && parent.file_name().is_some_and(|name| name == "deps")
-        && let Some(bin_dir) = parent.parent()
+    if let Some(candidate) = current_exe
+        .as_deref()
+        .and_then(|path| crate::companion_binary::companion_binary_for_path(path, "cued"))
     {
-        let cargo_bin = bin_dir.join("cued");
-        if cargo_bin.is_file() {
-            push_unique(&mut candidates, cargo_bin.display().to_string());
-        }
+        push_unique(&mut candidates, candidate.into_os_string());
+    }
+
+    if let Some(candidate) = argv0
+        .as_deref()
+        .and_then(|path| crate::companion_binary::companion_binary_for_path(path, "cued"))
+    {
+        push_unique(&mut candidates, candidate.into_os_string());
     }
 
     candidates
 }
 
-fn argv0_path() -> Option<PathBuf> {
-    let argv0 = std::env::args_os().next()?;
-    let path = PathBuf::from(argv0);
-    if path.components().count() == 1 {
-        return None;
-    }
-
-    let absolute = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir().ok()?.join(path)
-    };
-
-    absolute.is_file().then_some(absolute)
-}
-
-fn push_unique(paths: &mut Vec<String>, path: String) {
+fn push_unique(paths: &mut Vec<OsString>, path: OsString) {
     if !paths.contains(&path) {
         paths.push(path);
     }
@@ -453,6 +474,10 @@ mod tests {
         std::fs::write(path, []).expect("create temp file");
     }
 
+    fn path_os(path: &Path) -> OsString {
+        path.as_os_str().to_os_string()
+    }
+
     #[cfg(unix)]
     fn write_executable(path: &Path, body: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -465,16 +490,74 @@ mod tests {
         std::fs::set_permissions(path, permissions).expect("chmod executable");
     }
 
+    #[cfg(not(unix))]
+    fn write_executable(path: &Path, body: &str) {
+        std::fs::write(path, body).expect("write executable");
+    }
+
     #[test]
     fn daemon_bin_prefers_override() {
         assert_eq!(
             daemon_bin_candidates_from_sources(
-                Some("/custom/cued".into()),
+                Some(OsString::from("/custom/cued")),
                 Some(PathBuf::from("/bin/cue")),
                 Some(PathBuf::from("./target/debug/cue"))
             ),
-            vec!["/custom/cued".to_string()]
+            vec![OsString::from("/custom/cued")]
         );
+    }
+
+    #[test]
+    fn daemon_bin_override_does_not_require_current_exe() {
+        let candidates = daemon_bin_candidates_from_runtime_sources(
+            Some(OsString::from("/custom/cued")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "current executable disappeared",
+            )),
+            || panic!("argv0 should not be consulted when CUE_DAEMON_BIN is set"),
+        )
+        .expect("explicit daemon override should be enough");
+
+        assert_eq!(candidates, vec![OsString::from("/custom/cued")]);
+    }
+
+    #[test]
+    fn daemon_bin_reports_current_exe_failure_without_override() {
+        let error = daemon_bin_candidates_from_runtime_sources(
+            None,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "current executable disappeared",
+            )),
+            || panic!("argv0 should not hide current_exe failures"),
+        )
+        .expect_err("current_exe errors should not fall through to argv0 or implicit lookup");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("resolve current executable path"));
+        assert!(message.contains("current executable disappeared"));
+    }
+
+    #[test]
+    fn daemon_bin_runtime_lookup_uses_argv0_after_current_exe_has_no_companion() {
+        let current_dir = make_temp_bin_dir();
+        let argv0_dir = make_temp_bin_dir();
+        let current_cue = current_dir.join("cue");
+        let argv0_cue = argv0_dir.join("cue");
+        let argv0_cued = argv0_dir.join("cued");
+        touch(&current_cue);
+        touch(&argv0_cue);
+        write_executable(&argv0_cued, "#!/bin/sh\n");
+
+        let candidates = daemon_bin_candidates_from_runtime_sources(None, Ok(current_cue), || {
+            Ok(Some(argv0_cue))
+        })
+        .expect("argv0 daemon lookup should succeed");
+
+        assert_eq!(candidates, vec![path_os(&argv0_cued)]);
+        std::fs::remove_dir_all(current_dir).expect("remove current temp bin dir");
+        std::fs::remove_dir_all(argv0_dir).expect("remove argv0 temp bin dir");
     }
 
     #[test]
@@ -483,11 +566,11 @@ mod tests {
         let cue = dir.join("cue");
         let cued = dir.join("cued");
         touch(&cue);
-        touch(&cued);
+        write_executable(&cued, "#!/bin/sh\n");
 
         assert_eq!(
             daemon_bin_candidates_from_sources(None, Some(cue), None),
-            vec![cued.display().to_string(), "cued".to_string()]
+            vec![path_os(&cued)]
         );
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
@@ -499,11 +582,11 @@ mod tests {
         let cue = dir.join("cue");
         let cued = dir.join("cued");
         touch(&cue);
-        touch(&cued);
+        write_executable(&cued, "#!/bin/sh\n");
 
         assert_eq!(
             daemon_bin_candidates_from_sources(None, None, Some(cue)),
-            vec![cued.display().to_string(), "cued".to_string()]
+            vec![path_os(&cued)]
         );
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
@@ -517,22 +600,45 @@ mod tests {
         let cue = deps.join("cue-123");
         let cued = dir.join("cued");
         touch(&cue);
-        touch(&cued);
+        write_executable(&cued, "#!/bin/sh\n");
 
         assert_eq!(
             daemon_bin_candidates_from_sources(None, Some(cue), None),
-            vec![cued.display().to_string(), "cued".to_string()]
+            vec![path_os(&cued)]
         );
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
     }
 
     #[test]
-    fn daemon_bin_falls_back_to_path_lookup() {
+    fn daemon_bin_without_companion_has_no_implicit_path_lookup() {
         assert_eq!(
             daemon_bin_candidates_from_sources(None, None, None),
-            vec!["cued".to_string()]
+            Vec::<OsString>::new()
         );
+    }
+
+    #[test]
+    fn local_start_without_candidates_reports_required_companion_or_override() {
+        let dir = make_temp_bin_dir();
+        let socket = dir.join("custom.sock");
+
+        let error = start_local_daemon_with_candidates(&[], &socket)
+            .expect_err("missing daemon candidates should fail loudly");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("no cued executable was able to start"),
+            "{message}"
+        );
+        assert!(
+            message.contains("first-party `cued` companion"),
+            "{message}"
+        );
+        assert!(message.contains("CUE_DAEMON_BIN"), "{message}");
+        assert!(message.contains(&socket.display().to_string()), "{message}");
+
+        std::fs::remove_dir_all(dir).expect("remove temp bin dir");
     }
 
     #[test]
@@ -568,7 +674,7 @@ mod tests {
         );
         let socket = dir.join("custom.sock");
 
-        let error = restart_local_daemon_with_candidates(&[cued.display().to_string()], &socket)
+        let error = restart_local_daemon_with_candidates(&[path_os(&cued)], &socket)
             .expect_err("restart should fail");
         let message = format!("{error:#}");
 
@@ -595,7 +701,7 @@ mod tests {
         );
         let socket = dir.join("custom.sock");
 
-        let error = start_local_daemon_with_candidates(&[cued.display().to_string()], &socket)
+        let error = start_local_daemon_with_candidates(&[path_os(&cued)], &socket)
             .expect_err("start should fail");
         let message = format!("{error:#}");
 
@@ -606,6 +712,39 @@ mod tests {
         assert!(message.contains("exit status: 8"), "{message}");
         assert!(message.contains("stderr: start failed"), "{message}");
         assert!(message.contains("stdout: start note"), "{message}");
+        assert!(message.contains(&socket.display().to_string()), "{message}");
+
+        std::fs::remove_dir_all(dir).expect("remove temp bin dir");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn required_daemon_start_failure_returns_process_output() {
+        let dir = make_temp_bin_dir();
+        let cued = dir.join("cued");
+        write_executable(
+            &cued,
+            "#!/bin/sh\necho required start failed >&2\necho required start note\nexit 9\n",
+        );
+        let socket = dir.join("required.sock");
+
+        let error = match require_daemon_running_with_candidates(&socket, &[path_os(&cued)]).await {
+            Ok(_) => panic!("required daemon startup should fail loudly"),
+            Err(error) => error,
+        };
+        let message = format!("{error:#}");
+
+        assert!(message.contains("auto-start cued for"), "{message}");
+        assert!(
+            message.contains("no cued executable was able to start"),
+            "{message}"
+        );
+        assert!(message.contains("exit status: 9"), "{message}");
+        assert!(
+            message.contains("stderr: required start failed"),
+            "{message}"
+        );
+        assert!(message.contains("stdout: required start note"), "{message}");
         assert!(message.contains(&socket.display().to_string()), "{message}");
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
@@ -624,9 +763,7 @@ mod tests {
             ),
         );
 
-        assert!(local_cued_disk_version_matches_cue(&[cued
-            .display()
-            .to_string()]));
+        assert!(local_cued_disk_version_matches_cue(&[path_os(&cued)]));
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
     }
@@ -642,13 +779,14 @@ mod tests {
         );
 
         assert!(!local_cued_disk_version_matches_cue(&[
-            dir.join("missing").display().to_string(),
-            stale.display().to_string(),
+            path_os(&dir.join("missing")),
+            path_os(&stale),
         ]));
 
         std::fs::remove_dir_all(dir).expect("remove temp bin dir");
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn remote_restart_command_prefers_cued_restart() {
         assert_eq!(
@@ -662,6 +800,15 @@ mod tests {
         assert_eq!(
             remote_restart_command("custom-wrapper"),
             "custom-wrapper -F"
+        );
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn remote_restart_invocation_renders_actual_ssh_command() {
+        assert_eq!(
+            remote_restart_invocation("dev box", "cued restart --socket /tmp/cued.sock"),
+            "ssh 'dev box' 'cued restart --socket /tmp/cued.sock'"
         );
     }
 }

@@ -1,6 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-pub fn command_in_path(program: &str) -> bool {
+#[cfg(any(feature = "script", feature = "tui"))]
+pub(crate) fn command_in_path(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
@@ -8,7 +9,8 @@ pub fn command_in_path(program: &str) -> bool {
     find_executable_in_paths(program, std::env::split_paths(&path)).is_some()
 }
 
-pub fn find_executable_on_path(program: &str) -> Option<PathBuf> {
+#[cfg(feature = "extensions")]
+pub(crate) fn find_executable_on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     find_executable_in_paths(program, std::env::split_paths(&path))
 }
@@ -20,27 +22,14 @@ fn find_executable_in_paths(
     paths
         .into_iter()
         .map(|dir| dir.join(program))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
+        .find(|candidate| crate::companion_binary::is_executable_file(candidate))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);

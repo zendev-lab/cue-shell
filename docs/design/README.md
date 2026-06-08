@@ -77,7 +77,7 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
-execution behavior. They override `server.toml` defaults. Only launcher-style
+execution behavior. They override `daemon.toml` defaults. Only launcher-style
 commands support mode params: `:run` and `:cron`; supported keys are declared
 per command so unsupported keys fail during parsing instead of being ignored.
 

@@ -168,7 +168,7 @@ CREATE TABLE crons (
     id          TEXT PRIMARY KEY,   -- C1, C2, ...
     schedule    TEXT NOT NULL,
     command     TEXT NOT NULL,      -- raw command / chain text
-    enabled     INTEGER NOT NULL DEFAULT 1, -- legacy mirror of runnable state
+    enabled     INTEGER NOT NULL DEFAULT 1, -- persisted runnable state
     scope_hash  BLOB,
     status      TEXT,               -- scheduled / paused / completed / expired
     created_at  TEXT NOT NULL
@@ -187,7 +187,7 @@ CREATE TABLE jobs_history (
     exit_code    INTEGER
 );
 
--- Config overrides (mode param defaults from server.toml, cached)
+-- Config overrides (mode param defaults from daemon.toml, cached)
 CREATE TABLE config_cache (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -213,15 +213,19 @@ $XDG_STATE_HOME/cue-shell/    # default: ~/.local/state/cue-shell/
 
 $XDG_CONFIG_HOME/cue-shell/   # default: ~/.config/cue-shell/
   client.toml                  # client transport/profile and CLI extensions
-  server.toml                  # daemon runtime configuration
-  config.toml                  # legacy combined configuration fallback
+  daemon.toml                  # daemon runtime configuration
 ```
 
-macOS fallback: `$XDG_*` vars respected if set, otherwise:
-- `$XDG_DATA_HOME` → `~/.local/share`
-- `$XDG_CONFIG_HOME` → `~/.config`
-- `$XDG_STATE_HOME` → `~/.local/state`
+Fallbacks:
+- `$XDG_DATA_HOME` → `$HOME/.local/share`
+- `$XDG_CONFIG_HOME` → `$HOME/.config`
+- `$XDG_STATE_HOME` → `$HOME/.local/state`
 - `$XDG_RUNTIME_DIR` → `$TMPDIR` or `/tmp`
+
+Persistent directories require either the relevant `$XDG_*` variable or `$HOME`;
+they do not silently fall back to `/tmp`. The runtime directory is process
+lifetime state, so it may use the system temp directory when `$XDG_RUNTIME_DIR`
+is absent.
 
 ## 6. Startup Sequence
 

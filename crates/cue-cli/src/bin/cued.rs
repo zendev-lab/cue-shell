@@ -1,3 +1,3 @@
 fn main() {
-    cue_daemon::cli::run();
+    std::process::exit(cue_daemon::run_cli());
 }

@@ -11,31 +11,31 @@
 //! ```
 
 mod cron_schedule;
-pub mod event_bus;
-pub mod gateway;
-pub mod process_mgr;
-pub mod scheduler;
-pub mod scope_store;
+mod event_bus;
+pub(crate) mod gateway;
+mod process_mgr;
+mod scheduler;
+mod scope_store;
 mod script_record;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-use cue_core::ipc::{EventPayload, OkPayload, ResponsePayload, ScopeInfo};
+use cue_core::ipc::{EventPayload, ResponsePayload, ScopeInfo};
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{EventChannel, ScopeHash};
 
-use crate::parser::resolver::ResolvedCommand;
+use crate::parser::ResolvedCommand;
 
 /// Default bounded channel capacity for actor mailboxes.
-pub const ACTOR_CHANNEL_CAP: usize = 256;
+pub(crate) const ACTOR_CHANNEL_CAP: usize = 256;
 
 /// Per-client event channel capacity.
-pub const CLIENT_EVENT_CAP: usize = 64;
+pub(crate) const CLIENT_EVENT_CAP: usize = 64;
 
 #[derive(Clone, Debug)]
-pub struct ProcessJobOptions {
+pub(crate) struct ProcessJobOptions {
     /// Override the scope's cwd for this specific invocation.
     pub cwd_override: Option<std::path::PathBuf>,
     /// Whether the wrapper binary should be prepended to each segment.
@@ -50,7 +50,7 @@ pub struct ProcessJobOptions {
 // ── Per-actor message types ──
 
 /// Messages handled by the Gateway actor.
-pub enum GatewayMsg {
+pub(crate) enum GatewayMsg {
     /// Deliver a response to a specific client.
     SendResponse {
         client_id: u64,
@@ -67,7 +67,7 @@ pub enum GatewayMsg {
 }
 
 /// Messages handled by the Scheduler actor.
-pub enum SchedulerMsg {
+pub(crate) enum SchedulerMsg {
     /// Evaluate a resolved command on behalf of a client.
     Eval {
         client_id: u64,
@@ -84,7 +84,7 @@ pub enum SchedulerMsg {
 }
 
 /// Messages handled by the ProcessManager actor.
-pub enum ProcessMgrMsg {
+pub(crate) enum ProcessMgrMsg {
     /// Spawn a child process, pipeline, or job-local expression for the given job.
     SpawnJob {
         job_id: cue_core::JobId,
@@ -144,7 +144,7 @@ pub enum ProcessMgrMsg {
 }
 
 /// Snapshot of a job output stream, as returned by `ProcessMgrMsg::GetOutput`.
-pub struct OutputSnapshot {
+pub(crate) struct OutputSnapshot {
     /// Captured bytes (tail of the ring buffer, or empty).
     pub data: Vec<u8>,
     /// True when older bytes were omitted by ring-buffer overflow or tail limit.
@@ -152,7 +152,7 @@ pub struct OutputSnapshot {
 }
 
 /// Snapshot of a job's stderr, as returned by `ProcessMgrMsg::GetStderr`.
-pub struct StderrSnapshot {
+pub(crate) struct StderrSnapshot {
     /// True when the job used a PTY (stdout and stderr are merged).
     pub pty_merged: bool,
     /// Captured bytes (tail of the ring buffer, or empty).
@@ -162,7 +162,7 @@ pub struct StderrSnapshot {
 }
 
 /// Messages handled by the ScopeStore actor.
-pub enum ScopeStoreMsg {
+pub(crate) enum ScopeStoreMsg {
     /// Get the current HEAD scope hash.
     GetHead {
         reply: tokio::sync::oneshot::Sender<ScopeHash>,
@@ -175,11 +175,6 @@ pub enum ScopeStoreMsg {
     /// Get the current HEAD snapshot.
     GetHeadSnapshot {
         reply: tokio::sync::oneshot::Sender<Result<EnvSnapshot>>,
-    },
-    /// Create a root scope from a full snapshot.
-    CreateRoot {
-        snapshot: EnvSnapshot,
-        reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
     },
     /// Fork a child scope from the current HEAD.
     Fork {
@@ -201,7 +196,7 @@ pub enum ScopeStoreMsg {
 }
 
 /// Messages handled by the EventBus actor.
-pub enum EventBusMsg {
+pub(crate) enum EventBusMsg {
     /// Register a client for a channel.
     Subscribe {
         client_id: u64,
@@ -285,23 +280,23 @@ pub(crate) async fn send_gateway_event(
 
 /// Holds all actor sender handles.  Cheaply cloneable.
 #[derive(Clone)]
-pub struct ActorSystem {
-    pub gateway: mpsc::Sender<GatewayMsg>,
-    pub scheduler: mpsc::Sender<SchedulerMsg>,
-    pub process_mgr: mpsc::Sender<ProcessMgrMsg>,
-    pub scope_store: mpsc::Sender<ScopeStoreMsg>,
-    pub event_bus: mpsc::Sender<EventBusMsg>,
-    pub config: crate::config::Config,
+pub(crate) struct ActorSystem {
+    gateway: mpsc::Sender<GatewayMsg>,
+    scheduler: mpsc::Sender<SchedulerMsg>,
+    process_mgr: mpsc::Sender<ProcessMgrMsg>,
+    scope_store: mpsc::Sender<ScopeStoreMsg>,
+    event_bus: mpsc::Sender<EventBusMsg>,
+    config: crate::config::Config,
 }
 
 impl ActorSystem {
     /// Send `Shutdown` to every actor.
-    pub async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         self.shutdown_with_reason("shutdown requested").await;
     }
 
     /// Notify clients about shutdown, then send `Shutdown` to every actor.
-    pub async fn shutdown_with_reason(&self, reason: impl Into<String>) {
+    pub(crate) async fn shutdown_with_reason(&self, reason: impl Into<String>) {
         publish_event(
             "actor_system",
             &self.event_bus,
@@ -326,7 +321,7 @@ async fn send_shutdown<T>(actor: &'static str, sender: &mpsc::Sender<T>, message
 }
 
 /// Spawn all five actors, returning the [`ActorSystem`] handle bundle.
-pub async fn spawn_all(
+pub(crate) async fn spawn_all(
     socket_path: std::path::PathBuf,
     scope_db: rusqlite::Connection,
     scheduler_db: rusqlite::Connection,
@@ -364,11 +359,6 @@ pub async fn spawn_all(
     }
 
     Ok(sys)
-}
-
-/// Helper to build a success response.
-pub fn ok_response(payload: OkPayload) -> ResponsePayload {
-    ResponsePayload::Ok(payload)
 }
 
 #[cfg(test)]

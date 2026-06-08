@@ -107,7 +107,7 @@ pub enum ModeParamValueKind {
     Bool,
 }
 
-pub const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
+const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
     ModeParamSpec {
         name: "cwd",
         commands: &["run", "cron"],

@@ -8,15 +8,26 @@
 //!   → Resolver   → validated, ready for execution
 //! ```
 
-pub mod ast;
+mod ast;
 mod duration;
-pub mod parse;
-pub mod resolver;
-pub mod token;
-pub mod tokenizer;
+mod parse;
+mod resolver;
+mod token;
+mod tokenizer;
 
-pub use ast::Ast;
-pub use parse::Parser;
-pub use resolver::Resolver;
-pub use token::Token;
-pub use tokenizer::Tokenizer;
+use cue_core::mode::Mode;
+
+pub(crate) use parse::ParseError;
+pub(crate) use resolver::{ResolvedCommand, ResolvedScriptItem};
+pub(crate) use token::Token;
+pub(crate) use tokenizer::Tokenizer;
+
+pub(crate) fn parse_command(input: &str, mode: Mode) -> Result<ResolvedCommand, ParseError> {
+    let ast = parse::Parser::parse(input)?;
+    resolver::Resolver::resolve(ast, mode)
+}
+
+pub(crate) fn parse_file_script_command(input: &str) -> Result<ResolvedCommand, ParseError> {
+    let ast = parse::Parser::parse_file_script(input)?;
+    resolver::Resolver::resolve(ast, Mode::Job)
+}

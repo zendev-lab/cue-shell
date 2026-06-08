@@ -115,14 +115,13 @@ fn next_crontab_occurrence(
     now: DateTime<Local>,
     expr: &CrontabSchedule,
 ) -> Option<DateTime<Local>> {
-    let matcher = expr.matcher();
     let mut candidate = now.with_second(0)?.with_nanosecond(0)? + ChronoDuration::minutes(1);
     for _ in 0..CRONTAB_LOOKAHEAD_MINUTES {
         let weekday = match candidate.weekday() {
             chrono::Weekday::Sun => 0,
             other => other.number_from_monday(),
         };
-        if matcher.matches(
+        if expr.matches(
             candidate.minute(),
             candidate.hour(),
             candidate.day(),

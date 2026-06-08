@@ -19,7 +19,7 @@ use crate::app::AppMsg;
 
 /// Visual status of a card, determines border color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CardStatus {
+pub(crate) enum CardStatus {
     Success,
     Error,
     Pending,
@@ -39,23 +39,23 @@ impl CardStatus {
 
 /// A single REPL card: one command + its output.
 #[derive(Debug, Clone)]
-pub struct Card {
+pub(crate) struct Card {
     /// Which mode this card belongs to.
-    pub mode: Mode,
+    pub(crate) mode: Mode,
     /// What the user typed.
-    pub input: String,
+    pub(crate) input: String,
     /// Response / accumulated output.
-    pub output: String,
+    pub(crate) output: String,
     /// Current status.
-    pub status: CardStatus,
+    pub(crate) status: CardStatus,
     /// Optional short ID label (e.g. "J1").
-    pub label: Option<String>,
+    pub(crate) label: Option<String>,
     /// Optional chain step label (e.g. "chain:CH1/1/3").
-    pub chain_label: Option<String>,
+    pub(crate) chain_label: Option<String>,
 }
 
 impl Card {
-    pub fn new(input: String, mode: Mode) -> Self {
+    pub(crate) fn new(input: String, mode: Mode) -> Self {
         Self {
             mode,
             input,
@@ -77,36 +77,28 @@ impl Card {
 // ── Component messages ──
 
 /// Messages local to the main view.
-pub enum MainViewMsg {
+pub(crate) enum MainViewMsg {
     /// Switch the active mode so empty-state guidance can mention the prompt mode.
     SetMode(Mode),
-    /// Append a new card for a submitted command.
-    PushCard(Card),
     /// Update the latest card's output (streaming).
     AppendOutput { data: String },
-    /// Replace the latest card's output.
-    SetLatestOutput(String),
-    /// Set the latest card's status.
-    SetLatestStatus(CardStatus),
-    /// Set the latest card's label.
-    SetLatestLabel(String),
     /// Set a specific card's chain step label.
     SetCardChainLabel { index: usize, label: String },
 }
 
 // ── MainView ──
 
-pub struct MainView {
+pub(crate) struct MainView {
     /// Active input mode.
-    pub mode: Mode,
+    pub(crate) mode: Mode,
     /// All cards, oldest first.
-    pub cards: Vec<Card>,
+    pub(crate) cards: Vec<Card>,
     /// Scroll offset (0 = bottom, i.e. show newest).
-    pub scroll_offset: usize,
+    pub(crate) scroll_offset: usize,
 }
 
 impl MainView {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             mode: Mode::default(),
             cards: Vec::new(),
@@ -114,54 +106,48 @@ impl MainView {
         }
     }
 
-    pub fn push_card(&mut self, input: String, mode: Mode) -> usize {
+    pub(crate) fn push_card(&mut self, input: String, mode: Mode) -> usize {
         self.cards.push(Card::new(input, mode));
         self.scroll_offset = 0;
         self.cards.len() - 1
     }
 
-    pub fn set_card_output(&mut self, index: usize, data: String) {
+    pub(crate) fn set_card_output(&mut self, index: usize, data: String) {
         if let Some(card) = self.cards.get_mut(index) {
             card.output = data;
         }
     }
 
-    pub fn append_card_output(&mut self, index: usize, data: &str) {
+    pub(crate) fn append_card_output(&mut self, index: usize, data: &str) {
         if let Some(card) = self.cards.get_mut(index) {
             card.output.push_str(data);
         }
     }
 
-    pub fn set_card_status(&mut self, index: usize, status: CardStatus) {
+    pub(crate) fn set_card_status(&mut self, index: usize, status: CardStatus) {
         if let Some(card) = self.cards.get_mut(index) {
             card.status = status;
         }
     }
 
-    pub fn set_card_label(&mut self, index: usize, label: String) {
+    pub(crate) fn set_card_label(&mut self, index: usize, label: String) {
         if let Some(card) = self.cards.get_mut(index) {
             card.label = Some(label);
         }
     }
 
-    pub fn set_card_chain_label(&mut self, index: usize, label: String) {
+    pub(crate) fn set_card_chain_label(&mut self, index: usize, label: String) {
         if let Some(card) = self.cards.get_mut(index) {
             card.chain_label = Some(label);
         }
     }
 
-    pub fn clear_all(&mut self) {
+    pub(crate) fn clear_all(&mut self) {
         self.cards.clear();
         self.scroll_offset = 0;
     }
 
-    pub fn scroll_to_card(&mut self, index: usize) {
-        if index < self.cards.len() {
-            self.scroll_offset = self.cards.len().saturating_sub(index + 1);
-        }
-    }
-
-    pub fn card_at_point(&self, area: Rect, point: Rect) -> Option<usize> {
+    pub(crate) fn card_at_point(&self, area: Rect, point: Rect) -> Option<usize> {
         if !crate::app::contains(area, point) {
             return None;
         }
@@ -215,29 +201,10 @@ impl Component for MainView {
     fn update(&mut self, msg: MainViewMsg) {
         match msg {
             MainViewMsg::SetMode(mode) => self.mode = mode,
-            MainViewMsg::PushCard(card) => {
-                self.cards.push(card);
-                self.scroll_offset = 0; // auto-scroll to bottom
-            }
             MainViewMsg::AppendOutput { data } => {
                 if let Some(card) = self.latest_visible_card_mut() {
                     card.output.push_str(&data);
                     card.status = CardStatus::Streaming;
-                }
-            }
-            MainViewMsg::SetLatestOutput(data) => {
-                if let Some(card) = self.latest_visible_card_mut() {
-                    card.output = data;
-                }
-            }
-            MainViewMsg::SetLatestStatus(status) => {
-                if let Some(card) = self.latest_visible_card_mut() {
-                    card.status = status;
-                }
-            }
-            MainViewMsg::SetLatestLabel(label) => {
-                if let Some(card) = self.latest_visible_card_mut() {
-                    card.label = Some(label);
                 }
             }
             MainViewMsg::SetCardChainLabel { index, label } => {
@@ -326,7 +293,7 @@ impl Component for MainView {
 }
 
 /// Format a chain step label string, e.g. `chain:CH1/1/3`.
-pub fn chain_step_label(chain_id: &str, step_index: usize, total: usize) -> String {
+pub(crate) fn chain_step_label(chain_id: &str, step_index: usize, total: usize) -> String {
     format!("chain:{}/{}/{}", chain_id, step_index + 1, total)
 }
 

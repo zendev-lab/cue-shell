@@ -231,7 +231,7 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 
 ### Job / Script 历史裁剪
 
-`server.toml` 增加：
+`daemon.toml` 增加：
 
 ```toml
 [retention]
@@ -266,7 +266,7 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 - `()` 紧跟命令名 = 模式参数（执行行为配置）
 - `()` 出现在其他位置 = chain 分组括号
 - Tokenizer 根据**位置规则**消歧（前一个 token 是 Command → 模式参数）
-- 模式参数可在 `server.toml`（迁移期仍兼容旧 `config.toml`）中设置默认值，调用时覆盖
+- 模式参数可在 `daemon.toml` 中设置默认值，调用时覆盖
 
 ### 支持模式参数的命令
 

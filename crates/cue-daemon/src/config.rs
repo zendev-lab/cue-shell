@@ -3,20 +3,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use toml::Value;
 
 use crate::dirs;
 
-const SERVER_CONFIG_FILE: &str = "server.toml";
-const LEGACY_CONFIG_FILE: &str = "config.toml";
-
+const DAEMON_CONFIG_FILE: &str = "daemon.toml";
+const DAEMON_ROOT_SECTIONS: &[&str] = &["aliases", "block", "retention", "warn", "weft", "wrapper"];
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub block: BlockConfig,
     #[serde(default)]
-    pub aliases: AliasConfig,
+    pub warn: WarnConfig,
     #[serde(default)]
-    pub bash_compat: BashCompatConfig,
+    pub aliases: AliasConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
@@ -105,68 +105,145 @@ fn token_spans(input: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-/// Forbidden argument patterns for specific commands.
+const DEFAULT_GIT_NO_VERIFY_HINT: &str = "Run the commit normally; if hooks fail, inspect and fix the hook/check or ask before any alternative.";
+
+/// Hard command guardrails.
 ///
-/// Configured in `server.toml`:
+/// Configured in `daemon.toml`:
 ///
 /// ```toml
 /// [block.commands]
-/// git = ["--no-verify", "--force"]
+/// sh = "Avoid shell wrappers."
 ///
-/// [block.warn_commands]
+/// [block.commands.git]
+/// "--no-verify" = "Run the commit normally, then fix hook failures."
+///
+/// [warn.commands]
 /// rm = "Careful: this removes files"
 /// ```
+///
+/// Command keys match the exact basename of argv[0].  Argument rules match
+/// each argv token independently using literal strings; they are not glob or
+/// regex patterns.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockConfig {
-    /// Map from command name → list of forbidden argument substrings.
-    #[serde(default)]
-    pub commands: BTreeMap<String, Vec<String>>,
+    /// Map from command name → whole-command or argument-level block rule.
+    #[serde(default = "default_block_commands")]
+    pub commands: BTreeMap<String, BlockCommandRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum BlockCommandRule {
+    /// Block the command whenever argv[0]'s basename matches the map key.
+    WholeCommand(String),
+    /// Block when any single argv token matches one of these literal patterns.
+    Args(BTreeMap<String, String>),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WarnConfig {
     /// Map from command name → advisory warning hint.
     #[serde(default)]
-    pub warn_commands: BTreeMap<String, String>,
+    pub commands: BTreeMap<String, String>,
+}
+
+fn blocked_arg_matches(arg: &str, pattern: &str) -> bool {
+    arg == pattern || arg.starts_with(&format!("{pattern}="))
+}
+
+fn default_block_commands() -> BTreeMap<String, BlockCommandRule> {
+    let mut commands = BTreeMap::new();
+    commands.insert(
+        "git".into(),
+        BlockCommandRule::Args(BTreeMap::from([(
+            "--no-verify".into(),
+            DEFAULT_GIT_NO_VERIFY_HINT.into(),
+        )])),
+    );
+    commands
 }
 
 impl Default for BlockConfig {
     fn default() -> Self {
-        let mut commands = BTreeMap::new();
-        commands.insert("git".into(), vec!["--no-verify".into()]);
-        let warn_commands = BTreeMap::new();
         Self {
-            commands,
-            warn_commands,
+            commands: default_block_commands(),
         }
     }
 }
 
 impl BlockConfig {
-    /// Check whether `command_line` is blocked.  Returns `None` if allowed,
-    /// `Some(BlockDecision::Block(reason))` if blocked,
-    /// `Some(BlockDecision::Warn(hint))` if the command should warn before running.
-    pub fn check(&self, command_line: &[String]) -> Option<BlockDecision> {
-        let cmd_name = command_line.first()?;
-        let base = std::path::Path::new(cmd_name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(cmd_name);
-
-        // Check warn-commands first (whole-command match).
-        if let Some(hint) = self.warn_commands.get(base) {
-            return Some(BlockDecision::Warn(hint.clone()));
-        }
-
-        // Check blocked arguments.
-        let forbidden = self.commands.get(base)?;
-        for arg in &command_line[1..] {
-            for pattern in forbidden {
-                if arg == pattern || arg.starts_with(&format!("{pattern}=")) {
-                    return Some(BlockDecision::Block(format!(
-                        "blocked: `{cmd_name} {pattern}` is forbidden by server config\n  (see [block.commands] in server.toml)"
-                    )));
+    fn ensure_defaults(&mut self) {
+        for (command, default_rule) in default_block_commands() {
+            match (self.commands.get_mut(&command), default_rule) {
+                (Some(BlockCommandRule::Args(rules)), BlockCommandRule::Args(defaults)) => {
+                    for (pattern, hint) in defaults {
+                        rules.entry(pattern).or_insert(hint);
+                    }
                 }
+                (Some(BlockCommandRule::WholeCommand(_)), _) => {}
+                (None, rule) => {
+                    self.commands.insert(command, rule);
+                }
+                _ => {}
             }
         }
-        None
     }
+
+    fn check(&self, command_line: &[String]) -> Option<BlockDecision> {
+        let cmd_name = command_line.first()?;
+        let base = command_base(cmd_name);
+
+        match self.commands.get(base)? {
+            BlockCommandRule::WholeCommand(hint) => Some(BlockDecision::Block(
+                self.command_block_reason(cmd_name, hint),
+            )),
+            BlockCommandRule::Args(rules) => {
+                for arg in &command_line[1..] {
+                    if let Some((pattern, hint)) = rules
+                        .iter()
+                        .find(|(pattern, _)| blocked_arg_matches(arg, pattern))
+                    {
+                        return Some(BlockDecision::Block(
+                            self.arg_block_reason(cmd_name, pattern, hint),
+                        ));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn command_block_reason(&self, cmd_name: &str, hint: &str) -> String {
+        format!(
+            "blocked: `{cmd_name}` is forbidden by daemon config\n  hint: {hint}\n  (see [block.commands] in daemon.toml)"
+        )
+    }
+
+    fn arg_block_reason(&self, cmd_name: &str, pattern: &str, hint: &str) -> String {
+        format!(
+            "blocked: `{cmd_name} {pattern}` is forbidden by daemon config\n  hint: {hint}\n  (see [block.commands] in daemon.toml)"
+        )
+    }
+}
+
+impl WarnConfig {
+    fn check(&self, command_line: &[String]) -> Option<BlockDecision> {
+        let cmd_name = command_line.first()?;
+        let base = command_base(cmd_name);
+        self.commands
+            .get(base)
+            .map(|hint| BlockDecision::Warn(hint.clone()))
+    }
+}
+
+fn command_base(cmd_name: &str) -> &str {
+    std::path::Path::new(cmd_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(cmd_name)
 }
 
 #[derive(Debug, Clone)]
@@ -175,30 +252,8 @@ pub enum BlockDecision {
     Warn(String),
 }
 
-/// Deprecated bash compatibility transform configuration.
-///
-/// `&&` and `||` are now first-class job-local operators, so this option is
-/// kept only for config compatibility and intentionally performs no rewrite.
-///
-/// ```toml
-/// [bash_compat]
-/// enabled = true
-/// ```
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct BashCompatConfig {
-    #[serde(default)]
-    pub enabled: bool,
-}
-
-impl BashCompatConfig {
-    /// Apply bash compatibility transformations to the input string.
-    pub fn apply(&self, input: &str) -> String {
-        let _ = self.enabled;
-        input.to_string()
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
     #[serde(default = "default_max_job_history")]
     pub max_job_history: usize,
@@ -225,57 +280,66 @@ fn default_max_script_runs() -> usize {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let config_dir = dirs::config_dir();
-        let server_path = config_dir.join(SERVER_CONFIG_FILE);
-        let legacy_path = config_dir.join(LEGACY_CONFIG_FILE);
-        Self::load_from_sources(
-            read_source(&server_path)?
+        let config_dir = dirs::config_dir()?;
+        let daemon_path = config_dir.join(DAEMON_CONFIG_FILE);
+        Self::load_from_source(
+            read_source(&daemon_path)?
                 .as_deref()
-                .map(|text| (server_path.as_path(), text)),
-            read_source(&legacy_path)?
-                .as_deref()
-                .map(|text| (legacy_path.as_path(), text)),
+                .map(|text| (daemon_path.as_path(), text)),
         )
     }
 
-    fn load_from_sources(
-        server: Option<(&Path, &str)>,
-        legacy: Option<(&Path, &str)>,
-    ) -> Result<Self> {
-        if let Some((path, text)) = server {
-            return Self::parse(text, path);
-        }
-        if let Some((path, text)) = legacy {
+    fn load_from_source(daemon: Option<(&Path, &str)>) -> Result<Self> {
+        if let Some((path, text)) = daemon {
             return Self::parse(text, path);
         }
         Ok(Self::default())
     }
 
     fn parse(text: &str, path: &Path) -> Result<Self> {
-        reject_legacy_wrapper_denylist(text, path)?;
-        toml::from_str(text).with_context(|| format!("parse config {}", path.display()))
+        validate_root_config_shape(text, path)?;
+        let mut config: Self =
+            toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
+        config.block.ensure_defaults();
+        config.validate(path)?;
+        Ok(config)
+    }
+
+    fn validate(&self, path: &Path) -> Result<()> {
+        self.wrapper.validate(path)
+    }
+
+    /// Check whether `command_line` is blocked or should warn before running.
+    /// Hard block rules take precedence over advisory warnings.
+    pub fn check_command_guardrail(&self, command_line: &[String]) -> Option<BlockDecision> {
+        self.block
+            .check(command_line)
+            .or_else(|| self.warn.check(command_line))
     }
 }
 
-fn reject_legacy_wrapper_denylist(text: &str, path: &Path) -> Result<()> {
-    let value: toml::Value =
+fn validate_root_config_shape(text: &str, path: &Path) -> Result<()> {
+    let value: Value =
         toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
-    let has_legacy_denylist = value
-        .get("wrapper")
-        .and_then(toml::Value::as_table)
-        .is_some_and(|wrapper| wrapper.contains_key("denylist"));
+    let Some(root) = value.as_table() else {
+        bail!("config {} must be a TOML table", path.display());
+    };
 
-    if has_legacy_denylist {
-        bail!(
-            "legacy [wrapper.denylist] in {} is no longer supported; wrapper targeting is now allowlist-only. Replace it with [wrapper.allowlist] commands = [...]. Automatic migration is unsafe because the old denylist wrapped every non-denied command.",
-            path.display()
-        );
+    for section in root.keys() {
+        if !DAEMON_ROOT_SECTIONS.contains(&section.as_str()) {
+            bail!(
+                "unknown top-level daemon config section `{section}` in {}; expected daemon sections [{}]",
+                path.display(),
+                DAEMON_ROOT_SECTIONS.join(", ")
+            );
+        }
     }
 
     Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WeftConfig {
     #[serde(default = "default_weft_socket_path")]
     pub socket_path: PathBuf,
@@ -303,6 +367,7 @@ fn default_weft_socket_path() -> PathBuf {
 /// command basename is explicitly present in `allowlist.commands`. The wrapper
 /// is **idempotent**: if the program already matches `binary`, it is skipped.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WrapperConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -323,6 +388,22 @@ impl Default for WrapperConfig {
 }
 
 impl WrapperConfig {
+    fn validate(&self, path: &Path) -> Result<()> {
+        if self.binary.trim() != self.binary {
+            bail!(
+                "wrapper.binary in {} must not have leading or trailing whitespace",
+                path.display()
+            );
+        }
+        if self.enabled && self.binary.is_empty() {
+            bail!(
+                "wrapper.enabled is true in {} but wrapper.binary is empty",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
     /// Determine whether the wrapper should be applied for a given program.
     pub fn should_wrap(
         &self,
@@ -331,7 +412,8 @@ impl WrapperConfig {
         override_enabled: Option<bool>,
     ) -> bool {
         let enabled = override_enabled.unwrap_or(self.enabled);
-        if !enabled || is_foreground {
+        if !enabled || is_foreground || self.binary.is_empty() || self.binary.trim() != self.binary
+        {
             return false;
         }
         let base = std::path::Path::new(program)
@@ -353,6 +435,7 @@ impl WrapperConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WrapperAllowlist {
     #[serde(default)]
     pub commands: Vec<String>,
@@ -398,54 +481,99 @@ mod tests {
     }
 
     #[test]
-    fn server_toml_takes_precedence_over_legacy_config_toml() {
-        let config = Config::load_from_sources(
-            Some((
-                Path::new("server.toml"),
-                r#"
-[weft]
-socket_path = "/tmp/server.sock"
-"#,
-            )),
-            Some((
-                Path::new("config.toml"),
-                r#"
-[weft]
-socket_path = "/tmp/legacy.sock"
-"#,
-            )),
-        )
-        .expect("load config");
-
-        assert_eq!(config.weft.socket_path, PathBuf::from("/tmp/server.sock"));
-    }
-
-    #[test]
-    fn legacy_config_toml_still_loads_weft_config() {
-        let config = Config::load_from_sources(
-            None,
-            Some((
-                Path::new("config.toml"),
-                r#"
-[weft]
-socket_path = "/tmp/legacy.sock"
-"#,
-            )),
-        )
-        .expect("load config");
-
-        assert_eq!(config.weft.socket_path, PathBuf::from("/tmp/legacy.sock"));
-    }
-
-    #[test]
     fn invalid_config_is_not_silently_defaulted() {
-        let error = Config::load_from_sources(
-            Some((Path::new("server.toml"), "[weft]\nsocket_path = [")),
-            None,
-        )
-        .expect_err("invalid config should fail");
+        let error =
+            Config::load_from_source(Some((Path::new("daemon.toml"), "[weft]\nsocket_path = [")))
+                .expect_err("invalid config should fail");
 
-        assert!(error.to_string().contains("parse config server.toml"));
+        assert!(error.to_string().contains("parse config daemon.toml"));
+    }
+
+    #[test]
+    fn daemon_config_rejects_unknown_fields_inside_fixed_sections() {
+        for (section, config, expected) in [
+            (
+                "block",
+                r#"
+[block]
+commandz = {}
+"#,
+                "unknown field `commandz`",
+            ),
+            (
+                "retention",
+                r#"
+[retention]
+max_jobs = 10
+"#,
+                "unknown field `max_jobs`",
+            ),
+            (
+                "weft",
+                r#"
+[weft]
+socket = "/tmp/weft.sock"
+"#,
+                "unknown field `socket`",
+            ),
+            (
+                "warn",
+                r#"
+[warn]
+commandz = {}
+"#,
+                "unknown field `commandz`",
+            ),
+            (
+                "wrapper",
+                r#"
+[wrapper]
+program = "rtk"
+"#,
+                "unknown field `program`",
+            ),
+            (
+                "wrapper.allowlist",
+                r#"
+[wrapper.allowlist]
+command = ["git"]
+"#,
+                "unknown field `command`",
+            ),
+        ] {
+            let error = match Config::load_from_source(Some((Path::new("daemon.toml"), config))) {
+                Ok(_) => panic!("unknown {section} field should fail"),
+                Err(error) => error,
+            };
+
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("parse config daemon.toml"),
+                "missing parse context for {section}: {message}"
+            );
+            assert!(
+                message.contains(expected),
+                "wrong error for {section}: expected {expected:?}, got {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_config_rejects_unknown_top_level_sections() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[wefft]
+socket_path = "/tmp/typo.sock"
+"#,
+        )))
+        .expect_err("unknown top-level daemon sections should fail before defaults apply");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("unknown top-level daemon config section `wefft`"));
+        assert!(message.contains("daemon.toml"));
+        assert!(message.contains("weft"));
+        assert!(!message.contains("transport"));
     }
 
     #[test]
@@ -508,18 +636,15 @@ git = "alt-git"
     }
 
     #[test]
-    fn alias_parsed_from_server_toml() {
-        let config = Config::load_from_sources(
-            Some((
-                Path::new("server.toml"),
-                r#"
+    fn alias_parsed_from_daemon_toml() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
 [aliases]
 "git clone" = "ein clone"
 pip = "uv pip"
 "#,
-            )),
-            None,
-        )
+        )))
         .expect("load config");
         assert_eq!(
             config.aliases.apply("git clone https://example.com"),
@@ -533,37 +658,17 @@ pip = "uv pip"
 
     #[test]
     fn parses_weft_socket_path() {
-        let config = Config::load_from_sources(
-            Some((
-                Path::new("server.toml"),
-                r#"
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
 [weft]
 socket_path = "/var/run/weft.sock"
 "#,
-            )),
-            None,
-        )
+        )))
         .expect("load config");
 
         assert_eq!(config.weft.socket_path, PathBuf::from("/var/run/weft.sock"));
     }
-
-    #[test]
-    fn bash_compat_no_longer_rewrites_job_logical_operators() {
-        let compat = BashCompatConfig { enabled: true };
-        assert_eq!(compat.apply("a && b || c"), "a && b || c");
-    }
-
-    #[test]
-    fn bash_compat_preserves_utf8_input() {
-        let compat = BashCompatConfig { enabled: true };
-        assert_eq!(
-            compat.apply("echo café/路径 && pwd"),
-            "echo café/路径 && pwd"
-        );
-    }
-
-    // ── WrapperConfig ──
 
     #[test]
     fn wrapper_default_disabled() {
@@ -597,6 +702,53 @@ socket_path = "/var/run/weft.sock"
     }
 
     #[test]
+    fn wrapper_empty_binary_wraps_nothing_even_when_overridden_on() {
+        let cfg = WrapperConfig {
+            enabled: false,
+            binary: String::new(),
+            allowlist: WrapperAllowlist {
+                commands: vec!["git".into()],
+            },
+        };
+
+        assert!(!cfg.should_wrap("git", false, Some(true)));
+    }
+
+    #[test]
+    fn wrapper_enabled_requires_non_empty_binary() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[wrapper]
+enabled = true
+
+[wrapper.allowlist]
+commands = ["git"]
+"#,
+        )))
+        .expect_err("enabled wrapper without binary should fail config loading");
+
+        assert!(error.to_string().contains("wrapper.binary is empty"));
+    }
+
+    #[test]
+    fn wrapper_binary_rejects_leading_or_trailing_whitespace() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[wrapper]
+enabled = false
+binary = " rtk"
+"#,
+        )))
+        .expect_err("padded wrapper binary should fail config loading");
+
+        assert!(error.to_string().contains(
+            "wrapper.binary in daemon.toml must not have leading or trailing whitespace"
+        ));
+    }
+
+    #[test]
     fn wrapper_idempotent_already_wrapped() {
         let cfg = WrapperConfig {
             enabled: true,
@@ -622,11 +774,10 @@ socket_path = "/var/run/weft.sock"
     }
 
     #[test]
-    fn wrapper_parsed_from_server_toml() {
-        let config = Config::load_from_sources(
-            Some((
-                Path::new("server.toml"),
-                r#"
+    fn wrapper_parsed_from_daemon_toml() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
 [wrapper]
 enabled = true
 binary = "rtk"
@@ -634,9 +785,7 @@ binary = "rtk"
 [wrapper.allowlist]
 commands = ["git", "cargo"]
 "#,
-            )),
-            None,
-        )
+        )))
         .expect("load config");
         assert!(config.wrapper.enabled);
         assert_eq!(config.wrapper.binary, "rtk");
@@ -644,110 +793,254 @@ commands = ["git", "cargo"]
     }
 
     #[test]
-    fn legacy_wrapper_denylist_reports_migration_error() {
-        let error = Config::load_from_sources(
-            Some((
-                Path::new("server.toml"),
-                r#"
-[wrapper]
-enabled = true
-binary = "rtk"
-
-[wrapper.denylist]
-commands = ["vim", "ssh"]
-"#,
-            )),
-            None,
-        )
-        .expect_err("legacy denylist should fail fast");
-
-        let message = error.to_string();
-        assert!(message.contains("legacy [wrapper.denylist]"));
-        assert!(message.contains("[wrapper.allowlist]"));
-    }
-
-    #[test]
     fn wrapper_absent_config_is_default() {
-        let config = Config::load_from_sources(
-            Some((
-                Path::new("server.toml"),
-                r#"
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
 [aliases]
 pip = "uv pip"
 "#,
-            )),
-            None,
-        )
+        )))
         .expect("load config");
         assert!(!config.wrapper.enabled);
     }
 
     #[test]
-    fn block_config_default_blocks_git_no_verify() {
+    fn block_config_default_blocks_git_no_verify_with_hint() {
         let config = Config::default();
+        let decision = config
+            .check_command_guardrail(&["git".into(), "commit".into(), "--no-verify".into()])
+            .expect("git --no-verify should be blocked by default");
+        match decision {
+            BlockDecision::Block(message) => {
+                assert!(message.contains("git --no-verify"));
+                assert!(message.contains("hint:"));
+                assert!(message.contains("Run the commit normally"));
+            }
+            BlockDecision::Warn(_) => panic!("expected block decision"),
+        }
         assert!(
             config
-                .block
-                .check(&["git".into(), "commit".into(), "--no-verify".into()])
-                .is_some()
+                .check_command_guardrail(&["git".into(), "push".into()])
+                .is_none()
         );
-        assert!(config.block.check(&["git".into(), "push".into()]).is_none());
-        assert!(config.block.check(&["cd".into(), "/tmp".into()]).is_none());
+        assert!(
+            config
+                .check_command_guardrail(&["cd".into(), "/tmp".into()])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn block_config_partial_warn_table_keeps_default_block_commands() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[warn.commands]
+sh = "Use direct-exec instead."
+"#,
+        )))
+        .expect("load config");
+
+        assert!(
+            matches!(
+                config.check_command_guardrail(&[
+                    "git".into(),
+                    "commit".into(),
+                    "--no-verify".into()
+                ]),
+                Some(BlockDecision::Block(_))
+            ),
+            "configuring only warn.commands must not erase default block.commands"
+        );
+        assert!(matches!(
+            config.check_command_guardrail(&["sh".into(), "-lc".into(), "echo hi".into()]),
+            Some(BlockDecision::Warn(_))
+        ));
+    }
+
+    #[test]
+    fn block_config_whole_command_matches_exact_basename() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[block.commands]
+sh = "Avoid shell wrappers."
+"#,
+        )))
+        .expect("load config");
+
+        for command in ["sh", "/bin/sh"] {
+            let decision = config
+                .check_command_guardrail(&[command.into(), "-c".into(), "echo hi".into()])
+                .expect("sh command should be blocked");
+            match decision {
+                BlockDecision::Block(message) => {
+                    assert!(message.contains(command));
+                    assert!(message.contains("Avoid shell wrappers."));
+                }
+                BlockDecision::Warn(_) => panic!("expected block decision"),
+            }
+        }
+
+        for command in ["zsh", "/bin/zsh", "shellcheck"] {
+            assert!(
+                config
+                    .check_command_guardrail(&[command.into(), "-c".into(), "echo hi".into()])
+                    .is_none(),
+                "{command} must not match the literal sh command rule"
+            );
+        }
+    }
+
+    #[test]
+    fn block_config_argument_rules_match_each_token_literally() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[block.commands.npm]
+"--force" = "Use normal install."
+"install --unsafe-peer-deps" = "This phrase is not matched across argv tokens."
+"#,
+        )))
+        .expect("load config");
+
+        assert!(matches!(
+            config.check_command_guardrail(&["npm".into(), "install".into(), "--force".into()]),
+            Some(BlockDecision::Block(_))
+        ));
+        assert!(matches!(
+            config.check_command_guardrail(&[
+                "npm".into(),
+                "install".into(),
+                "--force=true".into()
+            ]),
+            Some(BlockDecision::Block(_))
+        ));
+        assert!(
+            config
+                .check_command_guardrail(&[
+                    "npm".into(),
+                    "install".into(),
+                    "--unsafe-peer-deps".into()
+                ])
+                .is_none(),
+            "argument patterns must not match across joined argv tokens"
+        );
+    }
+
+    #[test]
+    fn block_config_custom_commands_keep_default_git_no_verify() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[block.commands.npm]
+"--force" = "Use normal install."
+"#,
+        )))
+        .expect("load config");
+
+        assert!(matches!(
+            config.check_command_guardrail(&["git".into(), "commit".into(), "--no-verify".into()]),
+            Some(BlockDecision::Block(_))
+        ));
+        assert!(matches!(
+            config.check_command_guardrail(&["npm".into(), "install".into(), "--force".into()]),
+            Some(BlockDecision::Block(_))
+        ));
+    }
+
+    #[test]
+    fn block_config_prefers_block_over_warning_for_same_command() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[block.commands.git]
+"--no-verify" = "Run the commit normally."
+
+[warn.commands]
+git = "Review git command before running."
+"#,
+        )))
+        .expect("load config");
+
+        let git_no_verify = config
+            .check_command_guardrail(&["git".into(), "commit".into(), "--no-verify".into()])
+            .expect("git --no-verify should be blocked");
+        match git_no_verify {
+            BlockDecision::Block(message) => {
+                assert!(message.contains("hint:"));
+                assert!(message.contains("Run the commit normally"));
+            }
+            BlockDecision::Warn(_) => panic!("expected block decision"),
+        }
+        assert!(matches!(
+            config.check_command_guardrail(&["git".into(), "status".into()]),
+            Some(BlockDecision::Warn(_))
+        ));
     }
 
     #[test]
     fn block_config_parses_and_checks() {
-        let config = Config::load_from_sources(
-            Some((
-                Path::new("server.toml"),
-                r#"
-[block.commands]
-git = ["--no-verify"]
-npm = ["--force", "--legacy-peer-deps"]
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[block.commands.git]
+"--no-verify" = "Run the commit normally."
+
+[block.commands.npm]
+"--force" = "Use the lockfile and normal install path instead."
+"--unsafe-peer-deps" = "Use the package manager's normal dependency resolution."
 "#,
-            )),
-            None,
-        )
+        )))
         .expect("load config");
 
         // Blocked patterns
         assert!(
             config
-                .block
-                .check(&["git".into(), "push".into(), "--no-verify".into()])
+                .check_command_guardrail(&["git".into(), "push".into(), "--no-verify".into()])
                 .is_some()
         );
         assert!(
             config
-                .block
-                .check(&["git".into(), "commit".into(), "--no-verify".into()])
+                .check_command_guardrail(&["git".into(), "commit".into(), "--no-verify".into()])
                 .is_some()
         );
-        assert!(
-            config
-                .block
-                .check(&["npm".into(), "install".into(), "--force".into()])
-                .is_some()
-        );
+        let npm_force = config
+            .check_command_guardrail(&["npm".into(), "install".into(), "--force".into()])
+            .expect("npm --force should be blocked");
+        match npm_force {
+            BlockDecision::Block(message) => {
+                assert!(message.contains("npm --force"));
+                assert!(message.contains("Use the lockfile and normal install path instead."));
+            }
+            BlockDecision::Warn(_) => panic!("expected block decision"),
+        }
 
         // Allowed patterns
-        assert!(config.block.check(&["git".into(), "push".into()]).is_none());
         assert!(
             config
-                .block
-                .check(&["git".into(), "commit".into(), "-m".into(), "fix".into()])
+                .check_command_guardrail(&["git".into(), "push".into()])
                 .is_none()
         );
         assert!(
             config
-                .block
-                .check(&["npm".into(), "install".into()])
+                .check_command_guardrail(&[
+                    "git".into(),
+                    "commit".into(),
+                    "-m".into(),
+                    "fix".into()
+                ])
                 .is_none()
         );
         assert!(
             config
-                .block
-                .check(&["cargo".into(), "test".into()])
+                .check_command_guardrail(&["npm".into(), "install".into()])
+                .is_none()
+        );
+        assert!(
+            config
+                .check_command_guardrail(&["cargo".into(), "test".into()])
                 .is_none()
         );
     }

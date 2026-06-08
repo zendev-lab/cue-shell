@@ -187,8 +187,8 @@ Command names and flags: [`commands-and-modes.md`](commands-and-modes.md).
 |--------|------|
 | `log` | Historical / event introspection |
 
-**Naming**: when bash-compat mode is off, repeating a `cue_` prefix usually adds
-noise — the builtin name already names the category operation.
+**Naming**: repeating a `cue_` prefix usually adds noise — the builtin name
+already names the category operation.
 
 ---
 

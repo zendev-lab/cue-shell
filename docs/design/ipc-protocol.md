@@ -3,7 +3,7 @@
 ## 1. Transport
 
 - **Unix domain socket**: `$XDG_RUNTIME_DIR/cue-shell/cued.sock`
-- Fallback: `$HOME/.cue-shell/cued.sock`
+- Runtime fallback: `$TMPDIR/cue-shell/cued.sock` (or the OS temp directory)
 - Single bidirectional connection per client
 - `cued gateway --stdio` relays the exact same byte stream over stdin/stdout for SSH-style remote clients
 - Phase-1 remote support uses the system OpenSSH client and a client profile with
@@ -51,7 +51,7 @@ enum Message {
 {"type": "response", "id": 1, "payload": {"Err": {"code": "INVALID_SYNTAX", "message": "cue chain operator `|?|` must be surrounded by whitespace"}}}
 
 // Request: RunScript (file-script body loaded by cue-cli)
-{"type": "request", "id": 4, "payload": {"RunScript": {"path": "scripts/build.cue", "input": "cargo test\ncargo fmt -> cargo clippy", "mode": "Job"}}}
+{"type": "request", "id": 4, "payload": {"RunScript": {"path": "scripts/build.cue", "input": "cargo test\ncargo fmt -> cargo clippy"}}}
 
 // Response (success — file script submission created)
 {"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "source": {"kind": "file", "path": "scripts/build.cue"}, "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
@@ -69,8 +69,8 @@ enum Message {
 {"type": "event", "payload": {"ChainProgress": {"chain": {"id": "CH1", "pipeline": "cargo test -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo test", "status": "Done", "job_id": "J1", "start_scope": "S@32b17bec", "end_scope": "S@32b17bec", "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Running", "job_id": "J2", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}]}}}}
 
 // Request: Complete (editor service)
-{"type": "request", "id": 3, "payload": {"Complete": {"input": ":ru", "cursor": 3, "mode": "Job"}}}
-{"type": "response", "id": 3, "payload": {"Ok": {"CompletionList": {"items": [{"label": "run", "insert_text": "run", "kind": "Command", "detail": "Run a command as a job"}]}}}}
+{"type": "request", "id": 3, "payload": {"Complete": {"input": ":ru", "cursor": 3}}}
+{"type": "response", "id": 3, "payload": {"Ok": {"CompletionList": {"items": [{"label": ":run", "insert_text": ":run", "kind": "Command", "detail": "Run a command as a job"}]}}}}
 ```
 
 ## 4. Communication Model
@@ -139,10 +139,10 @@ enum RequestPayload {
     //        or bare input "cargo test" (cued applies mode default)
     // mode: current TUI mode (JOB/CRON) for bare input resolution
 
-    RunScript { path: String, input: String, mode: Mode },
+    RunScript { path: String, input: String },
     // path: user-facing .cue file path, used as script source metadata
     // input: file contents already loaded by cue-cli
-    // mode: default mode used for bare items inside the file
+    // bare items are resolved by cued with JOB-mode semantics
 
     // === Protocol commands (structured, not user-typed) ===
 
@@ -157,7 +157,7 @@ enum RequestPayload {
     FgResize { cols: u16, rows: u16 },  // terminal resize
 
     // Editor services (completion & highlighting)
-    Complete { input: String, cursor: usize, mode: Mode },
+    Complete { input: String, cursor: usize },
     Highlight { input: String },
 
     // Typed query/control APIs for non-interactive clients. These mirror common
@@ -227,7 +227,7 @@ enum OkPayload {
     HighlightResult { spans: Vec<HighlightSpan> },
 
     FgAttached { id: String },  // J<n> = live PTY attach
-    Pong { version: Option<String> },  // `version` reports cued's build version; `None` from older daemons
+    Pong { version: String },  // reports cued's build version
 }
 
 struct PageInfo {

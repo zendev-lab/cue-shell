@@ -145,7 +145,7 @@ JOB  J:3 (1 running)  A:1  C:2  cued:ok  mouse:ui  14:30
 
 - `clear` 只有在当前没有 pending request 时才高亮可用
 - `copy` 会把当前前台 / 活动 display 内容写到终端 clipboard（OSC52）
-- `targets` 以 toggle 方式打开/关闭 frontend-local 的 target/profile 设置页，列出 `client.toml`（或 legacy `config.toml` fallback）里的 transport profiles；选择后会写回 `transport.default_profile`，并在**下次启动 cue** 时生效；若当前只读到了 legacy `config.toml`，保存时会创建/更新 `client.toml`
+- `targets` 以 toggle 方式打开/关闭 frontend-local 的 target/profile 设置页，列出 `client.toml` 里的 transport profiles；选择后会写回 `transport.default_profile`，可 live reconnect 的目标会提示按 `R` 立即重连，否则在下次 reconnect/restart 时生效
 - `mouse` 在 `ui` / `text` 两种模式间切换；`text` 让终端原生选中复制更顺手
 - header action pills 支持鼠标点击
 

@@ -30,15 +30,8 @@ impl RingBuffer {
     }
 
     /// Number of bytes currently stored.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    /// Whether the buffer is empty.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     /// Append `bytes` to the buffer.  If the incoming slice exceeds capacity,
@@ -172,7 +165,7 @@ mod tests {
     #[test]
     fn empty_buffer() {
         let rb = RingBuffer::new(8);
-        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
         assert_eq!(rb.as_bytes(), b"");
         assert_eq!(rb.tail(5), b"");
     }
@@ -192,6 +185,6 @@ mod tests {
     fn default_capacity() {
         let rb = RingBuffer::default();
         assert_eq!(rb.capacity, DEFAULT_CAPACITY);
-        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
     }
 }

@@ -25,7 +25,7 @@ use crate::app::{AppState, FocusArea};
 use crate::component::Component;
 
 /// Render the entire TUI into the current frame.
-pub fn draw(frame: &mut Frame, state: &AppState) {
+pub(crate) fn draw(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
     if state.fg_active() {
         let vertical = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);

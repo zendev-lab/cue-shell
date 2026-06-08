@@ -10,7 +10,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioCommand};
 use tokio::task::JoinHandle;
 
-use crate::{ClientConnector, CuedClient, ResolvedTransport};
+use crate::client::CuedClient;
+use crate::reconnect::ClientConnector;
+use crate::transport_config::ResolvedTransport;
 
 /// Build a reusable connector for an already-resolved transport profile.
 pub fn transport_connector(transport: &ResolvedTransport) -> ClientConnector {
@@ -32,10 +34,8 @@ pub fn transport_connector(transport: &ResolvedTransport) -> ClientConnector {
 
 /// Connect to a remote daemon through `ssh <destination> <gateway_command>`.
 ///
-/// The returned version is the remote daemon's optional `Pong.version` field.
-pub async fn connect_ssh_transport(
-    transport: &ResolvedTransport,
-) -> Result<(CuedClient, Option<String>)> {
+/// The returned version is the remote daemon's `Pong.version` field.
+pub async fn connect_ssh_transport(transport: &ResolvedTransport) -> Result<(CuedClient, String)> {
     let ResolvedTransport::Ssh {
         profile_name,
         destination,
@@ -63,7 +63,7 @@ pub async fn connect_ssh_transport(
     }
 }
 
-pub fn ssh_invocation(destination: &str, remote_command: &str) -> String {
+pub(crate) fn ssh_invocation(destination: &str, remote_command: &str) -> String {
     format!(
         "ssh {} {}",
         shell_quote(destination),

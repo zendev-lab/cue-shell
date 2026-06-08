@@ -4,17 +4,13 @@
 //! which pattern-matches on [`AppMsg`] and delegates to components.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use cue_core::command_spec::command_names;
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     ChainInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload,
@@ -26,7 +22,8 @@ use cue_core::{EventChannel, JobId, Mode};
 use ratatui::layout::{Constraint, Layout, Rect};
 use tui_term::vt100;
 
-use crate::client::{ReconnectCmd, RestartHandle, WriterHandle};
+use crate::client::{ConnectionController, RestartHandle, WriterHandle};
+use crate::completion::{bare_completion_candidates, builtin_command_candidates};
 use crate::component::Component;
 use crate::component::input_line::{InputLine, InputMsg};
 use crate::component::main_view::{Card, CardStatus, MainView, MainViewMsg, chain_step_label};
@@ -41,27 +38,27 @@ use crate::target_config::{
 
 /// Which panel currently owns keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocusArea {
+pub(crate) enum FocusArea {
     Input,
     MainView,
     Sidebar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MouseMode {
+pub(crate) enum MouseMode {
     TextSelect,
     UiCapture,
 }
 
 impl MouseMode {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::TextSelect => "text",
             Self::UiCapture => "ui",
         }
     }
 
-    pub fn capture_enabled(self) -> bool {
+    pub(crate) fn capture_enabled(self) -> bool {
         matches!(self, Self::UiCapture)
     }
 
@@ -76,8 +73,7 @@ impl MouseMode {
 // ── App-level message ──
 
 /// All events that can mutate [`AppState`].
-#[allow(clippy::large_enum_variant)]
-pub enum AppMsg {
+pub(crate) enum AppMsg {
     // Raw terminal events
     KeyEvent(KeyEvent),
     MouseEvent(MouseEvent),
@@ -104,6 +100,7 @@ pub enum AppMsg {
     ServerEvent(EventPayload),
 
     // System
+    FatalError { message: String },
     Tick,
     Quit,
 }
@@ -350,18 +347,18 @@ struct UiRegions {
 // ── App state ──
 
 /// Root application state.  Owns all component state and connection info.
-pub struct AppState {
+pub(crate) struct AppState {
     // Components
-    pub input: InputLine,
-    pub main_view: MainView,
-    pub sidebar: Sidebar,
-    pub status_bar: StatusBar,
+    pub(crate) input: InputLine,
+    pub(crate) main_view: MainView,
+    pub(crate) sidebar: Sidebar,
+    pub(crate) status_bar: StatusBar,
 
     // Connection
-    pub writer: Option<WriterHandle>,
-    pub connected: bool,
-    /// Sender for live reconnect / target-switch commands.
-    reconnect_tx: Option<tokio::sync::mpsc::Sender<ReconnectCmd>>,
+    pub(crate) writer: Option<WriterHandle>,
+    pub(crate) connected: bool,
+    /// Controller for live reconnect / target-switch commands.
+    connection_controller: Option<ConnectionController>,
     restart_handle: Option<RestartHandle>,
     /// Profile name we are reconnecting to; set when the user triggers a live
     /// reconnect, cleared and applied to `session_profile_name` on success.
@@ -376,6 +373,7 @@ pub struct AppState {
     chain_cards: HashMap<String, usize>,
     /// Maps script_id → card_index for script summary cards.
     script_cards: HashMap<String, usize>,
+    pending_script_finishes: HashMap<String, (ScriptRunStatus, i32, Option<usize>)>,
     fg_session: Option<FgSession>,
     display_tabs: Vec<DisplayTab>,
     active_display_tab: Option<usize>,
@@ -388,18 +386,18 @@ pub struct AppState {
     session_profile_name: Option<String>,
 
     // UI state
-    pub mode: Mode,
+    pub(crate) mode: Mode,
     /// `None` = auto (show when width ≥ 100), `Some` = manual override.
-    pub show_sidebar: Option<bool>,
-    pub focus: FocusArea,
-    pub mouse_mode: MouseMode,
-    pub should_quit: bool,
-    pub terminal_width: u16,
-    pub terminal_height: u16,
+    pub(crate) show_sidebar: Option<bool>,
+    pub(crate) focus: FocusArea,
+    pub(crate) mouse_mode: MouseMode,
+    pub(crate) should_quit: bool,
+    pub(crate) terminal_width: u16,
+    pub(crate) terminal_height: u16,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut state = Self {
             input: InputLine::new(),
             main_view: MainView::new(),
@@ -407,7 +405,7 @@ impl AppState {
             status_bar: StatusBar::new(),
             writer: None,
             connected: false,
-            reconnect_tx: None,
+            connection_controller: None,
             restart_handle: None,
             pending_reconnect_profile_name: None,
             jobs: Vec::new(),
@@ -416,6 +414,7 @@ impl AppState {
             cron_job_cards: HashMap::new(),
             chain_cards: HashMap::new(),
             script_cards: HashMap::new(),
+            pending_script_finishes: HashMap::new(),
             fg_session: None,
             display_tabs: Vec::new(),
             active_display_tab: None,
@@ -437,52 +436,52 @@ impl AppState {
         state.set_focus(FocusArea::Input);
         state
             .status_bar
-            .update(StatusBarMsg::SetMouseMode(state.mouse_mode));
+            .update(StatusBarMsg::MouseMode(state.mouse_mode));
         state.refresh_clear_action();
         state
     }
 
-    pub fn set_session_profile_name(&mut self, session_profile_name: Option<String>) {
+    pub(crate) fn set_session_profile_name(&mut self, session_profile_name: Option<String>) {
         self.session_profile_name = session_profile_name;
     }
 
-    /// Store the control channel for the connection manager so the TUI can
-    /// trigger live target switches.
-    pub fn set_reconnect_tx(&mut self, tx: tokio::sync::mpsc::Sender<ReconnectCmd>) {
-        self.reconnect_tx = Some(tx);
+    /// Store the connection manager controller so the TUI can trigger live
+    /// target switches.
+    pub(crate) fn set_connection_controller(&mut self, controller: ConnectionController) {
+        self.connection_controller = Some(controller);
     }
 
-    pub fn set_restart_handle(&mut self, restart_handle: Option<RestartHandle>) {
+    pub(crate) fn set_restart_handle(&mut self, restart_handle: Option<RestartHandle>) {
         self.restart_handle = restart_handle;
     }
 
     /// Whether the sidebar should be visible for the current terminal width.
-    pub fn sidebar_visible(&self) -> bool {
+    pub(crate) fn sidebar_visible(&self) -> bool {
         match self.show_sidebar {
             Some(v) => v,
             None => self.terminal_width >= 100,
         }
     }
 
-    pub fn fg_active(&self) -> bool {
+    pub(crate) fn fg_active(&self) -> bool {
         self.fg_session.is_some()
     }
 
-    pub fn fg_id(&self) -> Option<&str> {
+    pub(crate) fn fg_id(&self) -> Option<&str> {
         self.fg_session.as_ref().map(|session| session.id.as_str())
     }
 
-    pub fn fg_screen(&self) -> Option<&vt100::Screen> {
+    pub(crate) fn fg_screen(&self) -> Option<&vt100::Screen> {
         let session = self.fg_session.as_ref()?;
         let FgSessionKind::Job { parser, .. } = &session.kind;
         Some(parser.screen())
     }
 
-    pub fn display_pane_title(&self) -> String {
+    pub(crate) fn display_pane_title(&self) -> String {
         " Display ".to_string()
     }
 
-    pub fn display_pane_content(&self) -> &str {
+    pub(crate) fn display_pane_content(&self) -> &str {
         self.active_display_tab
             .and_then(|index| self.display_tabs.get(index))
             .map(|tab| tab.content.as_str())
@@ -491,15 +490,15 @@ impl AppState {
             )
     }
 
-    pub fn display_pane_has_target(&self) -> bool {
+    pub(crate) fn display_pane_has_target(&self) -> bool {
         self.active_display_tab.is_some()
     }
 
-    pub fn target_settings_open(&self) -> bool {
+    pub(crate) fn target_settings_open(&self) -> bool {
         self.target_settings.is_some() || self.target_settings_error.is_some()
     }
 
-    pub fn target_settings_can_save(&self) -> bool {
+    pub(crate) fn target_settings_can_save(&self) -> bool {
         self.target_settings
             .as_ref()
             .and_then(|state| {
@@ -513,7 +512,7 @@ impl AppState {
             .is_some_and(target_profile_can_be_saved)
     }
 
-    pub fn footer_text(&self) -> String {
+    pub(crate) fn footer_text(&self) -> String {
         if self.job_picker_open() {
             return match self.mode {
                 Mode::Job => "Kill picker: Enter kill  •  Esc close".to_string(),
@@ -567,7 +566,7 @@ impl AppState {
         }
     }
 
-    pub fn display_tab_labels(&self) -> Vec<String> {
+    pub(crate) fn display_tab_labels(&self) -> Vec<String> {
         self.display_tabs
             .iter()
             .map(|tab| match &tab.target {
@@ -580,18 +579,17 @@ impl AppState {
             .collect()
     }
 
-    pub fn active_display_tab(&self) -> Option<usize> {
+    pub(crate) fn active_display_tab(&self) -> Option<usize> {
         self.active_display_tab
     }
 
     fn copy_target(&self) -> Option<CopyTarget> {
-        if let Some(job_id) = self.fg_id().filter(|_| self.fg_active()) {
+        if let Some(job_id) = self.fg_id().filter(|_| self.fg_active())
+            && let Some(screen) = self.fg_screen()
+        {
             return Some(CopyTarget {
                 label: format!("fg {job_id}"),
-                content: self
-                    .fg_screen()
-                    .map(|screen| screen.contents().to_string())
-                    .unwrap_or_default(),
+                content: screen.contents().to_string(),
             });
         }
 
@@ -627,36 +625,36 @@ impl AppState {
         })
     }
 
-    pub fn job_picker_open(&self) -> bool {
+    pub(crate) fn job_picker_open(&self) -> bool {
         self.job_picker.is_some()
     }
 
-    pub fn job_picker_selected(&self) -> Option<usize> {
+    pub(crate) fn job_picker_selected(&self) -> Option<usize> {
         self.job_picker.as_ref().and_then(|picker| picker.selected)
     }
 
-    pub fn job_picker_title(&self) -> &'static str {
+    pub(crate) fn job_picker_title(&self) -> &'static str {
         match self.mode {
             Mode::Job => "Running Jobs",
             Mode::Cron => "Crons",
         }
     }
 
-    pub fn job_picker_empty_text(&self) -> &'static str {
+    pub(crate) fn job_picker_empty_text(&self) -> &'static str {
         match self.mode {
             Mode::Job => "No running jobs.",
             Mode::Cron => "No crons.",
         }
     }
 
-    pub fn job_picker_submit_label(&self) -> &'static str {
+    pub(crate) fn job_picker_submit_label(&self) -> &'static str {
         match self.mode {
             Mode::Job => "kill",
             Mode::Cron => "remove",
         }
     }
 
-    pub fn job_picker_items(&self) -> Vec<(String, String, &'static str)> {
+    pub(crate) fn job_picker_items(&self) -> Vec<(String, String, &'static str)> {
         match self.mode {
             Mode::Job => self
                 .jobs
@@ -684,7 +682,7 @@ impl AppState {
         }
     }
 
-    pub fn target_settings_content(&self) -> Option<String> {
+    pub(crate) fn target_settings_content(&self) -> Option<String> {
         self.render_target_settings_content()
     }
 
@@ -710,15 +708,15 @@ impl AppState {
     fn sync_mode_views(&mut self) {
         self.input.update(InputMsg::SetMode(self.mode));
         self.main_view.update(MainViewMsg::SetMode(self.mode));
-        self.sidebar.update(SidebarMsg::SetMode(self.mode));
-        self.status_bar.update(StatusBarMsg::SetMode(self.mode));
+        self.sidebar.update(SidebarMsg::Mode(self.mode));
+        self.status_bar.update(StatusBarMsg::Mode(self.mode));
         self.sync_sidebar_items();
     }
 
     fn set_focus(&mut self, focus: FocusArea) {
         self.focus = focus;
         self.sidebar
-            .update(SidebarMsg::SetFocused(focus == FocusArea::Sidebar));
+            .update(SidebarMsg::Focused(focus == FocusArea::Sidebar));
     }
 
     fn layout_regions(&self) -> UiRegions {
@@ -784,7 +782,7 @@ impl AppState {
             Mode::Job => self.jobs.iter().rev().map(job_sidebar_item).collect(),
             Mode::Cron => self.crons.iter().rev().map(cron_sidebar_item).collect(),
         };
-        self.sidebar.update(SidebarMsg::SetItems(items));
+        self.sidebar.update(SidebarMsg::Items(items));
         self.refresh_overview();
     }
 
@@ -802,7 +800,7 @@ impl AppState {
     }
 
     fn refresh_clear_action(&mut self) {
-        self.status_bar.update(StatusBarMsg::SetClearEnabled(
+        self.status_bar.update(StatusBarMsg::ClearEnabled(
             self.pending_submissions.is_empty(),
         ));
     }
@@ -833,6 +831,52 @@ impl AppState {
         );
         self.main_view.set_card_status(card_index, status);
         card_index
+    }
+
+    fn record_script_finished(
+        &mut self,
+        script_id: String,
+        status: ScriptRunStatus,
+        exit_code: i32,
+        failed_item_index: Option<usize>,
+    ) {
+        if !self.apply_script_finished(&script_id, status, exit_code, failed_item_index)
+            && self.has_pending_user_submission()
+        {
+            self.pending_script_finishes
+                .insert(script_id, (status, exit_code, failed_item_index));
+        }
+    }
+
+    fn apply_script_finished(
+        &mut self,
+        script_id: &str,
+        status: ScriptRunStatus,
+        exit_code: i32,
+        failed_item_index: Option<usize>,
+    ) -> bool {
+        let Some(&card_index) = self.script_cards.get(script_id) else {
+            return false;
+        };
+        self.main_view.append_card_output(
+            card_index,
+            &format_script_finished(status, exit_code, failed_item_index),
+        );
+        self.main_view.set_card_status(
+            card_index,
+            if status == ScriptRunStatus::Done {
+                CardStatus::Success
+            } else {
+                CardStatus::Error
+            },
+        );
+        true
+    }
+
+    fn has_pending_user_submission(&self) -> bool {
+        self.pending_submissions
+            .values()
+            .any(PendingSubmission::is_user_visible)
     }
 
     fn desired_display_subscriptions(&self) -> BTreeSet<String> {
@@ -1340,7 +1384,7 @@ impl AppState {
             Ok(snapshot) => {
                 let source = display_path(&snapshot.source_path);
                 let selected_profile = snapshot.profiles.iter().find(|p| p.name == profile_name);
-                let can_live_reconnect = self.reconnect_tx.is_some()
+                let can_live_reconnect = self.connection_controller.is_some()
                     && selected_profile.is_some_and(target_profile_supports_live_reconnect);
                 let notice = if self.session_profile_name.as_deref() == Some(profile_name.as_str())
                 {
@@ -1348,11 +1392,7 @@ impl AppState {
                         "saved default profile `{profile_name}` to {source}; current session already uses it"
                     )
                 } else if let Some(current_session) = self.session_profile_name.as_deref() {
-                    if selected_profile.is_some_and(target_profile_is_ssh) {
-                        format!(
-                            "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}`. SSH applies after restart/reconnect because live reconnect is unsupported"
-                        )
-                    } else if can_live_reconnect {
+                    if can_live_reconnect {
                         format!(
                             "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}`. Press R to reconnect now"
                         )
@@ -1361,10 +1401,6 @@ impl AppState {
                             "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}` until reconnect/restart"
                         )
                     }
-                } else if selected_profile.is_some_and(target_profile_is_ssh) {
-                    format!(
-                        "saved default profile `{profile_name}` to {source}; SSH applies on the next restart/reconnect because live reconnect is unsupported"
-                    )
                 } else {
                     format!(
                         "saved default profile `{profile_name}` to {source}; reconnect/restart cue to apply"
@@ -1410,8 +1446,8 @@ impl AppState {
             }
         };
 
-        if let Some(ref tx) = self.reconnect_tx {
-            if tx.try_send(ReconnectCmd::SwitchTarget(connector)).is_err() {
+        if let Some(ref controller) = self.connection_controller {
+            if controller.switch_target(connector).is_err() {
                 if let Some(state) = self.target_settings.as_mut() {
                     state.notice = Some("reconnect command could not be sent; try again".into());
                     state.pending_reconnect_profile = None;
@@ -1927,8 +1963,13 @@ impl AppState {
 
     fn complete_input(&mut self) {
         let range = self.input.current_word_range();
-        let cursor = self.input.cursor.min(self.input.content.len());
-        let candidates = self.completion_candidates(cursor);
+        let candidates = match self.completion_candidates() {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                self.show_completion_error(error);
+                return;
+            }
+        };
         if candidates.is_empty() {
             return;
         }
@@ -1950,8 +1991,19 @@ impl AppState {
         self.input.replace_range(range, &replacement);
     }
 
-    fn completion_candidates(&self, cursor: usize) -> Vec<String> {
+    fn show_completion_error(&mut self, error: anyhow::Error) {
+        let card_index = self.main_view.push_card("completion".into(), self.mode);
+        self.main_view
+            .set_card_output(card_index, format!("Error [completion]: {error:#}"));
+        self.main_view
+            .set_card_status(card_index, CardStatus::Error);
+        self.main_view
+            .set_card_label(card_index, "completion".into());
+    }
+
+    fn completion_candidates(&self) -> anyhow::Result<Vec<String>> {
         let content = &self.input.content;
+        let cursor = self.input.cursor.min(content.len());
         let line_start = content[..cursor].rfind('\n').map_or(0, |idx| idx + 1);
         let line_prefix = &content[line_start..cursor];
         let trimmed = line_prefix.trim_start();
@@ -1963,11 +2015,11 @@ impl AppState {
 
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
         if tokens.is_empty() {
-            return builtin_command_candidates(word);
+            return Ok(builtin_command_candidates(word));
         }
 
         if word.starts_with(':') && tokens.len() <= 1 {
-            return builtin_command_candidates(word);
+            return Ok(builtin_command_candidates(word));
         }
 
         let command = tokens[0];
@@ -1998,14 +2050,19 @@ impl AppState {
             }
             _ => Vec::new(),
         };
-        ids.into_iter()
+        Ok(ids
+            .into_iter()
             .filter(|candidate| candidate.starts_with(word))
-            .collect()
+            .collect())
     }
 
     /// TEA update: apply a message to the state.
-    pub fn update(&mut self, msg: AppMsg) {
+    pub(crate) fn update(&mut self, msg: AppMsg) {
         match msg {
+            AppMsg::FatalError { .. } => {
+                self.should_quit = true;
+            }
+
             AppMsg::Quit => {
                 self.should_quit = true;
             }
@@ -2040,7 +2097,7 @@ impl AppState {
             AppMsg::ToggleMouseMode => {
                 self.mouse_mode = self.mouse_mode.toggle();
                 self.status_bar
-                    .update(StatusBarMsg::SetMouseMode(self.mouse_mode));
+                    .update(StatusBarMsg::MouseMode(self.mouse_mode));
             }
 
             AppMsg::CopyFocus => {
@@ -2054,6 +2111,7 @@ impl AppState {
                     self.job_cards.clear();
                     self.chain_cards.clear();
                     self.script_cards.clear();
+                    self.pending_script_finishes.clear();
                     self.refresh_clear_action();
                 }
             }
@@ -2134,7 +2192,7 @@ impl AppState {
 
             AppMsg::Connected => {
                 self.connected = true;
-                self.status_bar.update(StatusBarMsg::SetConnected(true));
+                self.status_bar.update(StatusBarMsg::Connected(true));
                 self.sync_mode_views();
                 self.subscribe_core_channels();
                 self.request_sidebar_snapshots();
@@ -2148,15 +2206,17 @@ impl AppState {
                 self.connected = false;
                 self.writer = None;
                 self.display_subscriptions.clear();
+                self.pending_script_finishes.clear();
                 self.close_job_picker();
-                self.status_bar.update(StatusBarMsg::SetConnected(false));
+                self.status_bar.update(StatusBarMsg::Connected(false));
             }
 
             AppMsg::ReconnectFailed { message } => {
                 self.connected = false;
                 self.writer = None;
                 self.display_subscriptions.clear();
-                self.status_bar.update(StatusBarMsg::SetConnected(false));
+                self.pending_script_finishes.clear();
+                self.status_bar.update(StatusBarMsg::Connected(false));
                 if let Some(state) = self.target_settings.as_mut() {
                     state.notice = Some(match self.pending_reconnect_profile_name.as_deref() {
                         Some(profile) => {
@@ -2170,7 +2230,7 @@ impl AppState {
             AppMsg::Reconnected { writer } => {
                 self.writer = Some(writer);
                 self.connected = true;
-                self.status_bar.update(StatusBarMsg::SetConnected(true));
+                self.status_bar.update(StatusBarMsg::Connected(true));
                 self.sync_mode_views();
                 self.subscribe_core_channels();
                 self.request_sidebar_snapshots();
@@ -2277,7 +2337,17 @@ impl AppState {
                                     },
                                     Some(script_id.clone()),
                                 );
-                                self.script_cards.insert(script_id, card_index);
+                                self.script_cards.insert(script_id.clone(), card_index);
+                                if let Some((status, exit_code, failed_item_index)) =
+                                    self.pending_script_finishes.remove(&script_id)
+                                {
+                                    self.apply_script_finished(
+                                        &script_id,
+                                        status,
+                                        exit_code,
+                                        failed_item_index,
+                                    );
+                                }
                             }
                         }
                         OkPayload::JobCreated {
@@ -2600,20 +2670,7 @@ impl AppState {
                     exit_code,
                     failed_item_index,
                 } => {
-                    if let Some(&card_index) = self.script_cards.get(&script_id) {
-                        self.main_view.append_card_output(
-                            card_index,
-                            &format_script_finished(status, exit_code, failed_item_index),
-                        );
-                        self.main_view.set_card_status(
-                            card_index,
-                            if status == ScriptRunStatus::Done {
-                                CardStatus::Success
-                            } else {
-                                CardStatus::Error
-                            },
-                        );
-                    }
+                    self.record_script_finished(script_id, status, exit_code, failed_item_index);
                 }
                 EventPayload::FgOutput { data } => {
                     self.append_fg_output(&data);
@@ -2636,7 +2693,8 @@ impl AppState {
                         data: format!("⚠ Daemon shutting down: {reason}"),
                     });
                     self.connected = false;
-                    self.status_bar.update(StatusBarMsg::SetConnected(false));
+                    self.pending_script_finishes.clear();
+                    self.status_bar.update(StatusBarMsg::Connected(false));
                 }
                 _ => {
                     tracing::debug!(?event, "unhandled server event");
@@ -2938,10 +2996,10 @@ impl AppState {
     }
 
     /// Propagate overview counts to the sidebar.
-    pub fn set_overview(&mut self, counts: OverviewCounts) {
+    pub(crate) fn set_overview(&mut self, counts: OverviewCounts) {
         self.status_bar
-            .update(StatusBarMsg::SetOverview(counts.clone()));
-        self.sidebar.update(SidebarMsg::SetOverview(counts));
+            .update(StatusBarMsg::Overview(counts.clone()));
+        self.sidebar.update(SidebarMsg::Overview(counts));
     }
 }
 
@@ -3363,15 +3421,7 @@ fn format_target_settings_view(
     session_profile_name: Option<&str>,
 ) -> TargetSettingsView {
     let mut lines = vec![
-        format!(
-            "source: {}{}",
-            display_path(&state.snapshot.source_path),
-            if state.snapshot.using_legacy_config {
-                " (legacy config fallback)"
-            } else {
-                ""
-            }
-        ),
+        format!("source: {}", display_path(&state.snapshot.source_path)),
         format!(
             "current session target: {}",
             session_profile_name.unwrap_or("n/a")
@@ -3448,7 +3498,6 @@ fn target_profile_alert(
     match profile.transport.as_str() {
         "missing" => Some("missing"),
         "invalid" => Some("invalid"),
-        "ssh" => Some("restart-only"),
         _ if profile.detail == "unrecognized transport kind" => Some("invalid"),
         _ => None,
     }
@@ -3465,14 +3514,10 @@ fn target_profile_source_tag(
     }
 }
 
-fn target_profile_is_ssh(profile: &crate::target_config::TargetProfileSummary) -> bool {
-    profile.transport == "ssh"
-}
-
 fn target_profile_supports_live_reconnect(
     profile: &crate::target_config::TargetProfileSummary,
 ) -> bool {
-    profile.transport == "unix"
+    profile.is_usable_target()
 }
 
 fn target_profile_can_be_saved(profile: &crate::target_config::TargetProfileSummary) -> bool {
@@ -3551,215 +3596,6 @@ fn card_status_for_chain(chain: &ChainInfo) -> CardStatus {
         return CardStatus::Success;
     }
     CardStatus::Pending
-}
-
-fn builtin_command_candidates(word: &str) -> Vec<String> {
-    let prefix = word.strip_prefix(':').unwrap_or(word);
-    command_names()
-        .chain(["restart"])
-        .filter(|command| command.starts_with(prefix))
-        .map(|command| format!(":{command}"))
-        .collect()
-}
-
-fn bare_completion_candidates(mode: Mode, line_prefix: &str, word: &str) -> Vec<String> {
-    match mode {
-        Mode::Job => shell_segment_completion_candidates(line_prefix, word),
-        Mode::Cron => cron_completion_candidates(line_prefix, word),
-    }
-}
-
-fn cron_completion_candidates(line_prefix: &str, word: &str) -> Vec<String> {
-    const KEYWORDS: &[&str] = &[
-        "every", "in", "at", "on", "daily", "hourly", "weekly", "monthly", "cron",
-    ];
-
-    if let Some(command_start) = cron_command_start(line_prefix) {
-        return shell_segment_completion_candidates(&line_prefix[command_start..], word);
-    }
-
-    KEYWORDS
-        .iter()
-        .filter(|keyword| keyword.starts_with(word))
-        .map(|keyword| keyword.to_string())
-        .collect()
-}
-
-fn cron_command_start(line_prefix: &str) -> Option<usize> {
-    let trimmed = line_prefix.trim_start();
-    let leading = line_prefix.len().saturating_sub(trimmed.len());
-    let tokens = token_spans(trimmed);
-    let first = tokens.first()?.0;
-
-    let start_after = match first {
-        "daily" | "hourly" | "weekly" | "monthly" => 1,
-        "every" | "in" => 2,
-        "cron" => 6,
-        "at" => {
-            if tokens.len() >= 4 && tokens.get(2).is_some_and(|token| token.0 == "on") {
-                4
-            } else {
-                2
-            }
-        }
-        "on" => {
-            if tokens.len() >= 4 && tokens.get(2).is_some_and(|token| token.0 == "at") {
-                4
-            } else {
-                2
-            }
-        }
-        _ => return None,
-    };
-
-    if tokens.len() < start_after {
-        return None;
-    }
-    let (_, _, end) = tokens[start_after - 1];
-    Some(leading + end + 1)
-}
-
-fn shell_segment_completion_candidates(line_prefix: &str, word: &str) -> Vec<String> {
-    let tokens = line_prefix.split_whitespace().collect::<Vec<_>>();
-    let segment_start = tokens
-        .iter()
-        .rposition(|token| is_chain_operator(token))
-        .map_or(0, |index| index + 1);
-    let segment_token_count = tokens.len().saturating_sub(segment_start);
-    let ends_with_whitespace = line_prefix.chars().last().is_some_and(char::is_whitespace);
-    let completing_command = if ends_with_whitespace {
-        line_prefix.trim().is_empty()
-            || tokens.last().is_some_and(|token| is_chain_operator(token))
-            || segment_token_count == 0
-    } else {
-        line_prefix.trim().is_empty() || segment_token_count <= 1
-    };
-
-    let mut candidates = path_completion_candidates(word);
-    if completing_command {
-        candidates.extend(command_completion_candidates(word));
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn is_chain_operator(token: &str) -> bool {
-    matches!(token, "->" | "~>" | "|||" | "|?|")
-}
-
-fn command_completion_candidates(prefix: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    if prefix.contains('/') || prefix.starts_with('~') {
-        return candidates;
-    }
-
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                        continue;
-                    };
-                    if !name.starts_with(prefix) {
-                        continue;
-                    }
-                    let Ok(metadata) = entry.metadata() else {
-                        continue;
-                    };
-                    if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-                        candidates.push(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-    candidates
-}
-
-fn path_completion_candidates(prefix: &str) -> Vec<String> {
-    let (base_dir, partial, display_prefix) = path_completion_context(prefix);
-    let Ok(entries) = fs::read_dir(base_dir) else {
-        return Vec::new();
-    };
-
-    let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with(&partial) {
-            continue;
-        }
-        let suffix = if path.is_dir() { "/" } else { "" };
-        candidates.push(format!("{display_prefix}{name}{suffix}"));
-    }
-    candidates
-}
-
-fn path_completion_context(prefix: &str) -> (PathBuf, String, String) {
-    let expanded = expand_completion_prefix(prefix);
-    let path = Path::new(&expanded);
-
-    if prefix.ends_with('/') {
-        let base = if expanded.is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        } else {
-            PathBuf::from(&expanded)
-        };
-        return (base, String::new(), prefix.to_string());
-    }
-
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let base_dir = parent
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let partial = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string();
-    let display_prefix = prefix
-        .rfind('/')
-        .map(|index| prefix[..=index].to_string())
-        .unwrap_or_default();
-
-    (base_dir, partial, display_prefix)
-}
-
-fn expand_completion_prefix(prefix: &str) -> String {
-    if prefix == "~" || prefix.starts_with("~/") {
-        let home = std::env::var("HOME").unwrap_or_default();
-        if prefix == "~" {
-            home
-        } else {
-            format!("{home}/{}", &prefix[2..])
-        }
-    } else {
-        prefix.to_string()
-    }
-}
-
-fn token_spans(input: &str) -> Vec<(&str, usize, usize)> {
-    let mut tokens = Vec::new();
-    let mut start = None;
-    for (index, ch) in input.char_indices() {
-        if ch.is_whitespace() {
-            if let Some(token_start) = start.take() {
-                tokens.push((&input[token_start..index], token_start, index));
-            }
-        } else if start.is_none() {
-            start = Some(index);
-        }
-    }
-    if let Some(token_start) = start {
-        tokens.push((&input[token_start..], token_start, input.len()));
-    }
-    tokens
 }
 
 fn shared_prefix(items: &[String]) -> String {
@@ -3841,6 +3677,8 @@ fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn queue_pending(state: &mut AppState, id: u32, pending: PendingSubmission) {
@@ -3850,8 +3688,8 @@ mod tests {
     fn attach_test_writer(state: &mut AppState) -> tokio::io::DuplexStream {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
         let client = crate::client::CuedClient::from_stream(client_stream);
-        let (_reader, writer) = client.into_split();
-        state.writer = Some(crate::client::spawn_writer_task(writer));
+        let (_reader, writer) = client.into_reader_and_writer_handle();
+        state.writer = Some(writer);
         state.connected = true;
         server_stream
     }
@@ -3932,6 +3770,65 @@ mod tests {
         assert!(text.contains("failed at item 2"));
     }
 
+    #[test]
+    fn script_finished_before_created_is_applied_to_created_card() {
+        let mut state = AppState::new();
+        let card_index = state
+            .main_view
+            .push_card("cue run fast.cue".into(), Mode::Job);
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(
+                Some(card_index),
+                "cue run fast.cue".into(),
+                Mode::Job,
+                Vec::new(),
+            ),
+        );
+
+        state.update(AppMsg::ServerEvent(EventPayload::ScriptFinished {
+            script_id: "R1".into(),
+            status: ScriptRunStatus::Done,
+            exit_code: 0,
+            failed_item_index: None,
+        }));
+        assert!(state.pending_script_finishes.contains_key("R1"));
+
+        state.update(AppMsg::Response {
+            id: 1,
+            payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
+                script_id: "R1".into(),
+                source: ScriptSource::File {
+                    path: "fast.cue".into(),
+                },
+                items: vec![],
+                submit_error: None,
+            }),
+        });
+
+        let card = &state.main_view.cards[card_index];
+        assert_eq!(card.status, CardStatus::Success);
+        assert!(card.output.contains("submitted 0 item(s)"));
+        assert!(card.output.contains("script finished: Done, exit=0"));
+        assert!(!state.pending_script_finishes.contains_key("R1"));
+    }
+
+    #[test]
+    fn unknown_script_finished_without_pending_submission_is_not_cached() {
+        let mut state = AppState::new();
+
+        state.update(AppMsg::ServerEvent(EventPayload::ScriptFinished {
+            script_id: "R-other".into(),
+            status: ScriptRunStatus::Done,
+            exit_code: 0,
+            failed_item_index: None,
+        }));
+
+        assert!(state.pending_script_finishes.is_empty());
+        assert!(state.script_cards.is_empty());
+    }
+
     fn test_target_profile(
         name: &str,
         transport: &str,
@@ -3953,11 +3850,23 @@ mod tests {
     ) -> TargetSettingsSnapshot {
         TargetSettingsSnapshot {
             source_path: path.into(),
-            using_legacy_config: false,
             auto_detect_ssh: true,
             default_profile: default_profile.into(),
             profiles,
         }
+    }
+
+    #[test]
+    fn ssh_target_profile_has_no_restart_only_alert() {
+        let profile = test_target_profile(
+            "remote",
+            "ssh",
+            "devbox | cued gateway --stdio",
+            TargetProfileSource::Configured,
+        );
+
+        assert_eq!(target_profile_alert(&profile), None);
+        assert!(target_profile_supports_live_reconnect(&profile));
     }
 
     #[test]
@@ -4334,10 +4243,8 @@ mod tests {
 
         let (client_stream, _server_stream) = tokio::io::duplex(4096);
         let client = crate::client::CuedClient::from_stream(client_stream);
-        let (_reader, writer) = client.into_split();
-        state.update(AppMsg::Reconnected {
-            writer: crate::client::spawn_writer_task(writer),
-        });
+        let (_reader, writer) = client.into_reader_and_writer_handle();
+        state.update(AppMsg::Reconnected { writer });
 
         let request_id = pending_display_subscribe_id(&state, "J1");
         assert!(state.display_subscriptions.is_empty());
@@ -4486,6 +4393,17 @@ mod tests {
             KeyCode::Char('d'),
             KeyModifiers::CONTROL,
         )));
+
+        assert!(state.should_quit);
+    }
+
+    #[test]
+    fn fatal_error_quits_tui_state_machine() {
+        let mut state = AppState::new();
+
+        state.update(AppMsg::FatalError {
+            message: "terminal event poll failed: tty closed".into(),
+        });
 
         assert!(state.should_quit);
     }
@@ -4720,8 +4638,8 @@ destination = "devbox"
         );
     }
 
-    #[test]
-    fn saving_unix_profile_offers_live_reconnect() {
+    #[tokio::test]
+    async fn saving_unix_profile_offers_live_reconnect() {
         let unique = format!(
             "cue-shell-targets-unix-{}-{}",
             std::process::id(),
@@ -4751,8 +4669,11 @@ socket = "/tmp/alt.sock"
         .unwrap();
 
         let mut state = AppState::new();
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        state.set_reconnect_tx(tx);
+        let connector =
+            crate::client::ClientConnector::new(|| async { anyhow::bail!("unused connector") });
+        let (_events, controller) =
+            crate::client::spawn_connection_manager_controllable(None, connector);
+        state.set_connection_controller(controller);
         state.session_profile_name = Some("local".into());
         state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
             config_path.clone(),
@@ -4798,8 +4719,8 @@ socket = "/tmp/alt.sock"
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[test]
-    fn saving_ssh_profile_reports_restart_only() {
+    #[tokio::test]
+    async fn saving_ssh_profile_offers_live_reconnect() {
         let unique = format!(
             "cue-shell-targets-ssh-{}-{}",
             std::process::id(),
@@ -4828,6 +4749,11 @@ destination = "devbox"
         .unwrap();
 
         let mut state = AppState::new();
+        let connector =
+            crate::client::ClientConnector::new(|| async { anyhow::bail!("unused connector") });
+        let (_events, controller) =
+            crate::client::spawn_connection_manager_controllable(None, connector);
+        state.set_connection_controller(controller);
         state.session_profile_name = Some("local".into());
         state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
             config_path.clone(),
@@ -4860,14 +4786,14 @@ destination = "devbox"
                 .target_settings
                 .as_ref()
                 .and_then(|state| state.notice.as_deref())
-                .is_some_and(|notice| notice.contains("live reconnect is unsupported"))
+                .is_some_and(|notice| notice.contains("Press R to reconnect now"))
         );
         assert_eq!(
             state
                 .target_settings
                 .as_ref()
                 .and_then(|state| state.pending_reconnect_profile.as_deref()),
-            None
+            Some("remote")
         );
 
         let _ = std::fs::remove_dir_all(dir);
@@ -4878,7 +4804,7 @@ destination = "devbox"
         let mut state = AppState::new();
         state.pending_reconnect_profile_name = Some("alt".into());
         state.connected = true;
-        state.status_bar.update(StatusBarMsg::SetConnected(true));
+        state.status_bar.update(StatusBarMsg::Connected(true));
         state.target_settings = Some(TargetSettingsState::new(test_target_snapshot(
             "/tmp/client.toml",
             "alt",
@@ -5265,6 +5191,24 @@ destination = "devbox"
         )));
 
         assert_eq!(state.input.content, ":kill ");
+    }
+
+    #[test]
+    fn completion_error_records_visible_error_card() {
+        let mut state = AppState::new();
+
+        state.show_completion_error(anyhow::anyhow!("current directory was removed"));
+
+        let card = state
+            .main_view
+            .cards
+            .last()
+            .expect("completion error should create a visible card");
+        assert_eq!(card.input, "completion");
+        assert_eq!(card.label.as_deref(), Some("completion"));
+        assert_eq!(card.status, CardStatus::Error);
+        assert!(card.output.contains("Error [completion]"));
+        assert!(card.output.contains("current directory was removed"));
     }
 
     #[test]

@@ -233,7 +233,7 @@ url = "ws://192.168.1.10:8765/ws"   # or wss:// for TLS
 Daemon side (`cued` config):
 
 ```toml
-# ~/.config/cue-shell/server.toml
+# ~/.config/cue-shell/daemon.toml
 
 [http_gateway]
 enabled = true
@@ -276,9 +276,10 @@ tokio-rustls    = "0.26"
 
 4. **Add `ClientConnector::websocket`** constructor in `cue-client/src/reconnect.rs`.
 
-5. **Extend `TransportProfile`** enum in `cue-cli/src/config.rs` with
-   `Http(HttpProfile)` variant. Extend `connector_for_profile` and
-   `target_config.rs` to build the WebSocket connector.
+5. **Extend the transport schema and resolver** in
+   `cue-client/src/transport_config.rs` with an HTTP resolved transport. Extend
+   `connector_for_profile` and `target_config.rs` to build the WebSocket
+   connector without exposing raw profile parsing types.
 
 6. **Add auth middleware** using `axum` tower layer: extract
    `Authorization: Bearer <token>` from the upgrade request headers.
@@ -292,34 +293,24 @@ tokio-rustls    = "0.26"
 
 ### 2.1 Current State
 
-The SSH transport is **more complete than it might appear**:
+The SSH transport is **usable from both CLI startup and TUI live reconnect**:
 
-- **`cue-cli/src/main.rs`** (`connect_ssh_transport`, `spawn_ssh_transport`):
-  fully implements subprocess SSH with `ssh <destination> <gateway_command>`,
-  wraps the child's stdin/stdout as `SshChildStream: AsyncRead + AsyncWrite`,
-  performs a `Ping/Pong` handshake to verify the tunnel, and constructs a
-  `CuedClient` from the stream. The `ClientConnector` is also set up to
-  re-invoke `connect_ssh_transport` on reconnect.
+- **`cue-client/src/ssh_transport.rs`** owns the subprocess SSH implementation:
+  `ssh <destination> <gateway_command>`, child stdin/stdout wrapping, `Ping/Pong`
+  handshake, and `ClientConnector` construction for reconnects.
 
-- **The real gap** is in `cue-tui/src/target_config.rs::connector_for_profile`:
-
-```rust
-// crates/cue-tui/src/target_config.rs:122
-"ssh" => anyhow::bail!(
-    "live reconnect for ssh transport is not yet supported; \
-     restart cue-tui to apply the profile change"
-),
-```
-
-This function is called when the user switches the active target profile *inside
-a running cue-tui session*. It cannot reconstruct an SSH connector because it
-only has access to the TOML value (no access to `SshProfile` or the connector
-factory in `cue-cli`).
+- **`cue-client::transport_connector`** is the shared connector factory for
+  resolved transport profiles. `cue-cli` and
+  `cue-tui/src/target_config.rs::connector_for_profile` both resolve a profile
+  and call this shared factory, so a running `cue-tui` session can switch to SSH
+  targets without a process restart.
 
 - **Auto-start**: the SSH transport has no mechanism to run `start_command` on
   the remote when the gateway connection fails (unlike Unix where
-  `ensure_daemon_running` auto-starts `cued`). This is a UX gap but not a
-  correctness problem.
+  `ensure_daemon_running` auto-starts `cued`). The TUI treats initial SSH
+  unavailability as offline mode and relies on the shared reconnect loop;
+  `cue run` still fails fast because script execution cannot proceed without a
+  live daemon.
 
 ### 2.2 Alternative Approaches for the SSH Client Layer
 
@@ -391,17 +382,13 @@ implementation (client + server).
 
 ### 2.3 Recommended Approach
 
-**Keep the subprocess `ssh` approach** (Option A) and fix the two gaps:
+**Keep the subprocess `ssh` approach** (Option A). The connector factory gap is
+fixed by `cue-client::transport_connector`; the remaining SSH transport work is:
 
-1. **Fix `connector_for_profile` for SSH** so that live target-switching in
-   `cue-tui` works without restarting.
-2. **Add remote auto-start** as a best-effort step before the first connection.
-
-The fix for gap #1 is architectural: `connector_for_profile` lives in
-`cue-tui` and only has a TOML value. It needs the same connector factory logic
-that exists in `cue-cli`. The simplest fix is to move the SSH connector factory
-into `cue-client` (or a new `cue-client/src/ssh.rs`) so both `cue-cli` and
-`cue-tui` can call it.
+1. **Add remote auto-start** as a best-effort step before the first connection.
+2. **Add SSH invocation options** for keepalive and user-specified flags.
+3. **Broaden integration coverage** around TUI live reconnect and SSH connector
+   construction.
 
 ### 2.4 TOML Configuration Schema
 
@@ -417,6 +404,9 @@ start_command = "cued start"                 # run once if daemon not found
 # ssh_options = ["-A", "-o", "ServerAliveInterval=10"]
 ```
 
+`local` is reserved for the built-in Unix socket profile; SSH profiles must use
+another name such as `devbox`.
+
 Proposed new optional field:
 
 ```toml
@@ -428,53 +418,33 @@ ssh_options = ["-A"]    # additional ssh(1) flags prepended to the invocation
 
 ### 2.5 Implementation Steps
 
-1. **Extract SSH connector factory** into `cue-client/src/ssh.rs`:
+1. **Done: centralize the SSH connector factory** in `cue-client`:
 
 ```rust
-// crates/cue-client/src/ssh.rs
-
-pub struct SshConnectorConfig {
-    pub destination: String,
-    pub gateway_command: String,
-    pub start_command: String,
-    pub ssh_options: Vec<String>,
-    pub auto_start: bool,
-}
-
-impl ClientConnector {
-    pub fn ssh(config: SshConnectorConfig) -> Self {
-        Self::new(move || {
-            let config = config.clone();
-            async move {
-                // 1. spawn ssh process
-                // 2. wrap stdin/stdout as SshChildStream (AsyncRead + AsyncWrite)
-                // 3. send Ping, if timeout → try start_command, retry
-                // 4. return CuedClient::from_stream(stream)
-            }
-        })
+pub fn transport_connector(transport: &ResolvedTransport) -> ClientConnector {
+    match transport {
+        ResolvedTransport::Unix(unix) => unix_connector(unix.path.clone()),
+        ResolvedTransport::Ssh(ssh) => ssh_connector(ssh.clone()),
     }
 }
 ```
 
-Move `SshChildStream`, `spawn_ssh_transport`, and `connect_ssh_transport` from
-`cue-cli/src/main.rs` into this module. `cue-cli` calls `ClientConnector::ssh`.
+`cue-client/src/ssh_transport.rs` owns `SshChildStream`, SSH process spawning,
+handshake, and connector construction. `cue-cli` and `cue-tui` both use this
+shared boundary.
 
-2. **Fix `connector_for_profile`** in `cue-tui/src/target_config.rs`:
+2. **Done: `connector_for_profile` delegates to the shared factory**:
 
 ```rust
-"ssh" => {
-    let config = SshConnectorConfig {
-        destination: table.get("destination")...
-        gateway_command: ...
-        start_command: ...
-        ssh_options: ...
-        auto_start: ...
-    };
-    Ok(cue_client::ClientConnector::ssh(config))
+pub(crate) fn connector_for_profile(profile_name: &str) -> anyhow::Result<ClientConnector> {
+    let transport = load_transport_config()?.resolve_profile(profile_name)?;
+    Ok(transport_connector(&transport))
 }
 ```
 
-3. **Add `ssh_options` to `SshProfile`** in `cue-cli/src/config.rs`.
+3. **Add `ssh_options` to the SSH transport schema** in
+   `cue-client/src/transport_config.rs` and carry it through
+   `ResolvedTransport`.
 
 4. **Add auto-start logic**: before the first `Ping`, try
    `ssh <destination> <start_command>` once and retry the gateway connection.
@@ -484,8 +454,8 @@ Move `SshChildStream`, `spawn_ssh_transport`, and `connect_ssh_transport` from
    ServerAliveCountMax=3` to the SSH invocation so dead connections are detected
    without waiting for TCP timeout.
 
-6. **Add SSH live-reconnect integration test** in `cue-client` using in-process
-   duplex streams (no real `ssh`).
+6. **Add SSH live-reconnect integration coverage** using an in-process fake SSH
+   connector or the shared connector boundary (no real `ssh`).
 
 ---
 
@@ -591,7 +561,8 @@ The simplest useful design requires only:
 3. Or, more powerfully: configure `cued` itself to forward all client
    connections to an upstream
 
-The byte-relay approach re-uses `gateway_stdio::relay` nearly verbatim.
+The byte-relay approach re-uses the same implementation behind
+`cue_daemon::relay_gateway_stdio` nearly verbatim.
 
 ### 3.4 TOML Configuration Schema
 
@@ -601,7 +572,7 @@ transport to point at the intermediate `cued`. No new client config needed.
 **Daemon-side** — `cued` in relay mode:
 
 ```toml
-# ~/.config/cue-shell/server.toml  (on the relay node)
+# ~/.config/cue-shell/daemon.toml  (on the relay node)
 
 [relay]
 enabled = true
@@ -627,7 +598,7 @@ cued relay --upstream ssh://prod-server
    `cued gateway --stdio`):
    - Accept a Unix socket connection
    - Connect to upstream (Unix or SSH using the SSH connector from Mode 2)
-   - Run `gateway_stdio::relay(client_unix, stdin, upstream_stream)` — the
+   - Run `cue_daemon::relay_gateway_stdio(client_unix, stdin, upstream_stream)` — the
      three-way relay function already works for any `AsyncRead + AsyncWrite`
 
 2. **Extend `cued gateway`** to support an `--upstream` flag:
@@ -636,7 +607,7 @@ cued relay --upstream ssh://prod-server
 cued gateway --stdio --upstream ssh://devbox
 ```
 
-This re-uses the existing `gateway_stdio.rs::relay` function:
+This re-uses the existing `gateway_stdio.rs` relay implementation:
 
 ```rust
 pub async fn run_relay(stdin: impl AsyncRead, stdout: impl AsyncWrite, upstream: impl AsyncRead + AsyncWrite) -> Result<()> {
@@ -670,7 +641,7 @@ pub async fn run_relay(stdin: impl AsyncRead, stdout: impl AsyncWrite, upstream:
 | Chain     | Auth at each hop                               | SSH on the relay-to-upstream leg           |
 
 For HTTP, the token should be a random 256-bit hex string. The daemon stores
-accepted token material in `~/.config/cue-shell/server.toml` with `chmod 600`;
+accepted token material in `~/.config/cue-shell/daemon.toml` with `chmod 600`;
 clients reference the matching token from their `client.toml` transport profile.
 
 ### TLS
@@ -713,15 +684,14 @@ to detect* a dead connection.
 
 ### Priority 1: SSH Transport Completion
 
-**Why first**: It is 80% done and the missing 20% (`connector_for_profile` for
-SSH in `cue-tui`) blocks a real, already-configured user-facing feature. The
-change is surgical:
+**Why first**: SSH is already available through the shared `cue-client`
+connector boundary, and the remaining work is focused:
 
-1. Extract `SshConnectorConfig` + `ClientConnector::ssh` into `cue-client`
-2. Fix `connector_for_profile` to return a working SSH connector
-3. Add `ssh_options` + `auto_start` fields
+1. Add remote `start_command` auto-start for first-connect failures
+2. Add `ssh_options` / keepalive flags
+3. Add integration coverage for SSH live reconnect without invoking real `ssh`
 
-**Effort estimate**: ~1–2 days. No new dependencies.
+**Effort estimate**: ~1 day. No new dependencies.
 
 ### Priority 2: HTTP Transport
 
@@ -734,7 +704,7 @@ client side is ~100 lines of adapter code.
 ### Priority 3: Chain Transport
 
 **Why third**: The simplest `cued relay` form is trivially built on top of the
-SSH transport work (Priority 1) and `gateway_stdio::relay`. Full multiplexing
+SSH transport work (Priority 1) and `cue_daemon::relay_gateway_stdio`. Full multiplexing
 (one upstream connection for N local clients) is a Phase 2 enhancement.
 
 **Effort estimate**: ~1–2 days for simple relay; ~1 week for multiplexed relay.
@@ -801,5 +771,6 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> AsyncWrite for WsS
 
 ### SSH Child Stdin/Stdout → `AsyncRead + AsyncWrite`
 
-Already implemented in `cue-cli/src/main.rs` as `SshChildStream`. Moving this
-type to `cue-client/src/ssh.rs` makes it reusable.
+Already implemented in `cue-client/src/ssh_transport.rs` as `SshChildStream`,
+which keeps the subprocess transport reusable by both CLI startup and TUI
+target switching.

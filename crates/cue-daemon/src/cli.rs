@@ -13,7 +13,6 @@
 use std::ffi::OsString;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::process;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -49,6 +48,14 @@ enum Cli {
     Install,
     Uninstall,
     Upgrade,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidFileState {
+    Missing,
+    Running(u32),
+    Dead(u32),
+    Malformed,
 }
 
 fn socket_arg() -> impl bpaf::Parser<Option<PathBuf>> {
@@ -147,7 +154,7 @@ fn cli() -> bpaf::OptionParser<Cli> {
         .descr("cued — background daemon for cue-shell")
 }
 
-pub fn run() {
+pub(crate) fn run() -> i32 {
     let parser = cli();
     let args = normalized_cli_args();
     let args = bpaf::Args::from(args.as_slice()).set_name("cued");
@@ -155,7 +162,7 @@ pub fn run() {
         Ok(cmd) => cmd,
         Err(err) => {
             err.print_message(100);
-            process::exit(err.exit_code());
+            return err.exit_code();
         }
     };
     let result = match cmd {
@@ -170,21 +177,20 @@ pub fn run() {
     };
     if let Err(e) = result {
         eprintln!("cued: {e:#}");
-        process::exit(1);
+        return 1;
     }
+    0
 }
 
 // ── Start ──
 
 fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<()> {
-    let socket_path = socket_override
-        .clone()
-        .unwrap_or_else(crate::dirs::socket_path);
+    let socket_path = daemon_socket_path(socket_override.as_deref())?;
 
     if force {
         // When the service manager owns cued, delegate restart to it rather than
         // sending a raw SIGTERM (which would fight launchd/systemd's KeepAlive).
-        if crate::service::is_installed() && socket_override.is_none() {
+        if crate::service::is_installed()? && socket_override.is_none() {
             println!("cued: daemon is managed by the service manager — restarting via service");
             crate::service::restart()?;
             println!("cued: daemon restarted");
@@ -207,9 +213,7 @@ fn run_restart(socket_override: Option<PathBuf>) -> Result<()> {
 }
 
 fn run_start_background(socket_override: Option<PathBuf>) -> Result<()> {
-    let socket_path = socket_override
-        .clone()
-        .unwrap_or_else(crate::dirs::socket_path);
+    let socket_path = daemon_socket_path(socket_override.as_deref())?;
     let current_exe = std::env::current_exe().context("resolve current cued executable")?;
 
     let mut cmd = Command::new(current_exe);
@@ -258,28 +262,21 @@ fn run_start_background(socket_override: Option<PathBuf>) -> Result<()> {
 }
 
 fn run_start_foreground(socket_override: Option<PathBuf>) -> Result<()> {
-    // Initialize tracing (stderr, env-filter).
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    init_stderr_tracing("info")?;
 
     let pid_path = crate::dirs::pid_path();
-    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
+    let socket_path = daemon_socket_path(socket_override.as_deref())?;
 
     // Ensure directories exist.
     crate::dirs::ensure_dirs().context("create directories")?;
 
     // Write PID file.
-    std::fs::write(&pid_path, format!("{}", process::id()))
+    std::fs::write(&pid_path, format!("{}", std::process::id()))
         .with_context(|| format!("write PID file {}", pid_path.display()))?;
 
     info!(
         version = crate::version(),
-        pid = process::id(),
+        pid = std::process::id(),
         socket = %socket_path.display(),
         "cued starting"
     );
@@ -302,7 +299,7 @@ async fn async_main(socket_path: PathBuf) -> Result<()> {
     let config = crate::config::Config::load().context("load daemon config")?;
 
     // Open database.
-    let db_path = crate::dirs::db_path();
+    let db_path = crate::dirs::db_path()?;
     let scope_db = crate::storage::open_db(&db_path)
         .with_context(|| format!("open database {}", db_path.display()))?;
     let scheduler_db = crate::storage::open_db(&db_path)
@@ -346,7 +343,7 @@ fn cleanup(pid_path: &Path, socket_path: &Path) {
 // ── Stop ──
 
 fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
-    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
+    let socket_path = daemon_socket_path(socket_override.as_deref())?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let mut stream = tokio::net::UnixStream::connect(&socket_path)
@@ -383,25 +380,12 @@ fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
 
 fn run_status(socket_override: Option<PathBuf>) -> Result<()> {
     let pid_path = crate::dirs::pid_path();
-    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
+    let socket_path = daemon_socket_path(socket_override.as_deref())?;
 
-    // Check PID file.
-    if pid_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&pid_path)
-        && let Ok(pid) = content.trim().parse::<u32>()
-    {
-        if is_process_alive(pid) {
-            println!(
-                "cued is running (pid {pid}, socket {})",
-                socket_path.display()
-            );
-            return Ok(());
-        }
-        println!("cued: stale PID file (pid {pid} not running)");
-        return Ok(());
-    }
-
-    println!("cued is not running");
+    println!(
+        "{}",
+        daemon_status_message(&pid_path, &socket_path, is_process_alive, daemon_ready)?
+    );
     Ok(())
 }
 
@@ -410,7 +394,7 @@ fn run_status(socket_override: Option<PathBuf>) -> Result<()> {
 fn run_gateway(stdio: bool, socket_override: Option<PathBuf>) -> Result<()> {
     anyhow::ensure!(stdio, "gateway currently supports only --stdio");
 
-    let socket_path = socket_override.unwrap_or_else(crate::dirs::socket_path);
+    let socket_path = daemon_socket_path(socket_override.as_deref())?;
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     rt.block_on(crate::gateway_stdio::run(socket_path))
 }
@@ -496,28 +480,102 @@ fn implicit_start_args_only(args: &[OsString]) -> bool {
     !expecting_socket_path
 }
 
+fn daemon_socket_path(socket_override: Option<&Path>) -> Result<PathBuf> {
+    match socket_override {
+        Some(path) => {
+            validate_daemon_socket_path("--socket", path)?;
+            Ok(path.to_path_buf())
+        }
+        None => Ok(crate::dirs::socket_path()),
+    }
+}
+
+fn validate_daemon_socket_path(field: &str, path: &Path) -> Result<()> {
+    let Some(path) = path.to_str() else {
+        anyhow::bail!("{field} must be valid UTF-8");
+    };
+    if path.trim().is_empty() {
+        anyhow::bail!("{field} must not be empty");
+    }
+    if path.trim() != path {
+        anyhow::bail!("{field} must not have leading or trailing whitespace");
+    }
+    Ok(())
+}
+
+const RUST_LOG_ENV: &str = "RUST_LOG";
+
+fn init_stderr_tracing(default_directive: &str) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter_from_env(
+            default_directive,
+            std::env::var_os(RUST_LOG_ENV),
+        )?)
+        .with_writer(std::io::stderr)
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("initialize tracing subscriber: {error}"))
+}
+
+fn env_filter_from_env(
+    default_directive: &str,
+    rust_log: Option<OsString>,
+) -> Result<tracing_subscriber::EnvFilter> {
+    let Some(rust_log) = rust_log else {
+        return default_env_filter(default_directive);
+    };
+    if rust_log.is_empty() {
+        anyhow::bail!("{RUST_LOG_ENV} must not be empty");
+    }
+    let Some(rust_log) = rust_log.to_str() else {
+        anyhow::bail!("{RUST_LOG_ENV} must be valid UTF-8");
+    };
+    tracing_subscriber::EnvFilter::try_new(rust_log)
+        .with_context(|| format!("parse {RUST_LOG_ENV} `{rust_log}`"))
+}
+
+fn default_env_filter(default_directive: &str) -> Result<tracing_subscriber::EnvFilter> {
+    tracing_subscriber::EnvFilter::try_new(default_directive)
+        .with_context(|| format!("parse default tracing directive `{default_directive}`"))
+}
+
 /// Kill any running daemon and wait for it to exit (used by `--force`).
 fn force_stop_if_running(socket_path: &Path) -> Result<()> {
     let pid_path = crate::dirs::pid_path();
+    force_stop_if_running_with_pid_path(&pid_path, socket_path)
+}
 
-    if !pid_path.exists() {
-        ensure_socket_not_live(socket_path, "PID file is missing")?;
-        remove_runtime_file(socket_path, "stale socket")?;
-        return Ok(());
-    }
-
-    let Ok(content) = std::fs::read_to_string(&pid_path) else {
-        remove_stale_daemon_markers(&pid_path, socket_path, "PID file is unreadable")?;
-        return Ok(());
+fn force_stop_if_running_with_pid_path(pid_path: &Path, socket_path: &Path) -> Result<()> {
+    let pid = match inspect_pid_file(pid_path)? {
+        PidFileState::Missing => {
+            ensure_socket_not_live(socket_path, "PID file is missing")?;
+            remove_runtime_file(socket_path, "stale socket")?;
+            return Ok(());
+        }
+        PidFileState::Malformed => {
+            remove_stale_daemon_markers(pid_path, socket_path, "PID file is malformed")?;
+            return Ok(());
+        }
+        PidFileState::Dead(pid) => {
+            remove_stale_daemon_markers(
+                pid_path,
+                socket_path,
+                &format!("PID file points to dead pid {pid}"),
+            )?;
+            return Ok(());
+        }
+        PidFileState::Running(pid) => pid,
     };
 
-    let Ok(pid) = content.trim().parse::<u32>() else {
-        remove_stale_daemon_markers(&pid_path, socket_path, "PID file is malformed")?;
-        return Ok(());
-    };
+    terminate_running_daemon(pid, pid_path, socket_path)
+}
 
+fn terminate_running_daemon(pid: u32, pid_path: &Path, socket_path: &Path) -> Result<()> {
     if !is_process_alive(pid) {
-        remove_stale_daemon_markers(&pid_path, socket_path, "PID file points to a dead process")?;
+        remove_stale_daemon_markers(
+            pid_path,
+            socket_path,
+            &format!("PID file points to dead pid {pid}"),
+        )?;
         return Ok(());
     }
 
@@ -533,7 +591,7 @@ fn force_stop_if_running(socket_path: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
         if !is_process_alive(pid) {
             println!("cued: previous daemon stopped");
-            remove_daemon_markers(&pid_path, socket_path)?;
+            remove_daemon_markers(pid_path, socket_path)?;
             return Ok(());
         }
     }
@@ -545,27 +603,130 @@ fn force_stop_if_running(socket_path: &Path) -> Result<()> {
 
 fn ensure_not_running(socket_path: &Path) -> Result<()> {
     let pid_path = crate::dirs::pid_path();
+    ensure_not_running_with_pid_path(&pid_path, socket_path)
+}
 
-    if pid_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pid_path)
-            && let Ok(pid) = content.trim().parse::<u32>()
-            && is_process_alive(pid)
-        {
+fn ensure_not_running_with_pid_path(pid_path: &Path, socket_path: &Path) -> Result<()> {
+    ensure_not_running_with_pid_path_and_ready(pid_path, socket_path, daemon_ready)
+}
+
+fn ensure_not_running_with_pid_path_and_ready(
+    pid_path: &Path,
+    socket_path: &Path,
+    daemon_is_ready: impl Fn(&Path) -> bool + Copy,
+) -> Result<()> {
+    match inspect_pid_file(pid_path)? {
+        PidFileState::Running(pid) => {
             anyhow::bail!(
                 "cued already running (pid {pid}). If stale, remove {} and retry.",
                 pid_path.display()
             );
         }
-
-        remove_runtime_file(&pid_path, "stale PID file")?;
+        PidFileState::Dead(pid) => {
+            remove_stale_daemon_markers_with_ready(
+                pid_path,
+                socket_path,
+                &format!("PID file points to dead pid {pid}"),
+                daemon_is_ready,
+            )?;
+        }
+        PidFileState::Malformed => {
+            remove_stale_daemon_markers_with_ready(
+                pid_path,
+                socket_path,
+                "PID file is malformed",
+                daemon_is_ready,
+            )?;
+        }
+        PidFileState::Missing => {}
     }
 
-    if daemon_ready(socket_path) {
+    if daemon_is_ready(socket_path) {
         anyhow::bail!("cued already running on socket {}", socket_path.display());
     }
 
     remove_runtime_file(socket_path, "stale socket")?;
     Ok(())
+}
+
+fn inspect_pid_file(pid_path: &Path) -> Result<PidFileState> {
+    inspect_pid_file_with(pid_path, is_process_alive)
+}
+
+fn inspect_pid_file_with(
+    pid_path: &Path,
+    is_alive: impl FnOnce(u32) -> bool,
+) -> Result<PidFileState> {
+    let content = match std::fs::read_to_string(pid_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PidFileState::Missing);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read cued PID file {}", pid_path.display()));
+        }
+    };
+
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return Ok(PidFileState::Malformed);
+    };
+
+    if is_alive(pid) {
+        Ok(PidFileState::Running(pid))
+    } else {
+        Ok(PidFileState::Dead(pid))
+    }
+}
+
+fn daemon_status_message(
+    pid_path: &Path,
+    socket_path: &Path,
+    is_alive: impl FnOnce(u32) -> bool,
+    daemon_is_ready: impl Fn(&Path) -> bool,
+) -> Result<String> {
+    let pid_state = inspect_pid_file_with(pid_path, is_alive)?;
+    let socket_ready = daemon_is_ready(socket_path);
+
+    let message = match (pid_state, socket_ready) {
+        (PidFileState::Running(pid), true) => {
+            format!(
+                "cued is running (pid {pid}, socket {} reachable)",
+                socket_path.display()
+            )
+        }
+        (PidFileState::Running(pid), false) => {
+            format!(
+                "cued process is running (pid {pid}) but socket {} is not reachable",
+                socket_path.display()
+            )
+        }
+        (PidFileState::Dead(pid), true) => {
+            format!(
+                "cued is running (socket {} reachable, PID file points to dead pid {pid})",
+                socket_path.display()
+            )
+        }
+        (PidFileState::Dead(pid), false) => {
+            format!("cued: stale PID file (pid {pid} not running)")
+        }
+        (PidFileState::Malformed, true) => {
+            format!(
+                "cued is running (socket {} reachable, PID file is malformed)",
+                socket_path.display()
+            )
+        }
+        (PidFileState::Malformed, false) => "cued: stale PID file (malformed)".to_string(),
+        (PidFileState::Missing, true) => {
+            format!(
+                "cued is running (socket {} reachable, PID file is missing)",
+                socket_path.display()
+            )
+        }
+        (PidFileState::Missing, false) => "cued is not running".to_string(),
+    };
+
+    Ok(message)
 }
 
 fn remove_daemon_markers(pid_path: &Path, socket_path: &Path) -> Result<()> {
@@ -575,12 +736,29 @@ fn remove_daemon_markers(pid_path: &Path, socket_path: &Path) -> Result<()> {
 }
 
 fn remove_stale_daemon_markers(pid_path: &Path, socket_path: &Path, reason: &str) -> Result<()> {
-    ensure_socket_not_live(socket_path, reason)?;
+    remove_stale_daemon_markers_with_ready(pid_path, socket_path, reason, daemon_ready)
+}
+
+fn remove_stale_daemon_markers_with_ready(
+    pid_path: &Path,
+    socket_path: &Path,
+    reason: &str,
+    daemon_is_ready: impl Fn(&Path) -> bool,
+) -> Result<()> {
+    ensure_socket_not_live_with(socket_path, reason, daemon_is_ready)?;
     remove_daemon_markers(pid_path, socket_path)
 }
 
 fn ensure_socket_not_live(socket_path: &Path, reason: &str) -> Result<()> {
-    if daemon_ready(socket_path) {
+    ensure_socket_not_live_with(socket_path, reason, daemon_ready)
+}
+
+fn ensure_socket_not_live_with(
+    socket_path: &Path,
+    reason: &str,
+    daemon_is_ready: impl Fn(&Path) -> bool,
+) -> Result<()> {
+    if daemon_is_ready(socket_path) {
         anyhow::bail!(
             "cued socket {} is reachable but {reason}; run `cued stop --socket {}` first",
             socket_path.display(),
@@ -622,9 +800,9 @@ mod tests {
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn make_temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cue-daemon-cli-test-{}-{}",
-            process::id(),
+        let dir = PathBuf::from("/private/tmp").join(format!(
+            "cued-test-{}-{}",
+            std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -701,6 +879,68 @@ mod tests {
     }
 
     #[test]
+    fn daemon_socket_override_rejects_empty_or_padded_values() {
+        for (path, expected) in [
+            (PathBuf::new(), "--socket must not be empty"),
+            (PathBuf::from("   "), "--socket must not be empty"),
+            (
+                PathBuf::from(" /tmp/cued.sock"),
+                "--socket must not have leading or trailing whitespace",
+            ),
+            (
+                PathBuf::from("/tmp/cued.sock "),
+                "--socket must not have leading or trailing whitespace",
+            ),
+        ] {
+            let error = daemon_socket_path(Some(path.as_path()))
+                .expect_err("invalid --socket override should fail");
+
+            assert!(
+                format!("{error:#}").contains(expected),
+                "wrong error for socket {path:?}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_run_paths_reject_invalid_socket_before_side_effects() {
+        let start_error = run_start(false, false, Some(PathBuf::new()))
+            .expect_err("start should reject invalid socket before process checks");
+        assert!(format!("{start_error:#}").contains("--socket must not be empty"));
+
+        let status_error = run_status(Some(PathBuf::from(" /tmp/cued.sock")))
+            .expect_err("status should reject invalid socket before probing");
+        assert!(
+            format!("{status_error:#}")
+                .contains("--socket must not have leading or trailing whitespace")
+        );
+    }
+
+    #[test]
+    fn env_filter_uses_default_when_rust_log_is_absent() {
+        env_filter_from_env("info", None).expect("default tracing directive should parse");
+    }
+
+    #[test]
+    fn env_filter_rejects_empty_rust_log() {
+        let error = env_filter_from_env("info", Some(OsString::new()))
+            .expect_err("explicit empty RUST_LOG should fail");
+
+        assert_eq!(format!("{error:#}"), "RUST_LOG must not be empty");
+    }
+
+    #[test]
+    fn env_filter_rejects_invalid_rust_log_instead_of_falling_back() {
+        let error = env_filter_from_env("info", Some(OsString::from("cue_daemon=debug,[")))
+            .expect_err("invalid RUST_LOG should fail");
+
+        assert!(
+            format!("{error:#}").contains("parse RUST_LOG `cue_daemon=debug,[`"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn runtime_file_removal_deletes_existing_file() {
         let dir = make_temp_dir();
         let path = dir.join("cued.pid");
@@ -723,13 +963,165 @@ mod tests {
     }
 
     #[test]
+    fn pid_file_inspection_distinguishes_running_dead_malformed_and_missing() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+
+        assert_eq!(
+            inspect_pid_file_with(&pid_path, |_| unreachable!(
+                "missing pid should not check liveness"
+            ))
+            .expect("missing pid file should inspect cleanly"),
+            PidFileState::Missing
+        );
+
+        std::fs::write(&pid_path, "123").expect("write pid file");
+        assert_eq!(
+            inspect_pid_file_with(&pid_path, |pid| pid == 123)
+                .expect("running pid should inspect cleanly"),
+            PidFileState::Running(123)
+        );
+        assert_eq!(
+            inspect_pid_file_with(&pid_path, |_| false).expect("dead pid should inspect cleanly"),
+            PidFileState::Dead(123)
+        );
+
+        std::fs::write(&pid_path, "not-a-pid").expect("write malformed pid file");
+        assert_eq!(
+            inspect_pid_file_with(&pid_path, |_| unreachable!(
+                "malformed pid should not check liveness"
+            ))
+            .expect("malformed pid file should inspect cleanly"),
+            PidFileState::Malformed
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn status_reports_reachable_socket_when_pid_file_is_missing() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+        let socket = dir.join("cued.sock");
+
+        let message = daemon_status_message(
+            &pid_path,
+            &socket,
+            |_| unreachable!("missing pid should not check liveness"),
+            |_| true,
+        )
+        .expect("status message should render");
+
+        assert_eq!(
+            message,
+            format!(
+                "cued is running (socket {} reachable, PID file is missing)",
+                socket.display()
+            )
+        );
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn status_reports_reachable_socket_when_pid_file_is_malformed() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+        let socket = dir.join("cued.sock");
+        std::fs::write(&pid_path, "not-a-pid").expect("write malformed pid file");
+
+        let message = daemon_status_message(
+            &pid_path,
+            &socket,
+            |_| unreachable!("malformed pid should not check liveness"),
+            |_| true,
+        )
+        .expect("status message should render");
+
+        assert_eq!(
+            message,
+            format!(
+                "cued is running (socket {} reachable, PID file is malformed)",
+                socket.display()
+            )
+        );
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn status_reports_unreachable_socket_for_live_pid() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+        let socket = dir.join("cued.sock");
+        std::fs::write(&pid_path, "123").expect("write pid file");
+
+        let message = daemon_status_message(&pid_path, &socket, |pid| pid == 123, |_| false)
+            .expect("status message should render");
+
+        assert_eq!(
+            message,
+            format!(
+                "cued process is running (pid 123) but socket {} is not reachable",
+                socket.display()
+            )
+        );
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn status_reports_not_running_when_pid_and_socket_are_missing() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+        let socket = dir.join("cued.sock");
+
+        let message = daemon_status_message(
+            &pid_path,
+            &socket,
+            |_| unreachable!("missing pid should not check liveness"),
+            |_| false,
+        )
+        .expect("status message should render");
+
+        assert_eq!(message, "cued is not running");
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn unreadable_pid_file_is_not_removed_as_stale() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+        let socket = dir.join("cued.sock");
+        std::fs::create_dir(&pid_path).expect("create unreadable pid path");
+
+        let error = ensure_not_running_with_pid_path(&pid_path, &socket)
+            .expect_err("pid read failure should stop startup cleanup");
+
+        assert!(format!("{error:#}").contains("read cued PID file"));
+        assert!(pid_path.exists());
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn malformed_pid_file_is_not_removed_while_socket_is_live() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+        let socket = dir.join("cued.sock");
+        std::fs::write(&pid_path, "not-a-pid").expect("write malformed pid file");
+
+        let error = ensure_not_running_with_pid_path_and_ready(&pid_path, &socket, |_| true)
+            .expect_err("live socket should prevent stale marker cleanup");
+
+        assert!(format!("{error:#}").contains("reachable"));
+        assert!(pid_path.exists());
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
     fn socket_liveness_guard_rejects_reachable_socket() {
         let dir = make_temp_dir();
         let socket = dir.join("cued.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
 
-        let error =
-            ensure_socket_not_live(&socket, "PID file is missing").expect_err("socket is live");
+        let error = ensure_socket_not_live_with(&socket, "PID file is missing", |_| true)
+            .expect_err("socket is live");
 
         assert!(error.to_string().contains("socket"));
         assert!(error.to_string().contains("reachable"));

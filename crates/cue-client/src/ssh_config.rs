@@ -1,19 +1,22 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
-use crate::{home_dir, read_config_source};
+use anyhow::{Result, bail};
 
-pub fn detected_ssh_hosts() -> BTreeSet<String> {
-    let path = home_dir().join(".ssh/config");
+use crate::config_paths::read_config_source;
+
+pub(crate) fn detected_ssh_hosts() -> Result<BTreeSet<String>> {
+    let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        bail!("HOME is not set; set HOME or disable transport.auto_detect_ssh");
+    };
+    let path = PathBuf::from(home).join(".ssh/config");
     let text = match read_config_source(&path) {
         Ok(Some(text)) => text,
-        Ok(None) => return BTreeSet::new(),
-        Err(error) => {
-            tracing::warn!(%error, path = %path.display(), "failed to read ssh config");
-            return BTreeSet::new();
-        }
+        Ok(None) => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error),
     };
 
-    parse_ssh_config_hosts(&text)
+    Ok(parse_ssh_config_hosts(&text))
 }
 
 fn parse_ssh_config_hosts(text: &str) -> BTreeSet<String> {
