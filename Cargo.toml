@@ -17,7 +17,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Color
-ansi-to-tui = "8.0.1"
+ansi-to-tui = "8"
 # Error handling
 anyhow = "1"
 base64 = "0.22"
@@ -32,7 +32,7 @@ owo-colors = "4"
 # TUI
 ratatui = "0.30"
 # Storage
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -49,11 +49,11 @@ tokio = { version = "1", features = [
   "sync",
   "time"
 ] }
-toml = "0.8"
+toml = "1.1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tui-term = "0.3.4"
+tui-term = "0.3"
 
 [profile.dev]
 opt-level = 0
