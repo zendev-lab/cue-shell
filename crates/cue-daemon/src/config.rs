@@ -267,6 +267,8 @@ pub enum BlockDecision {
 pub struct ResourceConfig {
     #[serde(default)]
     pub cli: BTreeMap<String, CliResourceProviderConfig>,
+    #[serde(default)]
+    pub nvidia: NvidiaResourceConfig,
 }
 
 impl ResourceConfig {
@@ -279,6 +281,83 @@ impl ResourceConfig {
                 );
             }
             provider.validate(path, id)?;
+        }
+        self.nvidia.validate(path)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NvidiaResourceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_nvidia_provider_id")]
+    pub provider_id: String,
+    #[serde(default = "default_nvidia_gpu_key")]
+    pub gpu_key: String,
+    #[serde(default = "default_nvidia_gpu_mem_key")]
+    pub gpu_mem_key: String,
+    #[serde(default)]
+    pub safety_margin_bytes: u64,
+    #[serde(default = "default_nvidia_probe_ttl_ms")]
+    pub probe_ttl_ms: u64,
+}
+
+impl Default for NvidiaResourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider_id: default_nvidia_provider_id(),
+            gpu_key: default_nvidia_gpu_key(),
+            gpu_mem_key: default_nvidia_gpu_mem_key(),
+            safety_margin_bytes: 0,
+            probe_ttl_ms: default_nvidia_probe_ttl_ms(),
+        }
+    }
+}
+
+fn default_nvidia_provider_id() -> String {
+    "nvidia".into()
+}
+
+fn default_nvidia_gpu_key() -> String {
+    "gpu".into()
+}
+
+fn default_nvidia_gpu_mem_key() -> String {
+    "gpu_mem".into()
+}
+
+fn default_nvidia_probe_ttl_ms() -> u64 {
+    1_000
+}
+
+impl NvidiaResourceConfig {
+    fn validate(&self, path: &Path) -> Result<()> {
+        for (field, value) in [
+            ("provider_id", &self.provider_id),
+            ("gpu_key", &self.gpu_key),
+            ("gpu_mem_key", &self.gpu_mem_key),
+        ] {
+            if value.trim() != value || value.is_empty() {
+                bail!(
+                    "resources.nvidia.{field} in {} must be non-empty and must not have leading or trailing whitespace",
+                    path.display()
+                );
+            }
+        }
+        if self.gpu_key == self.gpu_mem_key {
+            bail!(
+                "resources.nvidia.gpu_key and gpu_mem_key in {} must be distinct",
+                path.display()
+            );
+        }
+        if self.probe_ttl_ms == 0 {
+            bail!(
+                "resources.nvidia.probe_ttl_ms in {} must be greater than zero",
+                path.display()
+            );
         }
         Ok(())
     }
@@ -752,6 +831,50 @@ pip = "uv pip"
         assert_eq!(
             config.aliases.apply("pip install foo"),
             "uv pip install foo"
+        );
+    }
+
+    #[test]
+    fn resources_nvidia_provider_parsed_from_daemon_toml() {
+        let config = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.nvidia]
+enabled = true
+provider_id = "gpu"
+gpu_key = "cuda"
+gpu_mem_key = "cuda_mem"
+safety_margin_bytes = 1048576
+probe_ttl_ms = 250
+"#,
+        )))
+        .expect("load config");
+
+        assert!(config.resources.nvidia.enabled);
+        assert_eq!(config.resources.nvidia.provider_id, "gpu");
+        assert_eq!(config.resources.nvidia.gpu_key, "cuda");
+        assert_eq!(config.resources.nvidia.gpu_mem_key, "cuda_mem");
+        assert_eq!(config.resources.nvidia.safety_margin_bytes, 1_048_576);
+        assert_eq!(config.resources.nvidia.probe_ttl_ms, 250);
+    }
+
+    #[test]
+    fn resources_nvidia_keys_must_be_distinct() {
+        let error = Config::load_from_source(Some((
+            Path::new("daemon.toml"),
+            r#"
+[resources.nvidia]
+gpu_key = "gpu"
+gpu_mem_key = "gpu"
+"#,
+        )))
+        .expect_err("duplicate keys should fail");
+
+        assert!(
+            error.to_string().contains(
+                "resources.nvidia.gpu_key and gpu_mem_key in daemon.toml must be distinct"
+            ),
+            "{error:#}"
         );
     }
 

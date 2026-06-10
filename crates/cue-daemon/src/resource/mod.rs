@@ -25,6 +25,7 @@ use crate::config::ResourceConfig;
 
 pub mod cli;
 pub mod mock;
+pub mod nvidia;
 pub mod provider;
 pub mod registry;
 
@@ -35,6 +36,9 @@ pub(crate) use registry::ProviderRegistry;
 
 pub(crate) fn registry_from_config(config: &ResourceConfig) -> Result<ProviderRegistry> {
     let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
+    if let Some(provider) = nvidia::NvidiaGpuProvider::try_from_config(&config.nvidia) {
+        providers.push(Arc::new(provider));
+    }
     for (id, provider_config) in &config.cli {
         providers.push(Arc::new(cli::CliProvider::from_config(id, provider_config)));
     }
@@ -50,6 +54,7 @@ mod tests {
     #[test]
     fn registry_from_config_adds_cli_provider_routes() {
         let config = ResourceConfig {
+            nvidia: Default::default(),
             cli: BTreeMap::from([(
                 "license".to_string(),
                 CliResourceProviderConfig {
