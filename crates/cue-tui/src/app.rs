@@ -29,9 +29,13 @@ use crate::component::input_line::{InputLine, InputMsg};
 use crate::component::main_view::{Card, CardStatus, MainView, MainViewMsg, chain_step_label};
 use crate::component::sidebar::{OverviewCounts, Sidebar, SidebarItem, SidebarMsg};
 use crate::component::status_bar::{StatusBar, StatusBarMsg};
-use crate::target_config::{
-    TargetProfileSource, TargetSettingsSnapshot, connector_for_profile, display_path,
-    load_target_settings, save_default_profile,
+#[cfg(test)]
+use crate::target_config::{TargetProfileKind, TargetProfileSource, TargetSettingsSnapshot};
+use crate::target_config::{connector_for_profile, load_target_settings, save_default_profile};
+use crate::target_settings::{
+    TargetSettingsState, TargetSettingsView, format_target_settings_view,
+    saved_target_profile_feedback, target_profile_can_be_saved,
+    target_profile_supports_live_reconnect,
 };
 
 // ── Focus ──
@@ -190,88 +194,6 @@ enum DisplayTarget {
 #[derive(Debug, Clone)]
 struct JobPickerState {
     selected: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-struct TargetSettingsState {
-    snapshot: TargetSettingsSnapshot,
-    selected: usize,
-    notice: Option<String>,
-    /// Profile name waiting for an R-key reconnect trigger.
-    /// `None` when no pending live-reconnect is available.
-    pending_reconnect_profile: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct TargetSettingsView {
-    content: String,
-    profile_line_rows: Vec<usize>,
-}
-
-impl TargetSettingsState {
-    fn new(snapshot: TargetSettingsSnapshot) -> Self {
-        let selected = snapshot
-            .profiles
-            .iter()
-            .position(|profile| profile.name == snapshot.default_profile)
-            .unwrap_or(0);
-        Self {
-            snapshot,
-            selected,
-            notice: None,
-            pending_reconnect_profile: None,
-        }
-    }
-
-    fn with_notice(snapshot: TargetSettingsSnapshot, notice: String) -> Self {
-        let mut state = Self::new(snapshot);
-        state.notice = Some(notice);
-        state
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        if self.snapshot.profiles.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        let max = self.snapshot.profiles.len().saturating_sub(1) as isize;
-        let next = (self.selected as isize + delta).clamp(0, max);
-        self.selected = next as usize;
-    }
-
-    fn selected_profile_name(&self) -> Option<&str> {
-        self.snapshot
-            .profiles
-            .get(self.selected)
-            .map(|profile| profile.name.as_str())
-    }
-
-    fn select_first(&mut self) {
-        self.selected = 0;
-    }
-
-    fn select_last(&mut self) {
-        if !self.snapshot.profiles.is_empty() {
-            self.selected = self.snapshot.profiles.len() - 1;
-        }
-    }
-
-    fn select_profile_name(&mut self, profile_name: &str) {
-        if let Some(index) = self
-            .snapshot
-            .profiles
-            .iter()
-            .position(|profile| profile.name == profile_name)
-        {
-            self.selected = index;
-        }
-    }
-
-    fn select_index(&mut self, index: usize) {
-        if index < self.snapshot.profiles.len() {
-            self.selected = index;
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1352,16 +1274,16 @@ impl AppState {
     }
 
     fn save_selected_target_profile(&mut self) {
-        let Some((snapshot, profile_name)) = self.target_settings.as_ref().and_then(|state| {
+        let Some((snapshot, selected_profile)) = self.target_settings.as_ref().and_then(|state| {
             state
-                .selected_profile_name()
-                .map(|profile_name| (state.snapshot.clone(), profile_name.to_string()))
+                .selected_profile()
+                .map(|profile| (state.snapshot.clone(), profile.clone()))
         }) else {
             return;
         };
+        let profile_name = selected_profile.name.clone();
 
-        let selected_profile = snapshot.profiles.iter().find(|p| p.name == profile_name);
-        if selected_profile.is_some_and(|profile| !target_profile_can_be_saved(profile)) {
+        if !target_profile_can_be_saved(&selected_profile) {
             if let Some(state) = self.target_settings.as_mut() {
                 state.notice = Some(format!(
                     "`{profile_name}` is not a usable target profile; fix the config and reload"
@@ -1383,34 +1305,17 @@ impl AppState {
 
         match save_default_profile(&profile_name, &snapshot) {
             Ok(snapshot) => {
-                let source = display_path(&snapshot.source_path);
                 let selected_profile = snapshot.profiles.iter().find(|p| p.name == profile_name);
                 let can_live_reconnect = self.connection_controller.is_some()
                     && selected_profile.is_some_and(target_profile_supports_live_reconnect);
-                let notice = if self.session_profile_name.as_deref() == Some(profile_name.as_str())
-                {
-                    format!(
-                        "saved default profile `{profile_name}` to {source}; current session already uses it"
-                    )
-                } else if let Some(current_session) = self.session_profile_name.as_deref() {
-                    if can_live_reconnect {
-                        format!(
-                            "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}`. Press R to reconnect now"
-                        )
-                    } else {
-                        format!(
-                            "saved default profile `{profile_name}` to {source}; current session still uses `{current_session}` until reconnect/restart"
-                        )
-                    }
-                } else {
-                    format!(
-                        "saved default profile `{profile_name}` to {source}; reconnect/restart cue to apply"
-                    )
-                };
-                let mut next_state = TargetSettingsState::with_notice(snapshot, notice);
-                if can_live_reconnect
-                    && self.session_profile_name.as_deref() != Some(profile_name.as_str())
-                {
+                let feedback = saved_target_profile_feedback(
+                    &snapshot,
+                    &profile_name,
+                    self.session_profile_name.as_deref(),
+                    can_live_reconnect,
+                );
+                let mut next_state = TargetSettingsState::with_notice(snapshot, feedback.notice);
+                if feedback.pending_reconnect {
                     next_state.pending_reconnect_profile = Some(profile_name.clone());
                 }
                 self.target_settings = Some(next_state);
@@ -3428,114 +3333,6 @@ fn format_cron_trigger_record(
     lines.join("\n")
 }
 
-fn format_target_settings_view(
-    state: &TargetSettingsState,
-    session_profile_name: Option<&str>,
-) -> TargetSettingsView {
-    let mut lines = vec![
-        format!("source: {}", display_path(&state.snapshot.source_path)),
-        format!(
-            "current session target: {}",
-            session_profile_name.unwrap_or("n/a")
-        ),
-        format!("default on next launch: {}", state.snapshot.default_profile),
-        format!(
-            "ssh auto-detection: {}",
-            if state.snapshot.auto_detect_ssh {
-                "enabled (~/.ssh/config)"
-            } else {
-                "disabled"
-            }
-        ),
-        match state.selected_profile_name() {
-            Some(selected) if selected == state.snapshot.default_profile => {
-                format!("selection: {selected} (already the saved default)")
-            }
-            Some(selected) => {
-                format!("selection: {selected} (press Enter to save for next launch)")
-            }
-            None => "selection: none".into(),
-        },
-        "Ctrl+R reloads target profiles from disk; Esc or Ctrl+T closes this dialog.".into(),
-        String::new(),
-        "profiles:".into(),
-    ];
-    let mut profile_line_rows = Vec::new();
-
-    for (index, profile) in state.snapshot.profiles.iter().enumerate() {
-        profile_line_rows.push(lines.len());
-        let marker = if index == state.selected { ">" } else { " " };
-        let mut tags = Vec::new();
-        if session_profile_name == Some(profile.name.as_str()) {
-            tags.push("session");
-        }
-        if state.snapshot.default_profile == profile.name {
-            tags.push("default");
-        }
-        if Some(profile.name.as_str()) == state.selected_profile_name() {
-            tags.push("selected");
-        }
-        if let Some(source_tag) = target_profile_source_tag(profile) {
-            tags.push(source_tag);
-        }
-        if let Some(alert) = target_profile_alert(profile) {
-            tags.push(alert);
-        }
-        let tags = if tags.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", tags.join(", "))
-        };
-        lines.push(format!(
-            "{marker} {} ({}){}",
-            profile.name, profile.transport, tags
-        ));
-        lines.push(format!("    {}", profile.detail));
-    }
-
-    if let Some(notice) = &state.notice {
-        lines.push(String::new());
-        lines.push(format!("note: {notice}"));
-    }
-
-    TargetSettingsView {
-        content: lines.join("\n"),
-        profile_line_rows,
-    }
-}
-
-fn target_profile_alert(
-    profile: &crate::target_config::TargetProfileSummary,
-) -> Option<&'static str> {
-    match profile.transport.as_str() {
-        "missing" => Some("missing"),
-        "invalid" => Some("invalid"),
-        _ if profile.detail == "unrecognized transport kind" => Some("invalid"),
-        _ => None,
-    }
-}
-
-fn target_profile_source_tag(
-    profile: &crate::target_config::TargetProfileSummary,
-) -> Option<&'static str> {
-    match profile.source {
-        TargetProfileSource::Local => Some("permanent"),
-        TargetProfileSource::Configured => Some("configured"),
-        TargetProfileSource::AutoDetectedSsh => Some("auto"),
-        TargetProfileSource::Missing => None,
-    }
-}
-
-fn target_profile_supports_live_reconnect(
-    profile: &crate::target_config::TargetProfileSummary,
-) -> bool {
-    profile.is_usable_target()
-}
-
-fn target_profile_can_be_saved(profile: &crate::target_config::TargetProfileSummary) -> bool {
-    profile.is_usable_target()
-}
-
 fn format_job_list_snapshot(jobs: &[JobInfo]) -> String {
     if jobs.is_empty() {
         return "no jobs".into();
@@ -3874,9 +3671,19 @@ mod tests {
     ) -> crate::target_config::TargetProfileSummary {
         crate::target_config::TargetProfileSummary {
             name: name.into(),
-            transport: transport.into(),
+            transport: test_target_profile_kind(transport),
             detail: detail.into(),
             source,
+        }
+    }
+
+    fn test_target_profile_kind(transport: &str) -> TargetProfileKind {
+        match transport {
+            "unix" => TargetProfileKind::Unix,
+            "ssh" => TargetProfileKind::Ssh,
+            "invalid" => TargetProfileKind::Invalid,
+            "missing" => TargetProfileKind::Missing,
+            other => TargetProfileKind::Unsupported(other.into()),
         }
     }
 
@@ -3891,19 +3698,6 @@ mod tests {
             default_profile: default_profile.into(),
             profiles,
         }
-    }
-
-    #[test]
-    fn ssh_target_profile_has_no_restart_only_alert() {
-        let profile = test_target_profile(
-            "remote",
-            "ssh",
-            "devbox | cued gateway --stdio",
-            TargetProfileSource::Configured,
-        );
-
-        assert_eq!(target_profile_alert(&profile), None);
-        assert!(target_profile_supports_live_reconnect(&profile));
     }
 
     #[test]
@@ -4939,24 +4733,6 @@ destination = "devbox"
         }));
 
         assert!(!state.target_settings_open());
-    }
-
-    #[test]
-    fn target_settings_marks_missing_profiles() {
-        let state = TargetSettingsState::new(test_target_snapshot(
-            "/tmp/client.toml",
-            "remote",
-            vec![test_target_profile(
-                "remote",
-                "missing",
-                "profile is referenced by default_profile but not defined",
-                TargetProfileSource::Missing,
-            )],
-        ));
-
-        let view = format_target_settings_view(&state, Some("local"));
-
-        assert!(view.content.contains("[default, selected, missing]"));
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod component;
 mod event;
 mod history;
 mod target_config;
+mod target_settings;
 mod terminal;
 mod ui;
 

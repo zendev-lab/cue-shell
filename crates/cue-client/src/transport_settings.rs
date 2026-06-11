@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -13,18 +14,62 @@ use crate::transport_config::{
     validate_client_config_root_sections, validate_default_profile_name, validate_profile_name,
 };
 
+const TRANSPORT_KEYS: &[&str] = &[
+    "auto_detect_ssh",
+    "default_profile",
+    "discovery",
+    "profiles",
+];
+const UNIX_PROFILE_KEYS: &[&str] = &["transport", "socket"];
+const SSH_PROFILE_KEYS: &[&str] = &[
+    "transport",
+    "destination",
+    "gateway_command",
+    "start_command",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportProfileSummary {
     pub name: String,
-    pub transport: String,
+    pub transport: TransportProfileKind,
     pub detail: String,
     pub source: TransportProfileSource,
 }
 
 impl TransportProfileSummary {
     pub fn is_usable_target(&self) -> bool {
-        self.source != TransportProfileSource::Missing
-            && matches!(self.transport.as_str(), "unix" | "ssh")
+        self.transport.is_usable_target()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportProfileKind {
+    Unix,
+    Ssh,
+    Invalid,
+    Missing,
+    Unsupported(String),
+}
+
+impl TransportProfileKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Unix => "unix",
+            Self::Ssh => "ssh",
+            Self::Invalid => "invalid",
+            Self::Missing => "missing",
+            Self::Unsupported(kind) => kind.as_str(),
+        }
+    }
+
+    fn is_usable_target(&self) -> bool {
+        matches!(self, Self::Unix | Self::Ssh)
+    }
+}
+
+impl fmt::Display for TransportProfileKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -88,6 +133,7 @@ pub fn parse_transport_snapshot(
     validate_client_config_root_sections(text, path)?;
     let document: Value =
         toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
+    validate_transport_section(&document)?;
     snapshot_from_value(path.to_path_buf(), &document, detected_hosts)
         .with_context(|| format!("parse transport settings {}", path.display()))
 }
@@ -99,6 +145,7 @@ fn parse_transport_snapshot_with_config_detection(
     validate_client_config_root_sections(text, path)?;
     let document: Value =
         toml::from_str(text).with_context(|| format!("parse config {}", path.display()))?;
+    validate_transport_section(&document)?;
     let discovery = transport_discovery_config(&document)?;
     let detected_hosts = detected_transport_hosts_for_snapshot(&discovery);
     snapshot_from_value(path.to_path_buf(), &document, &detected_hosts)
@@ -181,14 +228,14 @@ fn snapshot_from_value(
     {
         profiles.push(TransportProfileSummary {
             name: default_profile.clone(),
-            transport: "missing".into(),
+            transport: TransportProfileKind::Missing,
             detail: "profile is referenced by default_profile but not defined".into(),
             source: TransportProfileSource::Missing,
         });
         profiles.sort_by(|left, right| {
             left.name
                 .cmp(&right.name)
-                .then_with(|| left.transport.cmp(&right.transport))
+                .then_with(|| left.transport.as_str().cmp(right.transport.as_str()))
         });
     }
 
@@ -227,7 +274,7 @@ fn merged_profile_summaries(
             .entry(host.clone())
             .or_insert_with(|| TransportProfileSummary {
                 name: host.clone(),
-                transport: "ssh".into(),
+                transport: TransportProfileKind::Ssh,
                 detail: format!("{host} | {}", default_gateway_command()),
                 source: TransportProfileSource::AutoDetectedSsh,
             });
@@ -245,35 +292,43 @@ fn summarize_profile(name: &str, profile: &Value) -> TransportProfileSummary {
     let Some(table) = profile.as_table() else {
         return TransportProfileSummary {
             name: name.to_string(),
-            transport: "invalid".into(),
+            transport: TransportProfileKind::Invalid,
             detail: "profile value must be a TOML table".into(),
             source: TransportProfileSource::Configured,
         };
     };
 
-    let Some(transport) = table.get("transport").and_then(Value::as_str) else {
-        return TransportProfileSummary {
-            name: name.to_string(),
-            transport: "invalid".into(),
-            detail: "profile is missing transport".into(),
-            source: TransportProfileSource::Configured,
-        };
+    let transport = match profile_transport_string(
+        table,
+        "profile is missing transport",
+        "profile transport must be a string",
+    ) {
+        Ok(transport) => transport,
+        Err(detail) => {
+            return invalid_configured_profile(name, detail);
+        }
     };
 
     match transport {
         "unix" => {
+            if let Some(detail) = unknown_profile_field_detail(table, UNIX_PROFILE_KEYS) {
+                return invalid_configured_profile(name, detail);
+            }
             let socket = match optional_socket_string(table) {
                 Ok(socket) => socket,
                 Err(detail) => return invalid_configured_profile(name, detail),
             };
             TransportProfileSummary {
                 name: name.to_string(),
-                transport: "unix".into(),
+                transport: TransportProfileKind::Unix,
                 detail: format!("socket: {socket}"),
                 source: TransportProfileSource::Configured,
             }
         }
         "ssh" => {
+            if let Some(detail) = unknown_profile_field_detail(table, SSH_PROFILE_KEYS) {
+                return invalid_configured_profile(name, detail);
+            }
             let destination = match required_non_empty_string(table, "destination") {
                 Ok(destination) => destination,
                 Err(detail) => return invalid_configured_profile(name, detail),
@@ -293,14 +348,14 @@ fn summarize_profile(name: &str, profile: &Value) -> TransportProfileSummary {
             }
             TransportProfileSummary {
                 name: name.to_string(),
-                transport: "ssh".into(),
+                transport: TransportProfileKind::Ssh,
                 detail: format!("{destination} | {gateway_command}"),
                 source: TransportProfileSource::Configured,
             }
         }
         other => TransportProfileSummary {
             name: name.to_string(),
-            transport: other.to_string(),
+            transport: TransportProfileKind::Unsupported(other.to_string()),
             detail: "unrecognized transport kind".into(),
             source: TransportProfileSource::Configured,
         },
@@ -330,9 +385,20 @@ fn socket_string(value: &Value) -> Result<&str, String> {
 fn invalid_configured_profile(name: &str, detail: impl Into<String>) -> TransportProfileSummary {
     TransportProfileSummary {
         name: name.to_string(),
-        transport: "invalid".into(),
+        transport: TransportProfileKind::Invalid,
         detail: detail.into(),
         source: TransportProfileSource::Configured,
+    }
+}
+
+fn profile_transport_string<'a>(
+    table: &'a Map<String, Value>,
+    missing_detail: &'static str,
+    wrong_type_detail: &'static str,
+) -> Result<&'a str, String> {
+    match table.get("transport") {
+        Some(value) => value.as_str().ok_or_else(|| wrong_type_detail.to_string()),
+        None => Err(missing_detail.to_string()),
     }
 }
 
@@ -380,28 +446,34 @@ fn summarize_local_profile(profile: Option<&Value>) -> TransportProfileSummary {
     let Some(table) = profile.as_table() else {
         return TransportProfileSummary {
             name: "local".into(),
-            transport: "invalid".into(),
+            transport: TransportProfileKind::Invalid,
             detail: "profile value must be a TOML table".into(),
             source: TransportProfileSource::Configured,
         };
     };
 
-    let Some(transport) = table.get("transport").and_then(Value::as_str) else {
-        return TransportProfileSummary {
-            name: "local".into(),
-            transport: "invalid".into(),
-            detail: "local profile is missing transport".into(),
-            source: TransportProfileSource::Configured,
-        };
+    let transport = match profile_transport_string(
+        table,
+        "local profile is missing transport",
+        "local profile transport must be a string",
+    ) {
+        Ok(transport) => transport,
+        Err(detail) => {
+            return invalid_configured_profile("local", detail);
+        }
     };
 
     if transport != "unix" {
         return TransportProfileSummary {
             name: "local".into(),
-            transport: "invalid".into(),
+            transport: TransportProfileKind::Invalid,
             detail: "local profile is reserved for unix transport".into(),
             source: TransportProfileSource::Configured,
         };
+    }
+
+    if let Some(detail) = unknown_profile_field_detail(table, UNIX_PROFILE_KEYS) {
+        return invalid_configured_profile("local", detail);
     }
 
     let socket = match optional_socket_string(table) {
@@ -411,7 +483,7 @@ fn summarize_local_profile(profile: Option<&Value>) -> TransportProfileSummary {
 
     TransportProfileSummary {
         name: "local".into(),
-        transport: "unix".into(),
+        transport: TransportProfileKind::Unix,
         detail: format!("socket: {socket}"),
         source: TransportProfileSource::Local,
     }
@@ -420,7 +492,7 @@ fn summarize_local_profile(profile: Option<&Value>) -> TransportProfileSummary {
 fn builtin_local_profile_summary() -> TransportProfileSummary {
     TransportProfileSummary {
         name: "local".into(),
-        transport: "unix".into(),
+        transport: TransportProfileKind::Unix,
         detail: format!("socket: {}", default_socket_path().display()),
         source: TransportProfileSource::Local,
     }
@@ -428,6 +500,30 @@ fn builtin_local_profile_summary() -> TransportProfileSummary {
 
 fn transport_table(document: &Value) -> Option<&Map<String, Value>> {
     document.get("transport")?.as_table()
+}
+
+fn validate_transport_section(document: &Value) -> Result<()> {
+    let Some(value) = document.get("transport") else {
+        return Ok(());
+    };
+    let Some(transport) = value.as_table() else {
+        bail!("transport must be a table");
+    };
+    validate_known_keys(transport, "transport", TRANSPORT_KEYS)
+}
+
+fn validate_known_keys(table: &Map<String, Value>, scope: &str, allowed: &[&str]) -> Result<()> {
+    if let Some(key) = table.keys().find(|key| !allowed.contains(&key.as_str())) {
+        bail!("unknown field `{key}` in {scope}");
+    }
+    Ok(())
+}
+
+fn unknown_profile_field_detail(table: &Map<String, Value>, allowed: &[&str]) -> Option<String> {
+    table
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+        .map(|key| format!("unknown field `{key}`"))
 }
 
 fn transport_auto_detect_ssh(document: &Value) -> Result<bool> {
@@ -562,7 +658,7 @@ gateway_command = "cued gateway --stdio --socket /tmp/remote.sock"
             snapshot.profiles[0],
             TransportProfileSummary {
                 name: "local".into(),
-                transport: "unix".into(),
+                transport: TransportProfileKind::Unix,
                 detail: "socket: /tmp/cue.sock".into(),
                 source: TransportProfileSource::Local,
             }
@@ -571,7 +667,7 @@ gateway_command = "cued gateway --stdio --socket /tmp/remote.sock"
             snapshot.profiles[1],
             TransportProfileSummary {
                 name: "remote".into(),
-                transport: "ssh".into(),
+                transport: TransportProfileKind::Ssh,
                 detail: "devbox | cued gateway --stdio --socket /tmp/remote.sock".into(),
                 source: TransportProfileSource::Configured,
             }
@@ -667,7 +763,7 @@ socket = {socket}
                 .iter()
                 .find(|profile| profile.name == "remote")
                 .expect("remote profile is summarized");
-            assert_eq!(profile.transport, "invalid");
+            assert_eq!(profile.transport, TransportProfileKind::Invalid);
             assert_eq!(profile.detail, detail);
             assert!(!profile.is_usable_target());
         }
@@ -693,7 +789,7 @@ socket = " /tmp/cue.sock"
             snapshot.profiles.first(),
             Some(&TransportProfileSummary {
                 name: "local".into(),
-                transport: "invalid".into(),
+                transport: TransportProfileKind::Invalid,
                 detail: "unix profile socket must not have leading or trailing whitespace".into(),
                 source: TransportProfileSource::Configured,
             })
@@ -721,7 +817,7 @@ destination = " "
             .iter()
             .find(|profile| profile.name == "remote")
             .expect("remote profile is summarized");
-        assert_eq!(profile.transport, "invalid");
+        assert_eq!(profile.transport, TransportProfileKind::Invalid);
         assert_eq!(profile.detail, "ssh profile destination is empty");
         assert!(!profile.is_usable_target());
     }
@@ -770,7 +866,7 @@ destination = "devbox"
                 .iter()
                 .find(|profile| profile.name == "remote")
                 .expect("remote profile is summarized");
-            assert_eq!(profile.transport, "invalid");
+            assert_eq!(profile.transport, TransportProfileKind::Invalid);
             assert_eq!(
                 profile.detail,
                 format!("ssh profile {field} must not have leading or trailing whitespace")
@@ -801,7 +897,7 @@ gateway_command = 7
             .iter()
             .find(|profile| profile.name == "remote")
             .expect("remote profile is summarized");
-        assert_eq!(profile.transport, "invalid");
+        assert_eq!(profile.transport, TransportProfileKind::Invalid);
         assert_eq!(
             profile.detail,
             "ssh profile gateway_command must be a string"
@@ -835,6 +931,59 @@ destination = "devbox"
     }
 
     #[test]
+    fn configured_profile_with_non_string_transport_is_invalid() {
+        let snapshot = parse_transport_snapshot(
+            Path::new("client.toml"),
+            r#"
+[transport]
+default_profile = "remote"
+
+[transport.profiles.remote]
+transport = 42
+destination = "devbox"
+"#,
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot
+                .profiles
+                .iter()
+                .find(|profile| profile.name == "remote")
+                .map(|profile| (profile.transport.as_str(), profile.detail.as_str())),
+            Some(("invalid", "profile transport must be a string"))
+        );
+    }
+
+    #[test]
+    fn configured_profile_with_unknown_field_is_invalid() {
+        let snapshot = parse_transport_snapshot(
+            Path::new("client.toml"),
+            r#"
+[transport]
+default_profile = "remote"
+
+[transport.profiles.remote]
+transport = "ssh"
+destination = "devbox"
+extra_field = "typo"
+"#,
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot
+                .profiles
+                .iter()
+                .find(|profile| profile.name == "remote")
+                .map(|profile| (profile.transport.as_str(), profile.detail.as_str())),
+            Some(("invalid", "unknown field `extra_field`"))
+        );
+    }
+
+    #[test]
     fn local_profile_without_transport_is_invalid() {
         let snapshot = parse_transport_snapshot(
             Path::new("client.toml"),
@@ -853,8 +1002,35 @@ socket = "/tmp/ignored.sock"
             snapshot.profiles.first(),
             Some(&TransportProfileSummary {
                 name: "local".into(),
-                transport: "invalid".into(),
+                transport: TransportProfileKind::Invalid,
                 detail: "local profile is missing transport".into(),
+                source: TransportProfileSource::Configured,
+            })
+        );
+    }
+
+    #[test]
+    fn local_profile_with_non_string_transport_is_invalid() {
+        let snapshot = parse_transport_snapshot(
+            Path::new("client.toml"),
+            r#"
+[transport]
+default_profile = "local"
+
+[transport.profiles.local]
+transport = false
+socket = "/tmp/ignored.sock"
+"#,
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.profiles.first(),
+            Some(&TransportProfileSummary {
+                name: "local".into(),
+                transport: TransportProfileKind::Invalid,
+                detail: "local profile transport must be a string".into(),
                 source: TransportProfileSource::Configured,
             })
         );
@@ -883,7 +1059,7 @@ destination = "configured-remote"
                 .profiles
                 .iter()
                 .any(|profile| profile.name == "local"
-                    && profile.transport == "unix"
+                    && profile.transport == TransportProfileKind::Unix
                     && profile.source == TransportProfileSource::Local)
         );
         assert!(
@@ -891,7 +1067,7 @@ destination = "configured-remote"
                 .profiles
                 .iter()
                 .any(|profile| profile.name == "devbox"
-                    && profile.transport == "ssh"
+                    && profile.transport == TransportProfileKind::Ssh
                     && profile.source == TransportProfileSource::AutoDetectedSsh)
         );
         assert_eq!(
@@ -924,7 +1100,7 @@ destination = "bad"
             snapshot.profiles.first(),
             Some(&TransportProfileSummary {
                 name: "local".into(),
-                transport: "invalid".into(),
+                transport: TransportProfileKind::Invalid,
                 detail: "local profile is reserved for unix transport".into(),
                 source: TransportProfileSource::Configured,
             })
@@ -1064,6 +1240,21 @@ profiles = "remote"
     }
 
     #[test]
+    fn snapshot_rejects_unknown_transport_field() {
+        let error = parse_transport_snapshot(
+            Path::new("client.toml"),
+            r#"
+[transport]
+default_profiel = "remote"
+"#,
+            &Default::default(),
+        )
+        .expect_err("unknown transport fields should fail settings loading");
+
+        assert!(format!("{error:#}").contains("unknown field `default_profiel` in transport"));
+    }
+
+    #[test]
     fn update_default_profile_preserves_other_sections() {
         let mut document: Value = toml::from_str(
             r#"
@@ -1168,7 +1359,7 @@ profiles = "bad"
             default_profile: "local".into(),
             profiles: vec![TransportProfileSummary {
                 name: "local".into(),
-                transport: "unix".into(),
+                transport: TransportProfileKind::Unix,
                 detail: format!("socket: {}", default_socket_path().display()),
                 source: TransportProfileSource::Local,
             }],
@@ -1200,7 +1391,7 @@ profiles = "bad"
                 default_profile: "local".into(),
                 profiles: vec![TransportProfileSummary {
                     name: profile_name.into(),
-                    transport: "unix".into(),
+                    transport: TransportProfileKind::Unix,
                     detail: format!("socket: {}", default_socket_path().display()),
                     source: TransportProfileSource::Configured,
                 }],
@@ -1221,7 +1412,7 @@ profiles = "bad"
             default_profile: "local".into(),
             profiles: vec![TransportProfileSummary {
                 name: "remote".into(),
-                transport: "missing".into(),
+                transport: TransportProfileKind::Missing,
                 detail: "profile is referenced by default_profile but not defined".into(),
                 source: TransportProfileSource::Missing,
             }],

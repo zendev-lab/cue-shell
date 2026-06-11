@@ -350,7 +350,7 @@ pub(crate) fn detected_transport_hosts(
     discovery: &HostDiscoveryConfig,
 ) -> Result<BTreeSet<String>> {
     let mut hosts = detected_ssh_hosts()?;
-    hosts.extend(detected_configured_hosts(discovery));
+    hosts.extend(detected_configured_hosts(discovery)?);
     Ok(hosts)
 }
 

@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
+use anyhow::{Result, bail};
 use serde::Deserialize;
 
 use crate::config_paths::read_config_source;
@@ -26,14 +28,14 @@ impl HostDiscoveryConfig {
     }
 }
 
-pub fn detected_configured_hosts(config: &HostDiscoveryConfig) -> BTreeSet<String> {
+pub fn detected_configured_hosts(config: &HostDiscoveryConfig) -> Result<BTreeSet<String>> {
     detected_configured_hosts_from_vars(std::env::vars(), config)
 }
 
 fn detected_configured_hosts_from_vars<I, K, V>(
     vars: I,
     config: &HostDiscoveryConfig,
-) -> BTreeSet<String>
+) -> Result<BTreeSet<String>>
 where
     I: IntoIterator<Item = (K, V)>,
     K: AsRef<str>,
@@ -41,7 +43,7 @@ where
 {
     let mut hosts = BTreeSet::new();
     if config.is_empty() {
-        return hosts;
+        return Ok(hosts);
     }
 
     for (key, value) in vars {
@@ -56,7 +58,7 @@ where
         }
 
         if contains_key(&config.env_hostfiles, key) {
-            collect_hosts_from_hostfile(value, &mut hosts);
+            collect_hosts_from_hostfile(value, &mut hosts)?;
         }
 
         if contains_key(&config.env_bracket_ranges, key) {
@@ -68,7 +70,7 @@ where
         }
     }
 
-    hosts
+    Ok(hosts)
 }
 
 fn contains_key(keys: &[String], key: &str) -> bool {
@@ -86,9 +88,10 @@ fn is_host_list_separator(ch: char) -> bool {
     code == 44 || code == 59 || ch.is_whitespace()
 }
 
-fn collect_hosts_from_hostfile(path: &str, hosts: &mut BTreeSet<String>) {
-    let Ok(Some(text)) = read_config_source(path.as_ref()) else {
-        return;
+fn collect_hosts_from_hostfile(path: &str, hosts: &mut BTreeSet<String>) -> Result<()> {
+    let path = Path::new(path);
+    let Some(text) = read_config_source(path)? else {
+        bail!("configured hostfile {} does not exist", path.display());
     };
 
     for line in text.lines() {
@@ -100,6 +103,7 @@ fn collect_hosts_from_hostfile(path: &str, hosts: &mut BTreeSet<String>) {
             collect_host_token(first_field, hosts);
         }
     }
+    Ok(())
 }
 
 fn collect_host_token(token: &str, hosts: &mut BTreeSet<String>) {
@@ -265,12 +269,15 @@ fn is_explicit_host(host: &str) -> bool {
 mod tests {
     use super::*;
 
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     #[test]
     fn env_host_discovery_is_opt_in() {
         let hosts = detected_configured_hosts_from_vars(
             [("CLUSTER_HOSTS", "node-a,node-b")],
             &HostDiscoveryConfig::default(),
-        );
+        )
+        .unwrap();
 
         assert!(hosts.is_empty());
     }
@@ -289,7 +296,8 @@ mod tests {
                 ("IGNORED_HOSTS", "node-c"),
             ],
             &config,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             hosts.into_iter().collect::<Vec<_>>(),
@@ -315,7 +323,8 @@ mod tests {
                 ("ENDPOINTS", "10.0.0.1:40104;10.0.0.2:40105"),
             ],
             &config,
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             hosts.into_iter().collect::<Vec<_>>(),
@@ -335,7 +344,8 @@ mod tests {
             ..Default::default()
         };
         let hosts =
-            detected_configured_hosts_from_vars([("NODELIST", "gpu-[01-03,08],login")], &config);
+            detected_configured_hosts_from_vars([("NODELIST", "gpu-[01-03,08],login")], &config)
+                .unwrap();
 
         assert_eq!(
             hosts.into_iter().collect::<Vec<_>>(),
@@ -347,5 +357,27 @@ mod tests {
                 "login".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn configured_hostfile_read_failure_is_reported() {
+        let missing = std::env::temp_dir().join(format!(
+            "cue-client-missing-hostfile-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let missing = missing.to_string_lossy().into_owned();
+        let config = HostDiscoveryConfig {
+            env_hostfiles: vec!["HOSTFILE".into()],
+            ..Default::default()
+        };
+
+        let error = detected_configured_hosts_from_vars([("HOSTFILE", missing.as_str())], &config)
+            .expect_err("missing configured hostfile should be visible");
+
+        assert!(format!("{error:#}").contains("configured hostfile"));
     }
 }

@@ -10,7 +10,8 @@ use cue_client::{
 use crate::client::ClientConnector;
 
 pub(crate) use cue_client::{
-    TransportProfileSource as TargetProfileSource, TransportProfileSummary as TargetProfileSummary,
+    TransportProfileKind as TargetProfileKind, TransportProfileSource as TargetProfileSource,
+    TransportProfileSummary as TargetProfileSummary,
     TransportSettingsSnapshot as TargetSettingsSnapshot,
 };
 

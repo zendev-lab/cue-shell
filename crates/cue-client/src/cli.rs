@@ -288,9 +288,10 @@ impl TargetProfileJson {
         }
         .to_string();
         let usable = summary.is_usable_target();
+        let transport = summary.transport.as_str().to_string();
         Self {
             name: summary.name,
-            transport: summary.transport,
+            transport,
             detail: summary.detail,
             source,
             usable,
@@ -422,7 +423,7 @@ mod tests {
             default_profile: "local".into(),
             profiles: vec![crate::TransportProfileSummary {
                 name: "local".into(),
-                transport: "unix".into(),
+                transport: crate::TransportProfileKind::Unix,
                 detail: "socket: /tmp/cued.sock".into(),
                 source: crate::TransportProfileSource::Local,
             }],

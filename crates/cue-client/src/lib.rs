@@ -34,7 +34,8 @@ pub use transport_config::{
     validate_client_config_root_sections,
 };
 pub use transport_settings::{
-    TransportProfileSource, TransportProfileSummary, TransportSettingsSnapshot,
-    load_transport_settings_snapshot, load_transport_settings_snapshot_from_sources,
-    parse_transport_snapshot, save_default_transport_profile,
+    TransportProfileKind, TransportProfileSource, TransportProfileSummary,
+    TransportSettingsSnapshot, load_transport_settings_snapshot,
+    load_transport_settings_snapshot_from_sources, parse_transport_snapshot,
+    save_default_transport_profile,
 };
