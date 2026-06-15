@@ -293,7 +293,7 @@ Which argument type each command expects:
 
 | Command | Argument | Mode Params |
 |---|---|---|
-| `:run` | Chain | ✓ (cwd, wrapper, scope, pty, need.<resource>) |
+| `:run` | Chain | ✓ (cwd, wrapper, scope, pty, sandbox, sandbox.upper, need.<resource>) |
 | `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, wrapper, scope, need.<resource>) |
 | `:kill` | Job/Cron IdRef (`J<n>` or `C<n>`) | ✗ |
 | `:retry` | Job IdRef (`J<n>`) | ✗ |
