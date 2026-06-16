@@ -259,7 +259,11 @@ async fn create_and_persist_root_scope(
 
     let env: BTreeMap<String, String> = std::env::vars().collect();
     let cwd = std::env::current_dir().context("read current working directory for root scope")?;
-    let snapshot = EnvSnapshot { env, cwd };
+    let snapshot = EnvSnapshot {
+        env,
+        cwd,
+        execution: Default::default(),
+    };
     let root = Scope::root(snapshot);
     let head = root.hash;
 
@@ -306,6 +310,7 @@ mod tests {
         let snapshot = EnvSnapshot {
             env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp/persisted"),
+            execution: Default::default(),
         };
         let scope = Scope::root(snapshot);
         storage::insert_scope(&conn, &scope).unwrap();
@@ -404,6 +409,7 @@ mod tests {
                     set: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
                     unset: vec![],
                     cwd: None,
+                    execution: None,
                 },
                 reply: fork_tx,
             })
@@ -534,6 +540,7 @@ mod tests {
                     set: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
                     unset: vec![],
                     cwd: None,
+                    execution: None,
                 },
                 reply: derive_tx,
             })
@@ -559,6 +566,7 @@ mod tests {
         let root = Scope::root(EnvSnapshot {
             env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp/root"),
+            execution: Default::default(),
         });
         let child = Scope::fork(
             root.hash,
@@ -567,6 +575,7 @@ mod tests {
                 set: BTreeMap::new(),
                 unset: vec![],
                 cwd: Some(PathBuf::from("/tmp/child")),
+                execution: None,
             },
         );
         storage::insert_scope(&conn, &root).expect("insert root scope");
@@ -621,6 +630,7 @@ mod tests {
         let root = Scope::root(EnvSnapshot {
             env: BTreeMap::from([(String::from("PATH"), String::from("/usr/bin"))]),
             cwd: PathBuf::from("/tmp/root"),
+            execution: Default::default(),
         });
         let missing_snapshot = Scope {
             hash: ScopeHash([9; 32]),

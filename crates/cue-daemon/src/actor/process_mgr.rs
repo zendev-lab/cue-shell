@@ -255,7 +255,8 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     };
 
                     let effective_snapshot = effective_snapshot(&snapshot);
-                    let cwd = effective_cwd(&effective_snapshot, options.cwd_override.as_deref());
+                    let effective_options = effective_process_options(&options, &effective_snapshot);
+                    let cwd = effective_cwd(&effective_snapshot, effective_options.cwd_override.as_deref());
                     if !cwd.is_dir() {
                         error!(
                             %job_id,
@@ -274,7 +275,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         job_id,
                         &plan,
                         &effective_snapshot,
-                        &options,
+                        &effective_options,
                         sys.clone(),
                         cleanup_tx.clone(),
                     )
@@ -615,10 +616,33 @@ fn configure_command(
     cwd_override: Option<&Path>,
     sandbox: Option<&crate::sandbox::PreparedSandbox>,
 ) {
+    let cwd = effective_cwd_path(snapshot, cwd_override, sandbox);
     cmd.env_clear();
     cmd.envs(snapshot.env.iter());
-    cmd.current_dir(effective_cwd_path(snapshot, cwd_override, sandbox));
+    cmd.env("PWD", &cwd);
+    cmd.current_dir(cwd);
     cmd.kill_on_drop(true);
+}
+
+fn effective_process_options(
+    options: &ProcessJobOptions,
+    snapshot: &EnvSnapshot,
+) -> ProcessJobOptions {
+    ProcessJobOptions {
+        cwd_override: options.cwd_override.clone(),
+        sandbox: snapshot
+            .execution
+            .sandbox
+            .as_ref()
+            .map(crate::sandbox::SandboxConfig::from)
+            .or_else(|| options.sandbox.clone()),
+        wrapper_enabled: options.wrapper_enabled,
+        pty_enabled: snapshot
+            .execution
+            .pty_enabled
+            .unwrap_or(options.pty_enabled),
+        direct_output_client: options.direct_output_client,
+    }
 }
 
 fn effective_cwd<'a>(snapshot: &'a EnvSnapshot, cwd_override: Option<&'a Path>) -> &'a Path {
@@ -719,7 +743,7 @@ fn prepare_job_sandbox(
     job_id: JobId,
     snapshot: &EnvSnapshot,
     options: &ProcessJobOptions,
-) -> Result<Option<crate::sandbox::PreparedSandbox>, ()> {
+) -> Result<Option<crate::sandbox::PreparedSandbox>, String> {
     let Some(config) = options.sandbox.as_ref() else {
         return Ok(None);
     };
@@ -727,8 +751,45 @@ fn prepare_job_sandbox(
     crate::sandbox::prepare(job_id, config, lower_dir)
         .map(Some)
         .map_err(|error| {
-            error!(%job_id, err = %error, "process_mgr: sandbox setup failed");
+            let message = format!("sandbox setup failed: {error:#}");
+            error!(%job_id, err = %message, "process_mgr: sandbox setup failed");
+            message
         })
+}
+
+async fn prepare_job_sandbox_or_emit(
+    job_id: JobId,
+    snapshot: &EnvSnapshot,
+    options: &ProcessJobOptions,
+    sys: &ActorSystem,
+) -> Result<Option<crate::sandbox::PreparedSandbox>, ()> {
+    match prepare_job_sandbox(job_id, snapshot, options) {
+        Ok(sandbox) => Ok(sandbox),
+        Err(message) => {
+            emit_spawn_setup_stderr(sys, job_id, &message, options.direct_output_client).await;
+            Err(())
+        }
+    }
+}
+
+async fn emit_spawn_setup_stderr(
+    sys: &ActorSystem,
+    job_id: JobId,
+    message: &str,
+    direct_output_client: Option<u64>,
+) {
+    let line = format!("{message}\n");
+    let stderr_log = Arc::new(Mutex::new(open_stderr_log(job_id).await));
+    write_log(job_id, LogStream::Stderr, &stderr_log, line.as_bytes()).await;
+    emit_output(
+        sys,
+        job_id,
+        OutputStream::Stderr,
+        line.as_bytes(),
+        direct_output_client,
+    )
+    .await;
+    emit_output_eof(sys, job_id, direct_output_client).await;
 }
 
 /// Spawn a single-segment job with pipes (stdout/stderr piped, no PTY).
@@ -746,7 +807,7 @@ async fn spawn_single_pipe_job(
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
     let segment = &segments[0];
     let (program, args) = wrap_segment_if_enabled(&sys, options.wrapper_enabled, segment);
-    let sandbox = prepare_job_sandbox(job_id, snapshot, options)?;
+    let sandbox = prepare_job_sandbox_or_emit(job_id, snapshot, options, &sys).await?;
 
     let mut cmd = tokio::process::Command::new(&program);
     if !args.is_empty() {
@@ -930,7 +991,7 @@ async fn spawn_single_pty_job(
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
     let segment = &segments[0];
     let (program, args) = wrap_segment_if_enabled(&sys, options.wrapper_enabled, segment);
-    let sandbox = prepare_job_sandbox(job_id, snapshot, options)?;
+    let sandbox = prepare_job_sandbox_or_emit(job_id, snapshot, options, &sys).await?;
 
     let mut cmd = tokio::process::Command::new(&program);
     if !args.is_empty() {
@@ -1099,7 +1160,7 @@ async fn spawn_native_pipeline_job(
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
     let segments = expand_pipeline_segments(job_id, pipeline, snapshot)?;
-    let sandbox = prepare_job_sandbox(job_id, snapshot, options)?;
+    let sandbox = prepare_job_sandbox_or_emit(job_id, snapshot, options, &sys).await?;
     let NativePipelineSpawn {
         children,
         input,
@@ -1171,7 +1232,7 @@ async fn spawn_logical_job(
     sys: ActorSystem,
     cleanup_tx: mpsc::Sender<JobId>,
 ) -> Result<ProcessEntry, ()> {
-    let sandbox = prepare_job_sandbox(job_id, &snapshot, options)?;
+    let sandbox = prepare_job_sandbox_or_emit(job_id, &snapshot, options, &sys).await?;
     let log_file = open_output_log(job_id).await;
     let stderr_log = open_stderr_log(job_id).await;
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
@@ -2314,7 +2375,141 @@ mod tests {
                 ("USER".into(), "tester".into()),
             ]),
             cwd: PathBuf::from("/tmp/work"),
+            execution: Default::default(),
         }
+    }
+
+    fn process_options() -> ProcessJobOptions {
+        ProcessJobOptions {
+            cwd_override: None,
+            sandbox: None,
+            wrapper_enabled: false,
+            pty_enabled: true,
+            direct_output_client: None,
+        }
+    }
+
+    #[test]
+    fn effective_process_options_read_execution_settings_from_scope() {
+        let mut snapshot = snapshot();
+        snapshot.execution.pty_enabled = Some(false);
+        snapshot.execution.sandbox = Some(cue_core::scope::SandboxSettings {
+            mode: cue_core::scope::SandboxMode::Overlay,
+            upper: Some(cue_core::scope::SandboxUpper::Tmpfs),
+        });
+
+        let options = effective_process_options(&process_options(), &snapshot);
+
+        assert!(!options.pty_enabled);
+        assert_eq!(
+            options.sandbox,
+            Some(crate::sandbox::SandboxConfig {
+                mode: crate::sandbox::SandboxMode::Overlay,
+                upper: Some(crate::sandbox::SandboxUpper::Tmpfs),
+            })
+        );
+    }
+
+    #[test]
+    fn effective_process_options_fall_back_to_submitted_options() {
+        let mut options = process_options();
+        options.pty_enabled = false;
+        options.sandbox = Some(crate::sandbox::SandboxConfig {
+            mode: crate::sandbox::SandboxMode::Overlay,
+            upper: Some(crate::sandbox::SandboxUpper::Directory(PathBuf::from(
+                "/tmp/cue-upper",
+            ))),
+        });
+
+        let effective = effective_process_options(&options, &snapshot());
+
+        assert!(!effective.pty_enabled);
+        assert_eq!(effective.sandbox, options.sandbox);
+    }
+
+    #[test]
+    fn configure_command_sets_pwd_to_effective_cwd() {
+        let mut snapshot = snapshot();
+        snapshot.env.insert("PWD".into(), "/stale".into());
+        let cwd = std::env::temp_dir();
+        let mut cmd = tokio::process::Command::new("pwd");
+
+        configure_command(&mut cmd, &snapshot, Some(&cwd), None);
+
+        assert_eq!(cmd.as_std().get_current_dir(), Some(cwd.as_path()));
+        let pwd = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| (key == "PWD").then_some(value))
+            .flatten();
+        assert_eq!(pwd, Some(cwd.as_os_str()));
+    }
+
+    #[tokio::test]
+    async fn sandbox_setup_failure_is_emitted_to_stderr_output() {
+        let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+        let cwd = make_temp_dir();
+        let mut snapshot = snapshot();
+        snapshot.cwd = cwd.clone();
+        let mut options = process_options();
+        options.sandbox = Some(crate::sandbox::SandboxConfig {
+            mode: crate::sandbox::SandboxMode::Overlay,
+            upper: Some(crate::sandbox::SandboxUpper::Directory(PathBuf::from(
+                "/tmp/cue:bad-upper",
+            ))),
+        });
+
+        let result = spawn_single_pipe_job(
+            JobId(404),
+            &cue_core::pipeline::Pipeline {
+                segments: vec![cue_core::pipeline::PipeSegment {
+                    command: vec!["echo".into(), "unreachable".into()],
+                    pipe_to_next: None,
+                }],
+            },
+            &snapshot,
+            &options,
+            sys,
+            mpsc::channel(1).0,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("stderr event timeout")
+            .expect("stderr event");
+        match event {
+            super::super::EventBusMsg::Publish {
+                payload: EventPayload::OutputChunk { id, stream, data },
+                ..
+            } => {
+                assert_eq!(id, "J404");
+                assert_eq!(stream, OutputStream::Stderr);
+                assert!(data.contains("sandbox setup failed"));
+                assert!(
+                    data.contains("unsupported character")
+                        || data.contains("only supported on Linux"),
+                    "missing sandbox setup cause in stderr: {data}"
+                );
+            }
+            _ => panic!("expected stderr output chunk"),
+        }
+
+        std::fs::remove_dir_all(cwd).expect("remove temp dir");
     }
 
     #[tokio::test]
@@ -2644,6 +2839,7 @@ mod tests {
                                     snapshot: Some(EnvSnapshot {
                                         env: BTreeMap::new(),
                                         cwd: cwd.clone(),
+                                        execution: Default::default(),
                                     }),
                                 })))
                                 .expect("send scope reply");

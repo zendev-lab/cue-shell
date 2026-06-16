@@ -53,8 +53,10 @@ Stable job identities with an associated lifecycle state. See [`core-types.md`](
 ### Objects
 
 **Content-addressed environment snapshots** (`ScopeHash`): immutable
-`EnvSnapshot { env, cwd }`. Identity is purely by content (e.g. blake3) — no
-names or versions as sources of truth.
+`EnvSnapshot { env, cwd, execution }`. `execution` holds Scope-owned run/cron
+behavior such as explicit PTY setting, provider resource needs, and optional
+sandbox settings. Identity is purely by content (e.g. blake3) — no names or
+versions as sources of truth.
 
 ### Morphisms
 
@@ -65,17 +67,19 @@ struct EnvDelta {
     set: BTreeMap<String, String>,  // new or modified variables
     unset: Vec<String>,             // removed variables
     cwd: Option<PathBuf>,           // changed cwd (None = inherit)
+    execution: Option<ExecutionSettings>, // run/cron execution state (None = inherit)
 }
 ```
 
 ### Composition
 
-Deltas compose by overlay (right wins on keys, unset accumulates, last cwd wins):
+Deltas compose by overlay (right wins on keys, unset accumulates, last cwd/execution wins):
 
 ```
 δ₂ ∘ δ₁  =  { set: δ₁.set ∪ δ₂.set (δ₂ wins),
               unset: δ₁.unset ∪ δ₂.unset,
-              cwd: δ₂.cwd ?? δ₁.cwd }
+              cwd: δ₂.cwd ?? δ₁.cwd,
+              execution: δ₂.execution ?? δ₁.execution }
 ```
 
 ### Properties
@@ -85,7 +89,8 @@ Deltas compose by overlay (right wins on keys, unset accumulates, last cwd wins)
 - **Content-addressed equality**: two scopes are equal iff their hashes match
   (same design idea as Spore’s `sig hash`).
 - **Immutable store**: scopes are not mutated in place — forking creates a new
-  hash; HEAD moves, history does not rewrite.
+  hash; HEAD moves, history does not rewrite. `:run(...)` and `:cron(...)`
+  mode params can fork start scopes for execution without moving HEAD.
 
 Implementation: `crates/cue-daemon/src/actor/scope_store.rs`.
 

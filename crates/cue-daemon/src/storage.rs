@@ -931,7 +931,9 @@ mod tests {
     use std::path::PathBuf;
 
     use cue_core::job::CancelReason;
-    use cue_core::scope::EnvSnapshot;
+    use cue_core::scope::{
+        EnvSnapshot, ExecutionSettings, SandboxMode, SandboxSettings, SandboxUpper,
+    };
 
     use super::*;
 
@@ -1007,6 +1009,14 @@ mod tests {
         let snap = EnvSnapshot {
             env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp"),
+            execution: ExecutionSettings {
+                pty_enabled: Some(false),
+                needs: cue_core::Need::from_pairs([("gpu", cue_core::ResourceQuantity::Count(1))]),
+                sandbox: Some(SandboxSettings {
+                    mode: SandboxMode::Overlay,
+                    upper: Some(SandboxUpper::Tmpfs),
+                }),
+            },
         };
         let scope = Scope::root(snap);
         insert_scope(&conn, &scope).unwrap();
@@ -1015,7 +1025,7 @@ mod tests {
             .expect("scope exists");
         assert_eq!(loaded.hash, scope.hash);
         assert!(loaded.parent.is_none());
-        assert!(loaded.snapshot.is_some());
+        assert_eq!(loaded.snapshot, scope.snapshot);
     }
 
     #[test]
@@ -1024,6 +1034,7 @@ mod tests {
         let root = Scope::root(EnvSnapshot {
             env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp/root"),
+            execution: Default::default(),
         });
         let child = Scope::fork(
             root.hash,
@@ -1032,6 +1043,7 @@ mod tests {
                 set: BTreeMap::from([("FOO".into(), "bar".into())]),
                 unset: vec![],
                 cwd: Some(PathBuf::from("/tmp/child")),
+                execution: None,
             },
         );
         insert_scope(&conn, &root).unwrap();

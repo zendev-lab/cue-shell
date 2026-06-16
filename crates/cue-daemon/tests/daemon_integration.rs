@@ -235,6 +235,17 @@ fn job_id_from_created(resp: ResponsePayload) -> String {
     }
 }
 
+fn job_created_from_response(resp: ResponsePayload) -> (String, Option<String>) {
+    match resp {
+        ResponsePayload::Ok(OkPayload::JobCreated {
+            job_id,
+            start_scope,
+            ..
+        }) => (job_id, start_scope),
+        other => panic!("expected JobCreated, got {other:?}"),
+    }
+}
+
 /// Write a length-prefixed JSON message to the stream.
 async fn send<S>(stream: &mut S, msg: &Message)
 where
@@ -357,6 +368,71 @@ where
     wait_for_job_status(stream, request_id, job_id, |job| job.status.is_terminal())
         .await
         .status
+}
+
+async fn scope_cwd_from_list<S>(stream: &mut S, request_id: u32, scope_hash: &str) -> String
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let resp = roundtrip(
+        stream,
+        request_id,
+        RequestPayload::Eval {
+            input: ":scopes".into(),
+            mode: Mode::Job,
+        },
+    )
+    .await;
+    match resp {
+        ResponsePayload::Ok(OkPayload::ScopeList(scopes)) => {
+            scopes
+                .into_iter()
+                .find(|scope| scope.hash == scope_hash)
+                .unwrap_or_else(|| panic!("scope {scope_hash} missing from :scopes"))
+                .cwd
+        }
+        other => panic!("expected ScopeList, got {other:?}"),
+    }
+}
+
+async fn wait_for_done_job_matching<S>(
+    stream: &mut S,
+    mut request_id: u32,
+    exclude: &std::collections::HashSet<String>,
+    predicate: impl Fn(&JobInfo) -> bool,
+) -> JobInfo
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let resp = roundtrip(
+            stream,
+            request_id,
+            RequestPayload::Eval {
+                input: ":jobs".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        match resp {
+            ResponsePayload::Ok(OkPayload::JobList(list)) => {
+                if let Some(job) = list.into_iter().find(|job| {
+                    job.status == JobStatus::Done && !exclude.contains(&job.id) && predicate(job)
+                }) {
+                    return job;
+                }
+            }
+            other => panic!("expected JobList, got {other:?}"),
+        }
+        request_id += 1;
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "matching done job did not appear in time"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Subscribe to a set of channels.
@@ -709,6 +785,242 @@ timeout_ms = 5000
                 out,
                 ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.contains("leased")
             ));
+        }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_run_cwd_and_pty_mode_params_are_start_scope_state() {
+    run_daemon_test(async {
+        let env = TestEnv::new("run-cwd-scope");
+        let repo = env.root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let created = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: format!(":run(cwd={}, pty=false) /bin/pwd", repo.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let (job_id, start_scope) = job_created_from_response(created);
+        let start_scope = start_scope.expect("run should return a start scope");
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+
+        let out = roundtrip(
+            &mut stream,
+            20,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.trim() == repo.display().to_string()
+        ));
+        assert_eq!(
+            scope_cwd_from_list(&mut stream, 21, &start_scope).await,
+            repo.display().to_string()
+        );
+
+        let env_resp = roundtrip(
+            &mut stream,
+            22,
+            RequestPayload::Eval {
+                input: ":env".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            env_resp,
+            ResponsePayload::Ok(OkPayload::EvalText { ref text }) if !text.contains(&format!("cwd={}", repo.display()))
+        ));
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_run_need_params_are_admitted_from_start_scope() {
+    run_daemon_test(async {
+        let env = TestEnv::new("run-need-scope");
+        let provider_script = env.root.join("gpu-provider.sh");
+        let request_log = env.root.join("reserve.jsonl");
+        let bin_dir = env.root.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        write_executable_script(
+            &bin_dir.join("python"),
+            r#"#!/bin/sh
+printf '%s\n' "$GPU_TOKEN"
+"#,
+        );
+        std::fs::write(env.root.join("train.py"), "# fake training script\n")
+            .expect("write train.py");
+        write_executable_script(
+            &provider_script,
+            r#"#!/bin/sh
+command="$1"
+log="$2"
+case "$command" in
+  probe)
+    printf '{"units":[{"id":"gpu0","attrs":{}}]}'
+    ;;
+  reserve)
+    cat >> "$log"
+    printf '\n' >> "$log"
+    printf '{"ok":true,"grant_id":"gpu-grant","env":{"GPU_TOKEN":"reserved-from-scope"},"info":{}}'
+    ;;
+  release)
+    cat >/dev/null
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+        );
+        write_daemon_config(
+            &env,
+            &format!(
+                r#"
+[resources.cli.gpu]
+keys = ["gpu", "gpu_mem"]
+probe = ["{}", "probe", "{}"]
+reserve = ["{}", "reserve", "{}"]
+release = ["{}", "release", "{}"]
+timeout_ms = 5000
+"#,
+                provider_script.display(),
+                request_log.display(),
+                provider_script.display(),
+                request_log.display(),
+                provider_script.display(),
+                request_log.display(),
+            ),
+        );
+
+        let test_path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = env.spawn_daemon_with_env([("PATH", test_path)]);
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let created = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(need.gpu=1, need.gpu_mem=24GiB) python train.py".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let (job_id, start_scope) = job_created_from_response(created);
+        assert!(start_scope.is_some(), "resource run should return start scope");
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+
+        let out = roundtrip(
+            &mut stream,
+            20,
+            RequestPayload::Eval {
+                input: format!(":out {job_id}"),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.contains("reserved-from-scope")
+        ));
+
+        let request_log = std::fs::read_to_string(&request_log).expect("read reserve log");
+        assert!(request_log.contains(r#""gpu":{"kind":"count","value":1}"#));
+        assert!(request_log.contains(r#""gpu_mem":{"kind":"bytes","value":25769803776}"#));
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_run_overlay_tmpfs_mode_param_reaches_launch() {
+    run_daemon_test(async {
+        let env = TestEnv::new("run-overlay-tmpfs");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let created = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(sandbox=overlay, sandbox.upper=tmpfs) /bin/sh -c 'printf ok'".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let (job_id, start_scope) = job_created_from_response(created);
+        assert!(
+            start_scope.is_some(),
+            "sandbox run should return start scope"
+        );
+        let status = wait_for_job_terminal(&mut stream, 2, &job_id).await;
+
+        match status {
+            JobStatus::Done => {
+                let out = roundtrip(
+                    &mut stream,
+                    20,
+                    RequestPayload::Eval {
+                        input: format!(":out {job_id}"),
+                        mode: Mode::Job,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    out,
+                    ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.contains("ok")
+                ));
+            }
+            JobStatus::Failed => {
+                let err = roundtrip(
+                    &mut stream,
+                    21,
+                    RequestPayload::Eval {
+                        input: format!(":err {job_id}"),
+                        mode: Mode::Job,
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    err,
+                    ResponsePayload::Ok(OkPayload::Output { ref data, .. })
+                        if data.contains("overlay sandbox")
+                            || data.contains("tmpfs")
+                            || data.contains("only supported on Linux")
+                            || data.contains("Operation not permitted")
+                            || data.contains("permission denied")
+                ));
+            }
+            other => panic!("sandbox job should be terminal, got {other:?}"),
         }
 
         shutdown_daemon(&mut stream, &mut child).await;
@@ -1752,6 +2064,91 @@ async fn test_cron_add_and_list() {
             }
             other => panic!("expected CronList, got {other:?}"),
         }
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cron_cwd_mode_param_is_restored_scope_state() {
+    run_daemon_test(async {
+        let env = TestEnv::new("cron-cwd-scope");
+        let repo = env.root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        let resp = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: format!(":cron(cwd={}) every 1s /bin/pwd", repo.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(resp, ResponsePayload::Ok(OkPayload::CronAdded { .. })));
+
+        let initial = wait_for_done_job_matching(
+            &mut stream,
+            10,
+            &std::collections::HashSet::new(),
+            |job| job.pipeline == "/bin/pwd",
+        )
+        .await;
+        let out = roundtrip(
+            &mut stream,
+            30,
+            RequestPayload::Eval {
+                input: format!(":out {}", initial.id),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.trim() == repo.display().to_string()
+        ));
+
+        let before_restart = match roundtrip(
+            &mut stream,
+            31,
+            RequestPayload::Eval {
+                input: ":jobs".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await
+        {
+            ResponsePayload::Ok(OkPayload::JobList(list)) => {
+                list.into_iter().map(|job| job.id).collect::<std::collections::HashSet<_>>()
+            }
+            other => panic!("expected JobList, got {other:?}"),
+        };
+
+        shutdown_daemon(&mut stream, &mut child).await;
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+        let restored = wait_for_done_job_matching(&mut stream, 40, &before_restart, |job| {
+            job.pipeline == "/bin/pwd"
+        })
+        .await;
+        let out = roundtrip(
+            &mut stream,
+            60,
+            RequestPayload::Eval {
+                input: format!(":out {}", restored.id),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            out,
+            ResponsePayload::Ok(OkPayload::Output { ref data, .. }) if data.trim() == repo.display().to_string()
+        ));
 
         shutdown_daemon(&mut stream, &mut child).await;
     })

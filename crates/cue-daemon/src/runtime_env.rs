@@ -26,6 +26,7 @@ pub fn effective_snapshot(snapshot: &EnvSnapshot) -> EnvSnapshot {
     EnvSnapshot {
         env: merge_snapshot_env(snapshot, &ambient),
         cwd: snapshot.cwd.clone(),
+        execution: snapshot.execution.clone(),
     }
 }
 
@@ -95,6 +96,7 @@ mod tests {
         let snapshot = EnvSnapshot {
             env: BTreeMap::from([(String::from("FOO"), String::from("bar"))]),
             cwd: PathBuf::from("/tmp"),
+            execution: Default::default(),
         };
         let ambient = BTreeMap::from([(String::from("BAR"), String::from("baz"))]);
 
@@ -112,6 +114,7 @@ mod tests {
                 String::from("/snapshot/bin:/shared/bin"),
             )]),
             cwd: PathBuf::from("/tmp"),
+            execution: Default::default(),
         };
         let ambient = BTreeMap::from([(
             String::from("PATH"),
@@ -131,6 +134,7 @@ mod tests {
         let snapshot = EnvSnapshot {
             env: BTreeMap::from([(String::from("SSH_AUTH_SOCK"), String::from("/stale.sock"))]),
             cwd: PathBuf::from("/tmp"),
+            execution: Default::default(),
         };
         let ambient =
             BTreeMap::from([(String::from("SSH_AUTH_SOCK"), String::from("/fresh.sock"))]);

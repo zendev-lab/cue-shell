@@ -39,13 +39,21 @@ pub struct Scope {
 pub struct EnvSnapshot {
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
+    pub execution: ExecutionSettings,     // pty / need.* / sandbox 等执行态
     // 未来扩展：umask, aliases, functions, shell_options, traps
+}
+
+pub struct ExecutionSettings {
+    pub pty_enabled: Option<bool>,
+    pub needs: Need,
+    pub sandbox: Option<SandboxSettings>,
 }
 
 pub struct EnvDelta {
     pub set: BTreeMap<String, String>,    // 新增/修改的变量
     pub unset: Vec<String>,               // 删除的变量
     pub cwd: Option<PathBuf>,             // 若 cwd 变化
+    pub execution: Option<ExecutionSettings>, // None = 继承父 scope
 }
 ```
 
@@ -56,6 +64,7 @@ pub struct EnvDelta {
 - delta 存储 + parent_hash，查询时沿链还原
 - "默认 scope" 是一个可移动的 HEAD 指针（类似 git HEAD）
 - `:env set` / `:cd` 创建新 scope hash，更新 HEAD 指针，持久化
+- `:run(...)` / `:cron(...)` 中支持的执行态 mode params 创建派生 start scope，但不移动 HEAD；`need.*` 和 `sandbox` 当前仅 `:run` 支持
 - 未来：多个保存的命名默认 scope 可切换
 
 ### 类比
@@ -321,7 +330,7 @@ pub struct CommandArgs {
 
 | 命令 | 可用模式参数 |
 |------|-------------|
-| `:run()` | `cwd`, `wrapper`, `scope`, `pty` |
+| `:run()` | `cwd`, `wrapper`, `scope`, `pty`, `sandbox`, `sandbox.upper`, `need.<resource>` |
 | `:cron()` | `cwd`, `wrapper`, `scope` |
 
 其他命令只有命令参数，无 `()` 语法。

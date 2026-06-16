@@ -211,9 +211,14 @@ The Resolver transforms `Ast` → `RequestPayload`:
 
 3. **ID resolution**: validates J1/C3 references exist (queries cued state)
 
-4. **Mode params merge**: per-invocation params override daemon.toml defaults
+4. **Mode params parse/validate**: per-invocation params are validated against
+   `cue-core::command_spec` (with dynamic `need.<resource>` namespace support)
 
-5. **Scope resolution**: jobs start from HEAD; `cwd` mode params override process cwd without mutating HEAD
+5. **Scope resolution**: jobs and crons start from HEAD or an explicit `scope`,
+   then supported execution mode params derive a start scope. `cwd`, `pty`,
+   `need.<resource>`, `sandbox`, and `sandbox.upper` live in the scope snapshot;
+   they do not mutate the default HEAD. `need.<resource>` and sandbox params
+   are currently `:run`-only.
 
 ## 7. Completion Service
 
@@ -294,7 +299,7 @@ Which argument type each command expects:
 | Command | Argument | Mode Params |
 |---|---|---|
 | `:run` | Chain | ✓ (cwd, wrapper, scope, pty, sandbox, sandbox.upper, need.<resource>) |
-| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, wrapper, scope, need.<resource>) |
+| `:cron` | Chain（resolver 再拆 schedule/body） | ✓ (cwd, wrapper, scope) |
 | `:kill` | Job/Cron IdRef (`J<n>` or `C<n>`) | ✗ |
 | `:retry` | Job IdRef (`J<n>`) | ✗ |
 | `:out` | Job IdRef (`J<n>`) | ✗ |

@@ -1,12 +1,17 @@
+#[cfg(target_os = "linux")]
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::{Result, bail};
 use cue_core::command::{ModeParams, ParamValue};
-use tracing::{debug, warn};
+#[cfg(target_os = "linux")]
+use tracing::debug;
+use tracing::warn;
 
+#[cfg(target_os = "linux")]
 use crate::dirs;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,7 +40,9 @@ pub(crate) struct PreparedSandbox {
 
 impl PreparedSandbox {
     pub fn cwd_for(&self, original_cwd: &Path) -> PathBuf {
-        match original_cwd.strip_prefix(&self.lower_dir) {
+        let canonical_cwd =
+            std::fs::canonicalize(original_cwd).unwrap_or_else(|_| original_cwd.to_path_buf());
+        match canonical_cwd.strip_prefix(&self.lower_dir) {
             Ok(relative) if relative.as_os_str().is_empty() => self.mount_dir.clone(),
             Ok(relative) => self.mount_dir.join(relative),
             Err(_) => original_cwd.to_path_buf(),
@@ -75,10 +82,45 @@ impl Drop for SandboxCleanup {
     }
 }
 
+impl From<SandboxConfig> for cue_core::scope::SandboxSettings {
+    fn from(value: SandboxConfig) -> Self {
+        Self {
+            mode: match value.mode {
+                SandboxMode::Overlay => cue_core::scope::SandboxMode::Overlay,
+            },
+            upper: value.upper.map(|upper| match upper {
+                SandboxUpper::Directory(path) => cue_core::scope::SandboxUpper::Directory(path),
+                SandboxUpper::Tmpfs => cue_core::scope::SandboxUpper::Tmpfs,
+            }),
+        }
+    }
+}
+
+impl From<&cue_core::scope::SandboxSettings> for SandboxConfig {
+    fn from(value: &cue_core::scope::SandboxSettings) -> Self {
+        Self {
+            mode: match value.mode {
+                cue_core::scope::SandboxMode::Overlay => SandboxMode::Overlay,
+            },
+            upper: value.upper.as_ref().map(|upper| match upper {
+                cue_core::scope::SandboxUpper::Directory(path) => {
+                    SandboxUpper::Directory(path.clone())
+                }
+                cue_core::scope::SandboxUpper::Tmpfs => SandboxUpper::Tmpfs,
+            }),
+        }
+    }
+}
+
 impl SandboxConfig {
     pub fn from_params(params: &ModeParams) -> Result<Option<Self>, String> {
         let mode = match params.get("sandbox") {
-            None => return Ok(None),
+            None => {
+                if params.get("sandbox.upper").is_some() {
+                    return Err("sandbox.upper requires sandbox=overlay".into());
+                }
+                return Ok(None);
+            }
             Some(ParamValue::Str(value)) if value == "overlay" => SandboxMode::Overlay,
             Some(ParamValue::Str(value)) => {
                 return Err(format!(
@@ -222,16 +264,57 @@ fn prepare_overlay(
     bail!("overlay sandbox is only supported on Linux")
 }
 
+#[cfg(target_os = "linux")]
 fn sandbox_root(job_id: cue_core::JobId) -> Result<PathBuf> {
     let dir = dirs::runtime_sandbox_dir().join(job_id.to_string());
-    if let Err(error) = std::fs::remove_dir_all(&dir)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(error).with_context(|| format!("remove stale sandbox dir {}", dir.display()));
-    }
+    cleanup_stale_sandbox_root(&dir)?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sandbox dir {}", dir.display()))?;
     Ok(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_stale_sandbox_root(dir: &Path) -> Result<()> {
+    cleanup_stale_sandbox_root_with(dir, unmount)
+        .with_context(|| format!("remove stale sandbox dir {}", dir.display()))
+}
+
+#[cfg(test)]
+fn cleanup_stale_sandbox_root_for_test(dir: &Path) -> Result<()> {
+    cleanup_stale_sandbox_root_with(dir, |_| Ok(()))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cleanup_stale_sandbox_root_with(
+    dir: &Path,
+    mut unmount_fn: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    let merged = dir.join("merged");
+    let tmpfs = dir.join("tmpfs");
+    if merged.exists() {
+        let _ = unmount_fn(&merged);
+    }
+    if tmpfs.exists() {
+        let _ = unmount_fn(&tmpfs);
+    }
+    if let Err(error) = std::fs::remove_dir_all(dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_data_path(path: &Path, label: &str) -> Result<String> {
+    let value = path.to_string_lossy();
+    if value.contains(',') || value.contains(':') || value.contains('\n') {
+        bail!(
+            "sandbox {label} path contains an unsupported character for overlay mount data: {}",
+            path.display()
+        );
+    }
+    Ok(value.into_owned())
 }
 
 #[cfg(target_os = "linux")]
@@ -241,11 +324,11 @@ fn mount_overlay(
     work_dir: &Path,
     mount_dir: &Path,
 ) -> Result<()> {
+    let lower_dir = mount_data_path(lower_dir, "lowerdir")?;
+    let upper_dir = mount_data_path(upper_dir, "upperdir")?;
+    let work_dir = mount_data_path(work_dir, "workdir")?;
     let data = CString::new(format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lower_dir.display(),
-        upper_dir.display(),
-        work_dir.display()
+        "lowerdir={lower_dir},upperdir={upper_dir},workdir={work_dir}"
     ))?;
     mount(
         Some("overlay"),
@@ -313,13 +396,24 @@ fn cleanup_failed_mount(root_dir: &Path, work_dir: &Path, tmpfs_upper_mount: Opt
 }
 
 fn unmount(path: &Path) -> Result<()> {
-    let status = Command::new("umount")
-        .arg(path)
-        .status()
-        .with_context(|| format!("spawn umount {}", path.display()))?;
-    if !status.success() {
-        bail!("umount {} exited with {status}", path.display());
+    unmount_impl(path)
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_impl(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let target = CString::new(path.as_os_str().as_bytes())?;
+    let rc = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("umount2 {}", path.display()));
     }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmount_impl(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -327,6 +421,17 @@ fn unmount(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cue-sandbox-{name}-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn parses_overlay_sandbox_params() {
@@ -355,6 +460,17 @@ mod tests {
     }
 
     #[test]
+    fn rejects_sandbox_upper_without_overlay_mode() {
+        let mut params = ModeParams {
+            params: BTreeMap::new(),
+        };
+        params.insert("sandbox.upper", ParamValue::Str("tmpfs".into()));
+
+        let error = SandboxConfig::from_params(&params).expect_err("orphan upper should fail");
+        assert!(error.contains("requires sandbox=overlay"));
+    }
+
+    #[test]
     fn rewrites_cwd_relative_to_overlay_lowerdir() {
         let prepared = PreparedSandbox {
             lower_dir: PathBuf::from("/repo"),
@@ -374,5 +490,159 @@ mod tests {
             prepared.cwd_for(Path::new("/other")),
             PathBuf::from("/other")
         );
+    }
+
+    #[test]
+    fn rewrites_symlink_cwd_via_canonical_lowerdir() {
+        let temp = temp_path("symlink");
+        let _ = std::fs::remove_dir_all(&temp);
+        let lower = temp.join("real");
+        let child = lower.join("child");
+        std::fs::create_dir_all(&child).expect("create lower child");
+        let prepared = PreparedSandbox {
+            lower_dir: std::fs::canonicalize(&lower).expect("canonical lower"),
+            mount_dir: temp.join("merged"),
+            _cleanup: None,
+        };
+
+        assert_eq!(prepared.cwd_for(&child), temp.join("merged/child"));
+
+        std::fs::remove_dir_all(&temp).expect("remove temp");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_overlay_mount_data_paths_with_reserved_separators() {
+        let error = mount_data_path(Path::new("/tmp/cue,lower"), "lowerdir")
+            .expect_err("comma should fail");
+        assert!(error.to_string().contains("unsupported character"));
+
+        let error = mount_data_path(Path::new("/tmp/cue:lower"), "lowerdir")
+            .expect_err("colon should fail");
+        assert!(error.to_string().contains("unsupported character"));
+    }
+
+    #[test]
+    fn cleanup_stale_sandbox_root_removes_plain_stale_dirs() {
+        let root = temp_path("stale-root");
+        std::fs::create_dir_all(root.join("merged")).expect("create stale merged");
+        std::fs::write(root.join("merged/stale.txt"), "stale").expect("write stale file");
+
+        cleanup_stale_sandbox_root_for_test(&root).expect("cleanup stale root");
+
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn cleanup_stale_sandbox_root_unmounts_known_mountpoints_before_removal() {
+        let root = temp_path("stale-mounts");
+        std::fs::create_dir_all(root.join("merged")).expect("create stale merged");
+        std::fs::create_dir_all(root.join("tmpfs")).expect("create stale tmpfs");
+        let mut unmounted = Vec::new();
+
+        cleanup_stale_sandbox_root_with(&root, |path| {
+            unmounted.push(path.file_name().expect("mountpoint name").to_owned());
+            Ok(())
+        })
+        .expect("cleanup stale root");
+
+        assert_eq!(unmounted, vec!["merged", "tmpfs"]);
+        assert!(!root.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_smoke_is_supported_or_reports_mount_permission() {
+        let lower = temp_path("lower");
+        std::fs::create_dir_all(&lower).expect("create lower");
+        std::fs::write(lower.join("kept.txt"), "lower").expect("write lower file");
+        let config = SandboxConfig {
+            mode: SandboxMode::Overlay,
+            upper: None,
+        };
+
+        match prepare(cue_core::JobId(424242), &config, &lower) {
+            Ok(prepared) => {
+                let merged = prepared.cwd_for(&lower);
+                assert!(merged.join("kept.txt").exists());
+                std::fs::write(merged.join("created.txt"), "overlay").expect("write overlay file");
+                assert!(!lower.join("created.txt").exists());
+            }
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("mount overlay sandbox")
+                        || message.contains("Operation not permitted")
+                        || message.contains("permission denied"),
+                    "unexpected overlay smoke error: {message}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&lower);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlay_tmpfs_upper_smoke_cleans_up_after_drop_or_reports_mount_permission() {
+        let lower = temp_path("tmpfs-lower");
+        std::fs::create_dir_all(&lower).expect("create lower");
+        let config = SandboxConfig {
+            mode: SandboxMode::Overlay,
+            upper: Some(SandboxUpper::Tmpfs),
+        };
+
+        match prepare(cue_core::JobId(424243), &config, &lower) {
+            Ok(prepared) => {
+                let merged = prepared.cwd_for(&lower);
+                std::fs::write(merged.join("tmpfs-created.txt"), "overlay")
+                    .expect("write tmpfs overlay file");
+                let root_dir =
+                    dirs::runtime_sandbox_dir().join(cue_core::JobId(424243).to_string());
+                let tmpfs_dir = root_dir.join("tmpfs");
+                assert!(tmpfs_dir.exists());
+                drop(prepared);
+                assert!(
+                    !tmpfs_dir.exists(),
+                    "tmpfs upper mount directory should be removed after sandbox drop"
+                );
+            }
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("mount tmpfs sandbox dir")
+                        || message.contains("mount overlay sandbox")
+                        || message.contains("Operation not permitted")
+                        || message.contains("permission denied"),
+                    "unexpected tmpfs overlay smoke error: {message}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&lower);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn overlay_prepare_reports_not_supported_on_non_linux() {
+        let config = SandboxConfig {
+            mode: SandboxMode::Overlay,
+            upper: None,
+        };
+        let error = prepare(cue_core::JobId(424242), &config, Path::new("/tmp"))
+            .expect_err("non-linux overlay should be unsupported");
+        assert!(error.to_string().contains("only supported on Linux"));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn overlay_tmpfs_upper_reports_not_supported_on_non_linux() {
+        let config = SandboxConfig {
+            mode: SandboxMode::Overlay,
+            upper: Some(SandboxUpper::Tmpfs),
+        };
+        let error = prepare(cue_core::JobId(424243), &config, Path::new("/tmp"))
+            .expect_err("non-linux tmpfs overlay should be unsupported");
+        assert!(error.to_string().contains("only supported on Linux"));
     }
 }

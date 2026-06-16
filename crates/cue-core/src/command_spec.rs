@@ -150,6 +150,13 @@ const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
         value_hint: "tmpfs",
         detail: "Use tmpfs or a directory path for the overlay sandbox upperdir",
     },
+    ModeParamSpec {
+        name: "need.<resource>",
+        commands: &["run"],
+        value_kind: ModeParamValueKind::String,
+        value_hint: "1",
+        detail: "Declare a provider-owned resource need quantity",
+    },
 ];
 
 impl ModeParamSpec {
@@ -474,6 +481,8 @@ mod tests {
         assert!(mode_param_spec_for_command("cron", "pty").is_none());
         assert!(mode_param_spec_for_command("cron", "sandbox").is_none());
         assert!(mode_param_spec_for_command("cron", "cwd").is_some());
+        assert!(mode_param_spec_for_command("run", "need.<resource>").is_some());
+        assert!(mode_param_spec_for_command("cron", "need.<resource>").is_none());
         assert!(command_spec("run").is_some_and(CommandSpec::accepts_mode_params));
         assert!(command_spec("cron").is_some_and(CommandSpec::accepts_mode_params));
         assert!(!command_spec("kill").is_some_and(CommandSpec::accepts_mode_params));

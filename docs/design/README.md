@@ -80,25 +80,38 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
-execution behavior. They override `daemon.toml` defaults. Only launcher-style
-commands support mode params: `:run` and `:cron`; supported keys are declared
-per command so unsupported keys fail during parsing instead of being ignored.
-Resource needs use the `need.<resource>=<quantity>` namespace; resource keys are
-owned by configured providers rather than hardcoded in core. `:run` can opt into
-an overlayfs sandbox with `sandbox=overlay`; by default its upperdir is a
-runtime directory, and `sandbox.upper=tmpfs` mounts that upperdir on tmpfs for
-ephemeral in-memory writes. Overlay sandboxing is Linux-only and intentionally
-not persisted for `:cron` entries.
+execution behavior. Only launcher-style commands support mode params: `:run`
+and `:cron`; supported keys are declared per command so unsupported keys fail
+during parsing instead of being ignored. These settings are modeled as
+Scope-owned execution state: `cwd`, `pty`, `need.*`, `sandbox`, and
+`sandbox.upper`; supported execution params derive the job or cron start scope
+without moving the default HEAD. Resource needs use the `:run`-only
+`need.<resource>=<quantity>` namespace; resource keys are owned by configured
+providers rather than hardcoded in core. `:run`
+can opt into an overlayfs sandbox with `sandbox=overlay`; by default its
+upperdir is a runtime directory, and `sandbox.upper=tmpfs` mounts that upperdir
+on tmpfs for ephemeral in-memory writes. Overlay sandboxing is Linux-only and is
+a workspace view, not a security boundary: it does not isolate absolute paths
+outside the working tree, network access, process credentials, or inherited
+environment variables. `sandbox.upper` is only valid together with
+`sandbox=overlay`, and sandbox mode params are intentionally not accepted for
+`:cron` entries.
+
+TODO: add a macOS-compatible copy-on-write workspace backend for `sandbox=overlay`.
+Prefer APFS clonefile / `cp -c` for fast CoW materialization, fall back to
+recursive copy when CoW cloning is unavailable, and keep this separate from a
+future Seatbelt/bubblewrap permission sandbox backend.
 
 ## Scope Model
 
 Scopes are **immutable, content-addressed environment snapshots**:
 
-- ID = blake3(env + cwd + ...) → identical environments share the same hash
-- Delta storage: `parent_hash` + `EnvDelta` (set/unset/cwd changes)
+- ID = blake3(env + cwd + execution settings) → identical snapshots share the same hash
+- Delta storage: `parent_hash` + `EnvDelta` (set/unset/cwd/execution changes)
 - Display: `S@a3f1` (short content hash)
 - Job holds `start_scope` and `end_scope` (None until complete)
 - Default scope = movable HEAD pointer, modified via `:env set` / `:cd`
+- Mode params derive child scopes for jobs/crons without moving HEAD
 
 Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default scope ≈ HEAD.
 

@@ -303,6 +303,16 @@ impl<'a> Parser<'a> {
                     // daemon's ProviderRegistry is responsible for the
                     // semantic validation of `<X>`.
                     if let Some(suffix) = key.strip_prefix("need.") {
+                        if mode_param_spec_for_command(command, "need.<resource>").is_none() {
+                            return Err(ParseError {
+                                span: key_span,
+                                message: format!(
+                                    "mode parameter `{key}` is not supported by `:{command}`"
+                                ),
+                                kind: ParseErrorKind::InvalidModeParam,
+                                suggestions: vec![],
+                            });
+                        }
                         if suffix.is_empty() {
                             return Err(ParseError {
                                 span: key_span,
@@ -1248,6 +1258,17 @@ mod tests {
             }
             _ => panic!("expected Command"),
         }
+    }
+
+    #[test]
+    fn mode_params_need_namespace_is_run_only() {
+        let err = Parser::parse(":cron(need.gpu=1) every 5m cargo test")
+            .expect_err("cron must not accept run-only resource need params");
+        assert_eq!(err.kind, ParseErrorKind::InvalidModeParam);
+        assert!(
+            err.message
+                .contains("mode parameter `need.gpu` is not supported by `:cron`")
+        );
     }
 
     #[test]
