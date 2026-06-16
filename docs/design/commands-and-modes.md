@@ -274,12 +274,16 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ### 支持模式参数的命令
 
-| 命令 | 可用参数 |
-|------|---------|
-| `:run()` | `cwd`, `wrapper`, `scope`, `pty`, `sandbox`, `sandbox.upper`, `need.<resource>` |
-| `:cron()` | `cwd`, `wrapper`, `scope` |
+支持矩阵以 `crates/cue-core/src/command_spec.rs` 为准；parser 和 snapshot
+测试在 `crates/cue-daemon/src/parser/parse.rs` 中保护错误消息与动态命名空间。
 
-`cwd`、`pty`、`need.<resource>`、`sandbox`、`sandbox.upper` 是 Scope-owned execution state：`:run(cwd=/repo, pty=false)` 的 job 使用派生 start scope，但不会移动默认 HEAD；`:cron(cwd=/repo)` 把 cwd 固定在 cron 的 scope_hash 中，后续触发从该 scope 运行。`need.<resource>` 的 resource key 不由 core 写死，而是由 daemon 的 provider registry 从配置/内建 provider 声明；值支持 count（如 `1`）或 bytes（如 `24GiB`），当前仅 `:run` 支持。`sandbox=overlay` / `sandbox.upper=tmpfs` 只适用于 `:run`，且 overlay sandbox 是 Linux-only 工作目录 overlay 视图，不是安全边界。其他命令只有位置/标志参数，无 `()` 语法。
+执行态 mode params 是 Scope-owned execution state：`:run(cwd=/repo,
+pty=false)` 的 job 使用派生 start scope，但不会移动默认 HEAD；`:cron(cwd=/repo)`
+把 cwd 固定在 cron 的 scope_hash 中，后续触发从该 scope 运行。
+`need.<resource>` 的 resource key 不由 core 写死，而是由 daemon 的 provider
+registry 从配置/内建 provider 声明，当前仅 `:run` 支持。`sandbox=overlay` /
+`sandbox.upper=tmpfs` 只适用于 `:run`，且 overlay sandbox 是 Linux-only 工作目录
+overlay 视图，不是安全边界。其他命令只有位置/标志参数，无 `()` 语法。
 
 ---
 

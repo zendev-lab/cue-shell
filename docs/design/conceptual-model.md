@@ -53,34 +53,21 @@ Stable job identities with an associated lifecycle state. See [`core-types.md`](
 ### Objects
 
 **Content-addressed environment snapshots** (`ScopeHash`): immutable
-`EnvSnapshot { env, cwd, execution }`. `execution` holds Scope-owned run/cron
-behavior such as explicit PTY setting, provider resource needs, and optional
-sandbox settings. Identity is purely by content (e.g. blake3) — no names or
-versions as sources of truth.
+snapshots of environment, cwd, and scope-owned execution settings. Identity is
+purely by content (e.g. blake3) — no names or versions as sources of truth. The
+concrete schema lives in `crates/cue-core/src/scope.rs`.
 
 ### Morphisms
 
-An **environment delta** (`EnvDelta`) is the step from one snapshot to another:
-
-```rust
-struct EnvDelta {
-    set: BTreeMap<String, String>,  // new or modified variables
-    unset: Vec<String>,             // removed variables
-    cwd: Option<PathBuf>,           // changed cwd (None = inherit)
-    execution: Option<ExecutionSettings>, // run/cron execution state (None = inherit)
-}
-```
+An **environment delta** (`EnvDelta`) is the step from one snapshot to another.
+Deltas can update environment variables, cwd, and execution settings; omitted
+fields inherit from the parent. See `crates/cue-core/src/scope.rs` for the exact
+schema.
 
 ### Composition
 
-Deltas compose by overlay (right wins on keys, unset accumulates, last cwd/execution wins):
-
-```
-δ₂ ∘ δ₁  =  { set: δ₁.set ∪ δ₂.set (δ₂ wins),
-              unset: δ₁.unset ∪ δ₂.unset,
-              cwd: δ₂.cwd ?? δ₁.cwd,
-              execution: δ₂.execution ?? δ₁.execution }
-```
+Deltas compose by overlay: later environment writes win, unsets accumulate, and
+later cwd/execution settings replace earlier ones.
 
 ### Properties
 

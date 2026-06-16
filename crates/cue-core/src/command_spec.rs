@@ -546,14 +546,15 @@ mod tests {
     }
 
     #[test]
-    fn parser_design_docs_cover_mode_params() {
+    fn parser_design_docs_point_to_mode_param_source_of_truth() {
         let docs = include_str!("../../../docs/design/parser.md");
-        for spec in MODE_PARAM_SPECS {
-            assert!(
-                docs.contains(spec.name),
-                "docs/design/parser.md is missing mode param `{}`",
-                spec.name
-            );
-        }
+        assert!(
+            docs.contains("cue-core::command_spec"),
+            "docs/design/parser.md should point to command_spec for mode params"
+        );
+        assert!(
+            docs.contains("Mode params"),
+            "docs/design/parser.md should explain mode-param parsing at a high level"
+        );
     }
 }
