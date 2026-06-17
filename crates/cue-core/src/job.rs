@@ -1,4 +1,8 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
+
+use crate::resource::Need;
 
 /// Exit code used when a job has no process-provided exit status.
 ///
@@ -6,6 +10,42 @@ use serde::{Deserialize, Serialize};
 /// and rare platform cases where the OS wait status cannot be represented as a
 /// numeric exit code.
 pub const EXIT_CODE_UNAVAILABLE: i32 = -1;
+
+/// Per-run options that affect how a job is launched but are not part of the
+/// content-addressed scope identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchOptions {
+    /// Explicit PTY setting. `None` means use the session/config default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty: Option<bool>,
+    /// Resource needs declared via `need.<resource>=<quantity>` mode params.
+    #[serde(default, skip_serializing_if = "Need::is_empty")]
+    pub needs: Need,
+    /// Optional filesystem sandbox settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxSettings>,
+}
+
+/// Per-run filesystem sandbox settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxSettings {
+    pub mode: SandboxMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upper: Option<SandboxUpper>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    Overlay,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxUpper {
+    Directory(PathBuf),
+    Tmpfs,
+}
 
 /// Job lifecycle state (unidirectional state machine).
 ///
@@ -77,6 +117,8 @@ impl JobStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ResourceQuantity;
+    use insta::assert_json_snapshot;
 
     #[test]
     fn terminal_states() {
@@ -86,5 +128,47 @@ mod tests {
         assert!(JobStatus::Failed.is_terminal());
         assert!(JobStatus::Killed.is_terminal());
         assert!(JobStatus::Cancelled(CancelReason::User).is_terminal());
+    }
+
+    #[test]
+    fn launch_options_json_skips_empty_defaults() {
+        assert_json_snapshot!(LaunchOptions::default(), @r###"
+        {}
+        "###);
+    }
+
+    #[test]
+    fn launch_options_json_includes_explicit_values() {
+        let options = LaunchOptions {
+            pty: Some(false),
+            needs: Need::from_pairs([
+                ("gpu", ResourceQuantity::Count(1)),
+                ("gpu_mem", ResourceQuantity::Bytes(24 * 1024 * 1024 * 1024)),
+            ]),
+            sandbox: Some(SandboxSettings {
+                mode: SandboxMode::Overlay,
+                upper: Some(SandboxUpper::Tmpfs),
+            }),
+        };
+
+        assert_json_snapshot!(options, @r###"
+        {
+          "pty": false,
+          "needs": {
+            "gpu": {
+              "kind": "count",
+              "value": 1
+            },
+            "gpu_mem": {
+              "kind": "bytes",
+              "value": 25769803776
+            }
+          },
+          "sandbox": {
+            "mode": "overlay",
+            "upper": "tmpfs"
+          }
+        }
+        "###);
     }
 }

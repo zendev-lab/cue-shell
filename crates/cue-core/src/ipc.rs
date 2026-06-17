@@ -3,6 +3,7 @@
 //! Transport: Unix domain socket with length-prefixed JSON framing.
 //! See `docs/design/ipc-protocol.md` for the full specification.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,11 @@ pub enum RequestPayload {
     },
 
     // Connection management
+    Handshake {
+        session_id: String,
+        cwd: String,
+        env: BTreeMap<String, String>,
+    },
     Subscribe {
         channels: Vec<String>,
     },
@@ -285,12 +291,6 @@ pub enum EventPayload {
     },
     OutputEof {
         id: String,
-    },
-
-    // Scopes channel
-    HeadChanged {
-        old_hash: String,
-        new_hash: String,
     },
 
     // :fg (sent only to fg-attached client)
@@ -837,27 +837,6 @@ mod tests {
             ResponsePayload::Ok(OkPayload::ScopeCreated { hash, summary }) => {
                 assert_eq!(hash, "S@abc12345");
                 assert!(summary.contains("cwd: /old -> /tmp"));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn scope_events_roundtrip_as_head_changes() {
-        let msg = Message::Event {
-            payload: EventPayload::HeadChanged {
-                old_hash: "S@old00000".into(),
-                new_hash: "S@new00000".into(),
-            },
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let decoded: Message = serde_json::from_str(&json).unwrap();
-        match decoded {
-            Message::Event {
-                payload: EventPayload::HeadChanged { old_hash, new_hash },
-            } => {
-                assert_eq!(old_hash, "S@old00000");
-                assert_eq!(new_hash, "S@new00000");
             }
             _ => panic!("wrong variant"),
         }

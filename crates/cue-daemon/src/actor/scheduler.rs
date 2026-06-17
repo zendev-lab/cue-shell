@@ -22,13 +22,13 @@ use cue_core::ipc::{
     ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus, ScriptSource,
     ScriptSubmitError, StreamText, error_code,
 };
-use cue_core::job::{CancelReason, EXIT_CODE_UNAVAILABLE, JobStatus};
+use cue_core::job::{CancelReason, EXIT_CODE_UNAVAILABLE, JobStatus, LaunchOptions};
 use cue_core::mode::Mode;
 use cue_core::pipeline::{ChainNode, command_prefers_foreground};
 #[cfg(test)]
 use cue_core::pipeline::{ParallelOp, SerialOp};
 use cue_core::resource::Need;
-use cue_core::scope::{EnvDelta, EnvSnapshot, ExecutionSettings};
+use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{ChainId, CronId, EventChannel, JobId, ScopeHash, ScriptId};
 
 use crate::config::{BlockDecision, Config};
@@ -135,6 +135,21 @@ struct CommandExecutionContext {
     direct_output_client: Option<u64>,
 }
 
+#[derive(Clone, Default)]
+struct LaunchDefaults {
+    pty: Option<bool>,
+    wrapper_enabled: Option<bool>,
+}
+
+struct SessionState {
+    scope: ScopeHash,
+    defaults: LaunchDefaults,
+    connected_clients: usize,
+    disconnected_at: Option<Instant>,
+}
+
+const SESSION_GC_TTL: Duration = Duration::from_secs(300);
+
 #[derive(Debug, Clone, Copy)]
 struct ChainCompletion {
     exit_code: i32,
@@ -173,8 +188,10 @@ struct SchedulerState {
     pending_script_chains: HashMap<ChainId, ScriptId>,
     /// Completed chain results retained only until their owning script consumes them.
     completed_chains: HashMap<ChainId, ChainCompletion>,
-    /// Runtime wrapper toggle set by `:wrap on` / `:wrap off`.
-    wrapper_enabled: Option<bool>,
+    /// Logical sessions keyed by stable client-provided session id.
+    sessions: HashMap<String, SessionState>,
+    /// Transport client id to logical session id.
+    client_sessions: HashMap<u64, String>,
     /// Jobs waiting for resource admission, preserved in FIFO retry order.
     pending_resource_jobs: VecDeque<JobId>,
     /// Spawn context for each resource-pending job.
@@ -224,7 +241,8 @@ impl SchedulerState {
             pending_script_jobs: HashMap::new(),
             pending_script_chains: HashMap::new(),
             completed_chains: HashMap::new(),
-            wrapper_enabled: None,
+            sessions: HashMap::new(),
+            client_sessions: HashMap::new(),
             pending_resource_jobs: VecDeque::new(),
             pending_resource: HashMap::new(),
         }
@@ -248,9 +266,32 @@ impl SchedulerState {
         id
     }
 
-    /// Resolve the effective wrapper_enabled from session override or config.
-    fn wrapper_enabled(&self, config: &Config) -> bool {
-        self.wrapper_enabled.unwrap_or(config.wrapper.enabled)
+    fn session_for_client(&self, client_id: u64) -> Option<&SessionState> {
+        self.client_sessions
+            .get(&client_id)
+            .and_then(|session_id| self.sessions.get(session_id))
+    }
+
+    fn session_for_client_mut(&mut self, client_id: u64) -> Option<&mut SessionState> {
+        let session_id = self.client_sessions.get(&client_id)?.clone();
+        self.sessions.get_mut(&session_id)
+    }
+
+    fn client_scope(&self, client_id: u64) -> Option<ScopeHash> {
+        self.session_for_client(client_id)
+            .map(|session| session.scope)
+    }
+
+    fn wrapper_enabled(&self, client_id: u64, config: &Config) -> bool {
+        self.session_for_client(client_id)
+            .and_then(|session| session.defaults.wrapper_enabled)
+            .unwrap_or(config.wrapper.enabled)
+    }
+
+    fn pty_default(&self, client_id: u64) -> bool {
+        self.session_for_client(client_id)
+            .and_then(|session| session.defaults.pty)
+            .unwrap_or(true)
     }
 
     fn alloc_script(&mut self) -> ScriptId {
@@ -280,6 +321,7 @@ pub(super) async fn spawn(
         debug!("scheduler: started");
 
         loop {
+            sweep_disconnected_sessions(&mut state);
             // Compute the sleep deadline from the nearest enabled cron trigger.
             let next_cron_deadline = state
                 .crons
@@ -301,7 +343,26 @@ pub(super) async fn spawn(
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
                     match msg {
+                        SchedulerMsg::Connect { client_id, session_id, snapshot, reply } => {
+                            let result = connect_session(client_id, session_id, snapshot, &mut state, &sys).await;
+                            let _ = reply.send(result);
+                        }
+
+                        SchedulerMsg::Disconnect { client_id } => {
+                            disconnect_session(client_id, &mut state);
+                        }
+
                         SchedulerMsg::Eval { client_id, request_id, command } => {
+                            if state.session_for_client(client_id).is_none() {
+                                send_gateway_response(
+                                    &sys,
+                                    client_id,
+                                    request_id,
+                                    ResponsePayload::err(error_code::INVALID_REQUEST, "client session handshake required"),
+                                )
+                                .await;
+                                continue;
+                            }
                             match *command {
                                 ResolvedCommand::Wait { id } => {
                                     if let Some(response) = handle_wait_command(
@@ -836,32 +897,102 @@ async fn mark_cron_failed(
     }
 }
 
-async fn get_head_snapshot(
+async fn connect_session(
+    client_id: u64,
+    session_id: String,
+    snapshot: EnvSnapshot,
+    state: &mut SchedulerState,
     sys: &ActorSystem,
-) -> Result<cue_core::scope::EnvSnapshot, ResponsePayload> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if sys
-        .scope_store
-        .send(ScopeStoreMsg::GetHeadSnapshot { reply: tx })
-        .await
-        .is_err()
+) -> anyhow::Result<ScopeHash> {
+    if state
+        .client_sessions
+        .get(&client_id)
+        .is_some_and(|old_session_id| old_session_id == &session_id)
     {
+        if let Some(session) = state.sessions.get_mut(&session_id) {
+            session.disconnected_at = None;
+            return Ok(session.scope);
+        }
+        state.client_sessions.remove(&client_id);
+    }
+
+    if let Some(old_session_id) = state.client_sessions.insert(client_id, session_id.clone())
+        && old_session_id != session_id
+        && let Some(old_session) = state.sessions.get_mut(&old_session_id)
+    {
+        old_session.connected_clients = old_session.connected_clients.saturating_sub(1);
+        if old_session.connected_clients == 0 {
+            old_session.disconnected_at = Some(Instant::now());
+        }
+    }
+
+    if let Some(session) = state.sessions.get_mut(&session_id) {
+        session.connected_clients += 1;
+        session.disconnected_at = None;
+        return Ok(session.scope);
+    }
+
+    let scope = Scope::root(snapshot);
+    let hash = insert_scope(sys, scope).await?;
+    state.sessions.insert(
+        session_id.clone(),
+        SessionState {
+            scope: hash,
+            defaults: LaunchDefaults::default(),
+            connected_clients: 1,
+            disconnected_at: None,
+        },
+    );
+    Ok(hash)
+}
+
+fn disconnect_session(client_id: u64, state: &mut SchedulerState) {
+    let Some(session_id) = state.client_sessions.remove(&client_id) else {
+        return;
+    };
+    let Some(session) = state.sessions.get_mut(&session_id) else {
+        return;
+    };
+    session.connected_clients = session.connected_clients.saturating_sub(1);
+    if session.connected_clients == 0 {
+        session.disconnected_at = Some(Instant::now());
+    }
+}
+
+fn sweep_disconnected_sessions(state: &mut SchedulerState) {
+    let now = Instant::now();
+    state.sessions.retain(|_, session| {
+        session.connected_clients > 0
+            || session
+                .disconnected_at
+                .is_none_or(|disconnected_at| now.duration_since(disconnected_at) < SESSION_GC_TTL)
+    });
+}
+
+async fn insert_scope(sys: &ActorSystem, scope: Scope) -> anyhow::Result<ScopeHash> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sys.scope_store
+        .send(ScopeStoreMsg::Insert { scope, reply: tx })
+        .await
+        .map_err(|_| anyhow::anyhow!("scope_store unreachable"))?;
+    rx.await
+        .map_err(|_| anyhow::anyhow!("scope_store reply dropped"))?
+}
+
+async fn get_session_snapshot(
+    sys: &ActorSystem,
+    state: &SchedulerState,
+    client_id: u64,
+) -> Result<cue_core::scope::EnvSnapshot, ResponsePayload> {
+    let Some(scope) = state.client_scope(client_id) else {
         return Err(ResponsePayload::err(
-            error_code::INTERNAL,
-            "scope_store unreachable",
+            error_code::INVALID_REQUEST,
+            "client session handshake required",
         ));
-    }
-    match rx.await {
-        Ok(Ok(snapshot)) => Ok(snapshot),
-        Ok(Err(error)) => Err(ResponsePayload::err(
-            error_code::INTERNAL,
-            error.to_string(),
-        )),
-        Err(_) => Err(ResponsePayload::err(
-            error_code::INTERNAL,
-            "scope_store reply dropped",
-        )),
-    }
+    };
+    get_scope_snapshot_by_hash(sys, scope)
+        .await
+        .map_err(|error| ResponsePayload::err(error_code::INTERNAL, error))
 }
 
 // ── Chain helpers ────────────────────────────────────────────────────────────
@@ -1159,35 +1290,6 @@ async fn derive_scope(
     }
 }
 
-async fn fork_scope(
-    sys: &ActorSystem,
-    delta: cue_core::scope::EnvDelta,
-) -> Result<ScopeHash, ResponsePayload> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if sys
-        .scope_store
-        .send(ScopeStoreMsg::Fork { delta, reply: tx })
-        .await
-        .is_err()
-    {
-        return Err(ResponsePayload::err(
-            error_code::INTERNAL,
-            "scope_store unreachable",
-        ));
-    }
-    match rx.await {
-        Ok(Ok(hash)) => Ok(hash),
-        Ok(Err(error)) => Err(ResponsePayload::err(
-            error_code::INTERNAL,
-            error.to_string(),
-        )),
-        Err(_) => Err(ResponsePayload::err(
-            error_code::INTERNAL,
-            "scope_store reply dropped",
-        )),
-    }
-}
-
 fn resolve_cd_target(
     snapshot: &cue_core::scope::EnvSnapshot,
     path: &str,
@@ -1209,9 +1311,9 @@ fn resolve_cd_target(
     Ok(resolved)
 }
 
-fn execution_settings_from_params(params: &ModeParams) -> Result<ExecutionSettings, String> {
-    Ok(ExecutionSettings {
-        pty_enabled: match params.get("pty") {
+fn launch_options_from_params(params: &ModeParams) -> Result<LaunchOptions, String> {
+    Ok(LaunchOptions {
+        pty: match params.get("pty") {
             Some(cue_core::command::ParamValue::Bool(value)) => Some(*value),
             _ => None,
         },
@@ -1220,18 +1322,12 @@ fn execution_settings_from_params(params: &ModeParams) -> Result<ExecutionSettin
     })
 }
 
-fn mode_params_scope_delta(params: &ModeParams) -> Result<Option<EnvDelta>, String> {
-    let execution = execution_settings_from_params(params)?;
-    let cwd = params.cwd();
-    if cwd.is_none() && execution.is_default() {
-        return Ok(None);
-    }
-    Ok(Some(EnvDelta {
+fn mode_params_cwd_delta(params: &ModeParams) -> Option<EnvDelta> {
+    params.cwd().map(|cwd| EnvDelta {
         set: std::collections::BTreeMap::new(),
         unset: Vec::new(),
-        cwd,
-        execution: (!execution.is_default()).then_some(execution),
-    }))
+        cwd: Some(cwd),
+    })
 }
 
 async fn derive_mode_params_scope(
@@ -1239,17 +1335,10 @@ async fn derive_mode_params_scope(
     base_scope: ScopeHash,
     params: &ModeParams,
 ) -> Result<ScopeHash, String> {
-    match mode_params_scope_delta(params)? {
+    match mode_params_cwd_delta(params) {
         Some(delta) => derive_scope(sys, base_scope, delta).await,
         None => Ok(base_scope),
     }
-}
-
-async fn scope_execution_needs(sys: &ActorSystem, scope: ScopeHash) -> Result<Need, String> {
-    Ok(get_scope_snapshot_by_hash(sys, scope)
-        .await?
-        .execution
-        .needs)
 }
 
 async fn apply_scope_transform(
@@ -1268,7 +1357,6 @@ async fn apply_scope_transform(
             set: std::collections::BTreeMap::new(),
             unset: vec![],
             cwd: Some(resolve_cd_target(&snapshot, &path)?),
-            execution: None,
         },
         ScopeTransform::EnvSet { assignments } => {
             let mut set = std::collections::BTreeMap::new();
@@ -1287,7 +1375,6 @@ async fn apply_scope_transform(
                 set,
                 unset: vec![],
                 cwd: None,
-                execution: None,
             }
         }
     };
@@ -1372,7 +1459,6 @@ async fn admit_resource_scope(
             set,
             unset: Vec::new(),
             cwd: None,
-            execution: None,
         },
     )
     .await
@@ -1532,9 +1618,9 @@ struct TerminalStateUpdate {
 #[derive(Clone)]
 struct ProcessJobContext {
     cwd_override: Option<std::path::PathBuf>,
-    sandbox: Option<crate::sandbox::SandboxConfig>,
+    launch: LaunchOptions,
     wrapper_enabled: bool,
-    pty_enabled: bool,
+    pty_default: bool,
     direct_output_client: Option<u64>,
 }
 
@@ -1542,11 +1628,19 @@ impl ProcessJobContext {
     fn process_job_options(&self) -> ProcessJobOptions {
         ProcessJobOptions {
             cwd_override: self.cwd_override.clone(),
-            sandbox: self.sandbox.clone(),
+            sandbox: self
+                .launch
+                .sandbox
+                .as_ref()
+                .map(crate::sandbox::SandboxConfig::from),
             wrapper_enabled: self.wrapper_enabled,
-            pty_enabled: self.pty_enabled,
+            pty_enabled: self.launch.pty.unwrap_or(self.pty_default),
             direct_output_client: self.direct_output_client,
         }
+    }
+
+    fn needs(&self) -> &Need {
+        &self.launch.needs
     }
 }
 
@@ -1559,17 +1653,18 @@ impl ChainExecutionOptions {
     fn from_params(
         params: &ModeParams,
         state: &SchedulerState,
+        client_id: u64,
         config: &Config,
         direct_output_client: Option<u64>,
     ) -> Result<Self, String> {
         Ok(Self {
             process: ProcessJobContext {
                 cwd_override: None,
-                sandbox: None,
+                launch: launch_options_from_params(params)?,
                 wrapper_enabled: params
                     .wrapper_enabled()
-                    .unwrap_or_else(|| state.wrapper_enabled(config)),
-                pty_enabled: true,
+                    .unwrap_or_else(|| state.wrapper_enabled(client_id, config)),
+                pty_default: state.pty_default(client_id),
                 direct_output_client,
             },
             scope_enabled: params.scope().unwrap_or(false),
@@ -1580,22 +1675,22 @@ impl ChainExecutionOptions {
         Self {
             process: ProcessJobContext {
                 cwd_override: entry.cwd_override.clone(),
-                sandbox: None,
+                launch: LaunchOptions::default(),
                 wrapper_enabled: entry.wrapper_enabled,
-                pty_enabled: true,
+                pty_default: true,
                 direct_output_client: None,
             },
             scope_enabled: entry.scope_enabled,
         }
     }
 
-    fn retry_default(state: &SchedulerState, config: &Config) -> Self {
+    fn retry_default(config: &Config) -> Self {
         Self {
             process: ProcessJobContext {
                 cwd_override: None,
-                sandbox: None,
-                wrapper_enabled: state.wrapper_enabled(config),
-                pty_enabled: true,
+                launch: LaunchOptions::default(),
+                wrapper_enabled: config.wrapper.enabled,
+                pty_default: true,
                 direct_output_client: None,
             },
             scope_enabled: false,
@@ -2147,10 +2242,7 @@ async fn spawn_chain(
                 });
             }
             None => {
-                let needs = match scope_execution_needs(io.sys, scope_hash).await {
-                    Ok(needs) => needs,
-                    Err(message) => return ResponsePayload::err(error_code::INTERNAL, message),
-                };
+                let needs = options.process.needs().clone();
                 match admit_resource_scope(io.sys, jid, scope_hash, &needs).await {
                     Ok(ResourceAdmission::Pending(reason)) => {
                         state.jobs.insert(
@@ -2601,36 +2693,7 @@ async fn process_chain_advance(
             }
             Ok(None) => {
                 let proc_options = chain_context.process_job_options();
-                let needs = match scope_execution_needs(io.sys, start_scope).await {
-                    Ok(needs) => needs,
-                    Err(error) => {
-                        warn!(%chain_id, %jid, pipeline = %leaves[idx].pipeline_text, "scheduler: failed to read scope execution needs: {error}");
-                        outcome.spawn_error.get_or_insert_with(|| error.clone());
-                        let terminal = set_job_terminal_state(
-                            jid,
-                            TerminalStateUpdate {
-                                status: JobStatus::Failed,
-                                exit_code: EXIT_CODE_UNAVAILABLE,
-                                end_scope: Some(start_scope),
-                                advance_chain: true,
-                            },
-                            state,
-                            io.db,
-                            io.sys,
-                        )
-                        .await;
-                        apply_terminal_chain_advance(
-                            chain_id,
-                            terminal,
-                            &mut outcome,
-                            &mut queue,
-                            state,
-                            io,
-                        )
-                        .await;
-                        continue;
-                    }
-                };
+                let needs = chain_context.process.needs().clone();
                 match admit_resource_scope(io.sys, jid, start_scope, &needs).await {
                     Ok(ResourceAdmission::Pending(reason)) => {
                         if let Some(chain) = state.chains.get_mut(&chain_id) {
@@ -2847,8 +2910,10 @@ async fn start_pending_script_run(
     state: &mut SchedulerState,
     runtime: SchedulerRuntime<'_>,
 ) -> Option<ResponsePayload> {
+    #[cfg(test)]
+    ensure_test_session(state, runtime.io.sys, client_id).await;
     let script_id = state.alloc_script();
-    let item_scope = match create_isolated_script_scope(runtime.io.sys).await {
+    let item_scope = match create_isolated_script_scope(state, client_id, runtime.io.sys).await {
         Ok(scope) => scope,
         Err(response) => return Some(response),
     };
@@ -3334,6 +3399,21 @@ async fn handle_command(
     config: &Config,
     sys: &ActorSystem,
 ) -> ResponsePayload {
+    if matches!(cmd, ResolvedCommand::Script { .. }) {
+        return handle_command_with_scope(
+            cmd,
+            client_id,
+            state,
+            db,
+            config,
+            sys,
+            CommandExecutionContext::default(),
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    ensure_test_session(state, sys, client_id).await;
     handle_command_with_scope(
         cmd,
         client_id,
@@ -3361,9 +3441,9 @@ async fn handle_command_with_scope(
             "script commands must enter the scheduler through the file-script runner",
         ),
         ResolvedCommand::Run { chain, params } => {
-            let base_scope = match resolve_command_scope(sys, context.scope_override).await {
-                Ok(h) => h,
-                Err(resp) => return resp,
+            let Some(base_scope) = resolve_command_scope(state, client_id, context.scope_override)
+            else {
+                return missing_session_response();
             };
             let scope_hash = match derive_mode_params_scope(sys, base_scope, &params).await {
                 Ok(scope) => scope,
@@ -3376,6 +3456,7 @@ async fn handle_command_with_scope(
             let options = match ChainExecutionOptions::from_params(
                 &params,
                 state,
+                client_id,
                 config,
                 context.direct_output_client,
             ) {
@@ -3402,9 +3483,9 @@ async fn handle_command_with_scope(
             params,
         } => {
             let display_text = schedule.display();
-            let base_scope = match resolve_command_scope(sys, context.scope_override).await {
-                Ok(h) => h,
-                Err(resp) => return resp,
+            let Some(base_scope) = resolve_command_scope(state, client_id, context.scope_override)
+            else {
+                return missing_session_response();
             };
             let scope_hash = match derive_mode_params_scope(sys, base_scope, &params).await {
                 Ok(scope) => scope,
@@ -3421,10 +3502,11 @@ async fn handle_command_with_scope(
                     format!("cannot compute next trigger for schedule: {display_text}"),
                 );
             };
-            let options = match ChainExecutionOptions::from_params(&params, state, config, None) {
-                Ok(options) => options,
-                Err(reason) => return ResponsePayload::err(error_code::INVALID_SYNTAX, reason),
-            };
+            let options =
+                match ChainExecutionOptions::from_params(&params, state, client_id, config, None) {
+                    Ok(options) => options,
+                    Err(reason) => return ResponsePayload::err(error_code::INVALID_SYNTAX, reason),
+                };
             let entry = CronEntry {
                 cron_id,
                 schedule,
@@ -3728,7 +3810,7 @@ async fn handle_command_with_scope(
         ResolvedCommand::ListScopes { limit } => handle_list_scopes_page(sys, limit).await,
 
         ResolvedCommand::Env { subcommand } => {
-            let snapshot = match get_head_snapshot(sys).await {
+            let snapshot = match get_session_snapshot(sys, state, client_id).await {
                 Ok(snapshot) => snapshot,
                 Err(response) => return response,
             };
@@ -3757,17 +3839,27 @@ async fn handle_command_with_scope(
                         set,
                         unset: vec![],
                         cwd: None,
-                        execution: None,
                     };
-                    match fork_scope(sys, delta).await {
-                        Ok(hash) => match get_scope_snapshot_by_hash(sys, hash).await {
-                            Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
-                                hash: hash.to_string(),
-                                summary: format_scope_change_summary(hash, &snapshot, &updated),
-                            }),
-                            Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
-                        },
-                        Err(response) => response,
+                    let Some(base) = state.client_scope(client_id) else {
+                        return ResponsePayload::err(
+                            error_code::INVALID_REQUEST,
+                            "client session handshake required",
+                        );
+                    };
+                    match derive_scope(sys, base, delta).await {
+                        Ok(hash) => {
+                            if let Some(session) = state.session_for_client_mut(client_id) {
+                                session.scope = hash;
+                            }
+                            match get_scope_snapshot_by_hash(sys, hash).await {
+                                Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
+                                    hash: hash.to_string(),
+                                    summary: format_scope_change_summary(hash, &snapshot, &updated),
+                                }),
+                                Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
+                            }
+                        }
+                        Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
                     }
                 }
                 Err(message) => ResponsePayload::err(error_code::INVALID_SYNTAX, message),
@@ -3775,7 +3867,7 @@ async fn handle_command_with_scope(
         }
 
         ResolvedCommand::ShowEnv { tail_bytes } => {
-            let snapshot = match get_head_snapshot(sys).await {
+            let snapshot = match get_session_snapshot(sys, state, client_id).await {
                 Ok(snapshot) => snapshot,
                 Err(response) => return response,
             };
@@ -3796,71 +3888,26 @@ async fn handle_command_with_scope(
 
         ResolvedCommand::Quit => ResponsePayload::ack(),
 
-        ResolvedCommand::Wrap { subcommand } => {
-            let sub = subcommand.as_deref().unwrap_or("status");
-            match sub {
-                "on" => {
-                    state.wrapper_enabled = Some(true);
-                    let text = if config.wrapper.enabled {
-                        "wrapper enabled (already on in config)".into()
-                    } else {
-                        "wrapper enabled for this session".into()
-                    };
-                    ResponsePayload::Ok(OkPayload::EvalText { text })
-                }
-                "off" => {
-                    state.wrapper_enabled = Some(false);
-                    let text = if config.wrapper.enabled {
-                        "wrapper disabled for this session".into()
-                    } else {
-                        "wrapper disabled (already off in config)".into()
-                    };
-                    ResponsePayload::Ok(OkPayload::EvalText { text })
-                }
-                "" | "status" => {
-                    let effective = state.wrapper_enabled.unwrap_or(config.wrapper.enabled);
-                    let binary = &config.wrapper.binary;
-                    let source = if let Some(ov) = state.wrapper_enabled {
-                        if ov {
-                            "session override: on"
-                        } else {
-                            "session override: off"
-                        }
-                    } else {
-                        "config"
-                    };
-                    let lines = [
-                        format!(
-                            "wrapper status: {}",
-                            if effective { "enabled" } else { "disabled" }
-                        ),
-                        format!(
-                            "  binary: {}",
-                            if binary.is_empty() { "(none)" } else { binary }
-                        ),
-                        format!("  source: {source}"),
-                        format!(
-                            "  allowlist: {}",
-                            if config.wrapper.allowlist.commands.is_empty() {
-                                "(empty; wraps nothing)".into()
-                            } else {
-                                config.wrapper.allowlist.commands.join(", ")
-                            }
-                        ),
-                    ];
-                    ResponsePayload::Ok(OkPayload::EvalText {
-                        text: lines.join("\n"),
-                    })
-                }
-                other => ResponsePayload::err(
-                    error_code::INVALID_SYNTAX,
-                    format!(":wrap {other} — expected 'on', 'off', or 'status'"),
-                ),
-            }
-        }
+        ResolvedCommand::Wrap { subcommand } => handle_session_bool_default(
+            state,
+            client_id,
+            subcommand.as_deref(),
+            "wrapper",
+            config.wrapper.enabled,
+            |defaults| &mut defaults.wrapper_enabled,
+        ),
+
+        ResolvedCommand::Pty { subcommand } => handle_session_bool_default(
+            state,
+            client_id,
+            subcommand.as_deref(),
+            "pty",
+            true,
+            |defaults| &mut defaults.pty,
+        ),
 
         ResolvedCommand::Cd { path } => {
-            let snapshot = match get_head_snapshot(sys).await {
+            let snapshot = match get_session_snapshot(sys, state, client_id).await {
                 Ok(snapshot) => snapshot,
                 Err(response) => return response,
             };
@@ -3889,17 +3936,27 @@ async fn handle_command_with_scope(
                 set: std::collections::BTreeMap::new(),
                 unset: vec![],
                 cwd: Some(resolved.clone()),
-                execution: None,
             };
-            match fork_scope(sys, delta).await {
-                Ok(hash) => match get_scope_snapshot_by_hash(sys, hash).await {
-                    Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
-                        hash: hash.to_string(),
-                        summary: format_scope_change_summary(hash, &snapshot, &updated),
-                    }),
-                    Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
-                },
-                Err(response) => response,
+            let Some(base) = state.client_scope(client_id) else {
+                return ResponsePayload::err(
+                    error_code::INVALID_REQUEST,
+                    "client session handshake required",
+                );
+            };
+            match derive_scope(sys, base, delta).await {
+                Ok(hash) => {
+                    if let Some(session) = state.session_for_client_mut(client_id) {
+                        session.scope = hash;
+                    }
+                    match get_scope_snapshot_by_hash(sys, hash).await {
+                        Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
+                            hash: hash.to_string(),
+                            summary: format_scope_change_summary(hash, &snapshot, &updated),
+                        }),
+                        Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
+                    }
+                }
+                Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
             }
         }
 
@@ -4007,7 +4064,7 @@ async fn handle_command_with_scope(
                 SpawnChainRequest {
                     chain,
                     scope_hash: start_scope,
-                    options: ChainExecutionOptions::retry_default(state, config),
+                    options: ChainExecutionOptions::retry_default(config),
                     warnings: Vec::new(),
                     retain_completed_chain: false,
                 },
@@ -4133,48 +4190,110 @@ fn script_item_end_scope_from_ok(payload: &OkPayload, state: &SchedulerState) ->
     }
 }
 
-async fn resolve_command_scope(
-    sys: &ActorSystem,
+fn resolve_command_scope(
+    state: &SchedulerState,
+    client_id: u64,
     scope_override: Option<ScopeHash>,
-) -> Result<ScopeHash, ResponsePayload> {
-    match scope_override {
-        Some(scope) => Ok(scope),
-        None => get_head_scope(sys).await,
-    }
+) -> Option<ScopeHash> {
+    scope_override.or_else(|| state.client_scope(client_id))
 }
 
-async fn create_isolated_script_scope(sys: &ActorSystem) -> Result<ScopeHash, ResponsePayload> {
-    let head = get_head_scope(sys).await?;
+fn missing_session_response() -> ResponsePayload {
+    ResponsePayload::err(
+        error_code::INVALID_REQUEST,
+        "client session handshake required",
+    )
+}
+
+async fn create_isolated_script_scope(
+    state: &SchedulerState,
+    client_id: u64,
+    sys: &ActorSystem,
+) -> Result<ScopeHash, ResponsePayload> {
+    let base = state.client_scope(client_id).ok_or_else(|| {
+        ResponsePayload::err(
+            error_code::INVALID_REQUEST,
+            "client session handshake required",
+        )
+    })?;
     derive_scope(
         sys,
-        head,
+        base,
         cue_core::scope::EnvDelta {
             set: std::collections::BTreeMap::new(),
             unset: vec![],
             cwd: None,
-            execution: None,
         },
     )
     .await
     .map_err(|error| ResponsePayload::err(error_code::INTERNAL, error))
 }
 
-/// Get the HEAD scope hash from the scope store.
-async fn get_head_scope(sys: &ActorSystem) -> Result<ScopeHash, ResponsePayload> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    if sys
-        .scope_store
-        .send(ScopeStoreMsg::GetHead { reply: tx })
-        .await
-        .is_err()
-    {
-        return Err(ResponsePayload::err(
-            error_code::INTERNAL,
-            "scope_store unreachable",
-        ));
+#[cfg(test)]
+async fn ensure_test_session(state: &mut SchedulerState, _sys: &ActorSystem, client_id: u64) {
+    if state.session_for_client(client_id).is_some() {
+        return;
     }
-    rx.await
-        .map_err(|_| ResponsePayload::err(error_code::INTERNAL, "scope_store reply dropped"))
+    let session_id = format!("test-session-{client_id}");
+    state.client_sessions.insert(client_id, session_id.clone());
+    state.sessions.insert(
+        session_id,
+        SessionState {
+            scope: ScopeHash([0; 32]),
+            defaults: LaunchDefaults::default(),
+            connected_clients: 1,
+            disconnected_at: None,
+        },
+    );
+}
+
+fn handle_session_bool_default(
+    state: &mut SchedulerState,
+    client_id: u64,
+    subcommand: Option<&str>,
+    name: &str,
+    config_default: bool,
+    field: impl FnOnce(&mut LaunchDefaults) -> &mut Option<bool>,
+) -> ResponsePayload {
+    let Some(session) = state.session_for_client_mut(client_id) else {
+        return ResponsePayload::err(
+            error_code::INVALID_REQUEST,
+            "client session handshake required",
+        );
+    };
+    let default = field(&mut session.defaults);
+    match subcommand.unwrap_or("status") {
+        "on" => {
+            *default = Some(true);
+            ResponsePayload::Ok(OkPayload::EvalText {
+                text: format!("{name} enabled for this session"),
+            })
+        }
+        "off" => {
+            *default = Some(false);
+            ResponsePayload::Ok(OkPayload::EvalText {
+                text: format!("{name} disabled for this session"),
+            })
+        }
+        "" | "status" => {
+            let effective = default.unwrap_or(config_default);
+            let source = match default {
+                Some(true) => "session override: on",
+                Some(false) => "session override: off",
+                None => "config",
+            };
+            ResponsePayload::Ok(OkPayload::EvalText {
+                text: format!(
+                    "{name} status: {}\n  source: {source}",
+                    if effective { "enabled" } else { "disabled" }
+                ),
+            })
+        }
+        other => ResponsePayload::err(
+            error_code::INVALID_SYNTAX,
+            format!(":{name} {other} — expected 'on', 'off', or 'status'"),
+        ),
+    }
 }
 
 /// Parse a string like `"J5"` into a `JobId`.
@@ -4536,15 +4655,7 @@ async fn handle_list_scopes(sys: &ActorSystem) -> ResponsePayload {
         return ResponsePayload::err(error_code::INTERNAL, "scope_store unreachable");
     }
     match rx.await {
-        Ok(Ok((head, mut scopes))) => {
-            let head_str = head.to_string();
-            scopes.sort_by(|a, b| {
-                let a_head = a.hash == head_str;
-                let b_head = b.hash == head_str;
-                b_head.cmp(&a_head).then(a.hash.cmp(&b.hash))
-            });
-            ResponsePayload::Ok(OkPayload::ScopeList(scopes))
-        }
+        Ok(Ok(scopes)) => ResponsePayload::Ok(OkPayload::ScopeList(scopes)),
         Ok(Err(error)) => ResponsePayload::err(error_code::INTERNAL, error.to_string()),
         Err(_) => ResponsePayload::err(error_code::INTERNAL, "scope_store reply dropped"),
     }
@@ -4561,13 +4672,7 @@ async fn handle_list_scopes_page(sys: &ActorSystem, limit: Option<usize>) -> Res
         return ResponsePayload::err(error_code::INTERNAL, "scope_store unreachable");
     }
     match rx.await {
-        Ok(Ok((head, mut scopes))) => {
-            let head_str = head.to_string();
-            scopes.sort_by(|a, b| {
-                let a_head = a.hash == head_str;
-                let b_head = b.hash == head_str;
-                b_head.cmp(&a_head).then(a.hash.cmp(&b.hash))
-            });
+        Ok(Ok(scopes)) => {
             let (scopes, page) = page_items(scopes, limit);
             ResponsePayload::Ok(OkPayload::ScopeListPage { scopes, page })
         }
@@ -5069,9 +5174,9 @@ mod tests {
             ChainExecutionOptions {
                 process: ProcessJobContext {
                     cwd_override: None,
-                    sandbox: None,
+                    launch: LaunchOptions::default(),
                     wrapper_enabled: false,
-                    pty_enabled: true,
+                    pty_default: true,
                     direct_output_client: None,
                 },
                 scope_enabled: false,
@@ -5086,9 +5191,9 @@ mod tests {
             ChainExecutionOptions {
                 process: ProcessJobContext {
                     cwd_override: None,
-                    sandbox: None,
+                    launch: LaunchOptions::default(),
                     wrapper_enabled: false,
-                    pty_enabled: true,
+                    pty_default: true,
                     direct_output_client: None,
                 },
                 scope_enabled: true,
@@ -5163,23 +5268,17 @@ mod tests {
             let root_snapshot = cue_core::scope::EnvSnapshot {
                 env: std::collections::BTreeMap::new(),
                 cwd: std::env::current_dir().expect("current dir"),
-                execution: Default::default(),
             };
             let root = cue_core::scope::Scope::root(root_snapshot.clone());
-            let head = root.hash;
-            let mut scopes = HashMap::from([(head, root)]);
+            let root_hash = root.hash;
+            let mut scopes = HashMap::from([(root_hash, root)]);
 
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    ScopeStoreMsg::GetHead { reply } => {
-                        let _ = reply.send(head);
-                    }
-                    ScopeStoreMsg::GetHeadSnapshot { reply } => {
-                        let snapshot = scopes
-                            .get(&head)
-                            .and_then(|scope| scope.snapshot.clone())
-                            .expect("root snapshot");
-                        let _ = reply.send(Ok(snapshot));
+                    ScopeStoreMsg::Insert { scope, reply } => {
+                        let hash = scope.hash;
+                        scopes.insert(hash, scope);
+                        let _ = reply.send(Ok(hash));
                     }
                     ScopeStoreMsg::GetScope { hash, reply } => {
                         let scope =
@@ -5227,27 +5326,28 @@ mod tests {
                                 env_count: 0,
                             });
                         }
-                        let _ = reply.send(Ok((head, infos)));
+                        let _ = reply.send(Ok(infos));
                     }
                     ScopeStoreMsg::Shutdown => break,
-                    _ => {}
                 }
             }
         });
     }
 
-    fn spawn_scope_store_with_head_snapshot_error(mut rx: mpsc::Receiver<ScopeStoreMsg>) {
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    ScopeStoreMsg::GetHeadSnapshot { reply } => {
-                        let _ = reply.send(Err(anyhow::anyhow!("head snapshot unavailable")));
-                    }
-                    ScopeStoreMsg::Shutdown => break,
-                    _ => {}
-                }
-            }
-        });
+    async fn bind_test_session(state: &mut SchedulerState, sys: &ActorSystem, client_id: u64) {
+        let snapshot = cue_core::scope::EnvSnapshot {
+            env: std::collections::BTreeMap::new(),
+            cwd: std::env::current_dir().expect("current dir"),
+        };
+        connect_session(
+            client_id,
+            format!("test-session-{client_id}"),
+            snapshot,
+            state,
+            sys,
+        )
+        .await
+        .expect("bind test session");
     }
 
     fn spawn_fake_process_mgr(mut rx: mpsc::Receiver<ProcessMgrMsg>) {
@@ -6711,8 +6811,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_mode_params_are_captured_in_start_scope() {
+    async fn run_mode_params_are_split_between_scope_and_launch_options() {
         let provider = crate::resource::mock_provider("gpu", &["gpu", "gpu_mem"]);
+        provider.set_env(std::collections::BTreeMap::from([(
+            "CUDA_VISIBLE_DEVICES".to_string(),
+            "mock".to_string(),
+        )]));
         let registry = crate::resource::ProviderRegistry::from_providers(vec![
             provider.clone() as std::sync::Arc<dyn crate::resource::Provider>
         ])
@@ -6762,32 +6866,44 @@ mod tests {
             ResponsePayload::Ok(OkPayload::JobCreated { .. })
         ));
 
-        let scopes = drain_spawn_scopes(&mut pm_rx).await;
-        let scope = *scopes.first().expect("spawn scope");
+        let msg = pm_rx.try_recv().expect("spawn job");
+        let (scope, options) = match msg {
+            ProcessMgrMsg::SpawnJob {
+                scope_hash,
+                options,
+                ..
+            } => (scope_hash, options),
+            _ => panic!("expected SpawnJob"),
+        };
         let snapshot = get_scope_snapshot_by_hash(&sys, scope)
             .await
             .expect("spawn scope snapshot");
         assert_eq!(snapshot.cwd, cwd);
-        assert_eq!(snapshot.execution.pty_enabled, Some(false));
         assert_eq!(
-            snapshot.execution.needs.get("gpu"),
+            snapshot.env.get("CUDA_VISIBLE_DEVICES"),
+            Some(&"mock".to_string())
+        );
+        let snapshot_json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert!(snapshot_json.get("execution").is_none());
+        assert!(!options.pty_enabled);
+        assert_eq!(
+            options.sandbox,
+            Some(crate::sandbox::SandboxConfig {
+                mode: crate::sandbox::SandboxMode::Overlay,
+                upper: Some(crate::sandbox::SandboxUpper::Tmpfs),
+            })
+        );
+        let request = provider.last_request().expect("resource request");
+        assert_eq!(
+            request.need.get("gpu"),
             Some(cue_core::resource::ResourceQuantity::Count(1))
         );
         assert_eq!(
-            snapshot.execution.needs.get("gpu_mem"),
+            request.need.get("gpu_mem"),
             Some(cue_core::resource::ResourceQuantity::Bytes(
                 24 * 1024 * 1024 * 1024
             ))
         );
-        assert_eq!(
-            snapshot.execution.sandbox,
-            Some(cue_core::scope::SandboxSettings {
-                mode: cue_core::scope::SandboxMode::Overlay,
-                upper: Some(cue_core::scope::SandboxUpper::Tmpfs),
-            })
-        );
-        let request = provider.last_request().expect("resource request");
-        assert_eq!(request.need, snapshot.execution.needs);
     }
 
     #[tokio::test]
@@ -6799,7 +6915,12 @@ mod tests {
         let mut config = Config::default();
         config.wrapper.enabled = false;
         let mut state = SchedulerState::new();
-        state.wrapper_enabled = Some(false);
+        bind_test_session(&mut state, &sys, 0).await;
+        state
+            .session_for_client_mut(0)
+            .expect("test session")
+            .defaults
+            .wrapper_enabled = Some(false);
         let mut params = cue_core::command::ModeParams::new();
         params.insert("wrapper", cue_core::command::ParamValue::Bool(true));
 
@@ -6823,6 +6944,47 @@ mod tests {
         let msg = pm_rx.try_recv().expect("spawn job");
         match msg {
             ProcessMgrMsg::SpawnJob { options, .. } => assert!(options.wrapper_enabled),
+            _ => panic!("expected SpawnJob"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_uses_session_pty_default_without_mutating_scope() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+
+        let conn = test_db();
+        let config = Config::default();
+        let mut state = SchedulerState::new();
+        bind_test_session(&mut state, &sys, 0).await;
+        let original_scope = state.client_scope(0).expect("session scope");
+        state
+            .session_for_client_mut(0)
+            .expect("test session")
+            .defaults
+            .pty = Some(false);
+
+        let resp = handle_command(
+            ResolvedCommand::Run {
+                chain: leaf("echo hi"),
+                params: cue_core::command::ModeParams::new(),
+            },
+            0,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            resp,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+        assert_eq!(state.client_scope(0), Some(original_scope));
+
+        let msg = pm_rx.try_recv().expect("spawn job");
+        match msg {
+            ProcessMgrMsg::SpawnJob { options, .. } => assert!(!options.pty_enabled),
             _ => panic!("expected SpawnJob"),
         }
     }
@@ -6882,24 +7044,6 @@ mod tests {
             ResponsePayload::Ok(OkPayload::CronAdded { .. })
         ));
         assert!(state.crons[&CronId(1)].wrapper_enabled);
-    }
-
-    #[tokio::test]
-    async fn head_snapshot_errors_are_reported_to_scheduler_callers() {
-        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
-        spawn_scope_store_with_head_snapshot_error(ss_rx);
-
-        let error = get_head_snapshot(&sys)
-            .await
-            .expect_err("head snapshot error should be reported");
-
-        match error {
-            ResponsePayload::Err { code, message } => {
-                assert_eq!(code, error_code::INTERNAL);
-                assert!(message.contains("head snapshot unavailable"));
-            }
-            other => panic!("expected error response, got {other:?}"),
-        }
     }
 
     #[tokio::test]

@@ -72,6 +72,15 @@ pub(crate) enum GatewayMsg {
 
 /// Messages handled by the Scheduler actor.
 pub(crate) enum SchedulerMsg {
+    /// Bind a transport client id to a stable logical session.
+    Connect {
+        client_id: u64,
+        session_id: String,
+        snapshot: EnvSnapshot,
+        reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
+    },
+    /// Mark a transport client as disconnected and start session TTL handling.
+    Disconnect { client_id: u64 },
     /// Evaluate a resolved command on behalf of a client.
     Eval {
         client_id: u64,
@@ -167,25 +176,17 @@ pub(crate) struct StderrSnapshot {
 
 /// Messages handled by the ScopeStore actor.
 pub(crate) enum ScopeStoreMsg {
-    /// Get the current HEAD scope hash.
-    GetHead {
-        reply: tokio::sync::oneshot::Sender<ScopeHash>,
+    /// Insert a full scope snapshot if it is not already present.
+    Insert {
+        scope: Scope,
+        reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
     },
     /// Get a scope by hash.
     GetScope {
         hash: ScopeHash,
         reply: tokio::sync::oneshot::Sender<Result<Option<Scope>>>,
     },
-    /// Get the current HEAD snapshot.
-    GetHeadSnapshot {
-        reply: tokio::sync::oneshot::Sender<Result<EnvSnapshot>>,
-    },
-    /// Fork a child scope from the current HEAD.
-    Fork {
-        delta: EnvDelta,
-        reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
-    },
-    /// Derive a child scope from a specific base without moving HEAD.
+    /// Derive a child scope from a specific base without moving a global cursor.
     Derive {
         base: ScopeHash,
         delta: EnvDelta,
@@ -193,9 +194,9 @@ pub(crate) enum ScopeStoreMsg {
     },
     /// Graceful shutdown.
     Shutdown,
-    /// List all known scopes, returning (head_hash, scope_infos).
+    /// List all known scopes.
     ListScopes {
-        reply: tokio::sync::oneshot::Sender<Result<(ScopeHash, Vec<ScopeInfo>)>>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<ScopeInfo>>>,
     },
 }
 
@@ -382,28 +383,6 @@ mod tests {
 
     fn in_memory_db() -> rusqlite::Connection {
         storage::open_db(Path::new(":memory:")).expect("open in-memory db")
-    }
-
-    #[tokio::test]
-    async fn spawn_all_reports_scope_store_initialization_failure() {
-        let scope_db = in_memory_db();
-        let missing = ScopeHash([7; 32]);
-        storage::set_head(&scope_db, &missing).expect("set missing head");
-        let scheduler_db = in_memory_db();
-
-        let result = spawn_all(
-            PathBuf::from("/tmp/cue-spawn-all-should-not-bind.sock"),
-            scope_db,
-            scheduler_db,
-            crate::config::Config::default(),
-        )
-        .await;
-        let Err(error) = result else {
-            panic!("scope store initialization failure should stop daemon startup");
-        };
-
-        assert!(error.to_string().contains("persisted head scope"));
-        assert!(error.to_string().contains("is missing"));
     }
 
     #[tokio::test]

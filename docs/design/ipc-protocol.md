@@ -99,7 +99,7 @@ Channel types:
 - `"jobs"` — all job state changes (created, state transitions, removed)
 - `"crons"` — all cron state changes
 - `"output:<id>"` — stdout/stderr chunks for a specific job (e.g., `"output:J1"`)
-- `"scopes"` — scope creation, HEAD changes
+- `"scopes"` — scope creation/list updates; session cursor moves are returned to the requesting client as `ScopeCreated` responses, not broadcast as global state
 - `"system"` — cued status, shutdown notices
 
 Channel names are a closed protocol set. `Subscribe` / `Unsubscribe` requests
@@ -110,6 +110,12 @@ Operations:
 
 - `Subscribe { channels }` — add channels (additive, no duplicates)
 - `Unsubscribe { channels }` — remove channels
+
+Every newly connected transport must first send `Handshake`. The client chooses
+a stable `session_id` for its frontend process and reports its current `cwd` and
+`env`. The daemon creates a new logical session from that snapshot or reconnects
+to the existing session cursor/defaults for the same id until its disconnected
+TTL expires.
 
 The daemon does not add implicit subscriptions; clients must subscribe before
 relying on pushed events from a channel.
@@ -147,6 +153,7 @@ enum RequestPayload {
     // === Protocol commands (structured, not user-typed) ===
 
     // Connection / subscription
+    Handshake { session_id: String, cwd: String, env: BTreeMap<String, String> },
     Subscribe { channels: Vec<String> },
     Unsubscribe { channels: Vec<String> },
 
@@ -299,8 +306,7 @@ enum EventPayload {
     // OutputChunkBinary { id: String, stream: Stream, base64: String }
     OutputEof { id: String },  // process closed its output
 
-    // Scope events (channel: "scopes")
-    HeadChanged { old_hash: String, new_hash: String },
+    // Scope cursor changes are per-session responses (`ScopeCreated`), not global events.
 
     // :fg events (no channel — only sent to fg-attached client)
     FgOutput { data: Vec<u8> },  // raw pty output

@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -40,7 +41,33 @@ impl CuedClient {
         let stream = UnixStream::connect(socket_path)
             .await
             .with_context(|| format!("connect to {}", socket_path.display()))?;
-        Ok(Self::from_stream(stream))
+        let mut client = Self::from_stream(stream);
+        client.handshake().await?;
+        Ok(client)
+    }
+
+    /// Send and acknowledge the initial session handshake for a newly connected transport.
+    pub async fn handshake(&mut self) -> Result<()> {
+        let session_id = process_session_id();
+        let cwd = std::env::current_dir()
+            .context("read current working directory for cue session handshake")?
+            .display()
+            .to_string();
+        let env = std::env::vars().collect::<BTreeMap<_, _>>();
+        let request_id = self
+            .send(RequestPayload::Handshake {
+                session_id,
+                cwd,
+                env,
+            })
+            .await?;
+        match self.recv().await? {
+            Message::Response {
+                id,
+                payload: ResponsePayload::Ok(OkPayload::Ack {}),
+            } if id == request_id => Ok(()),
+            message => bail!("unexpected message while handshaking with daemon: {message:?}"),
+        }
     }
 
     /// Send a request and return the assigned request ID.
@@ -363,7 +390,7 @@ impl MultiplexedClient {
             .await
     }
 
-    /// Show HEAD environment with an optional byte tail.
+    /// Show the current session environment with an optional byte tail.
     pub async fn show_env(&self, tail_bytes: Option<usize>) -> Result<ResponsePayload> {
         self.call(RequestPayload::ShowEnv { tail_bytes }).await
     }
@@ -397,6 +424,7 @@ impl Drop for MultiplexedClient {
 }
 
 const APP_DIR: &str = "cue-shell";
+static PROCESS_SESSION_ID: OnceLock<String> = OnceLock::new();
 
 #[doc(hidden)]
 pub trait ClientStream: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -408,6 +436,19 @@ type BoxedClientStream = Box<dyn ClientStream>;
 /// Resolve the default socket path: `$XDG_RUNTIME_DIR/cue-shell/cued.sock`.
 pub fn default_socket_path() -> PathBuf {
     default_socket_path_from_env(std::env::var_os("XDG_RUNTIME_DIR"), std::env::temp_dir())
+}
+
+fn process_session_id() -> String {
+    PROCESS_SESSION_ID.get_or_init(generate_session_id).clone()
+}
+
+fn generate_session_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stack = 0u8;
+    format!("cue-{}-{}-{:p}", std::process::id(), now, &stack)
 }
 
 fn default_socket_path_from_env(xdg_runtime_dir: Option<OsString>, temp_dir: PathBuf) -> PathBuf {

@@ -17,7 +17,7 @@ v1 therefore keeps the surface intentionally small:
 - the only CLI entry is `cue run <file.cue>`
 - top-level file items reuse the existing cue-shell command/chain syntax
 - execution is synchronous and fail-fast
-- each run is scope-isolated from the default HEAD
+- each run is scope-isolated from the caller's session cursor
 
 ## CLI surface
 
@@ -123,18 +123,18 @@ submission order:
 
 ## Scope semantics
 
-Each script run forks a fresh isolated scope from the current default HEAD before
-submitting item 0.
+Each script run forks a fresh isolated scope from the caller's current session
+cursor before submitting item 0.
 
 Within the script:
 
 - item 0 starts from the forked scope
 - each later top-level item inherits the previous top-level item's `end_scope`
 - `cd ...`, `env set ...`, `:run cd ...`, and `:run env set ...` affect later items in the same script
-- the default HEAD is not advanced or mutated by script execution
+- the caller's session cursor is not advanced or mutated by script execution
 
 After the run, the isolated scope lineage may remain in normal scope storage and
-retention, but it is not promoted to HEAD by default.
+retention, but it is not promoted to the caller's session cursor by default.
 
 ## Run identity and persistence
 
@@ -196,7 +196,7 @@ The agreed rollout order is:
 
 1. add this design document and cross-links
 2. add a file-source parser entry with comments/shebang handling
-3. enforce fork-from-HEAD isolated scope for script submissions
+3. enforce fork-from-session-cursor isolated scope for script submissions
 4. extend IPC with file source and final aggregated status
 5. add `cue run <file.cue>`
 6. remove the inline multiline batch entry

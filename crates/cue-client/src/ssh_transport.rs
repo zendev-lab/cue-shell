@@ -49,6 +49,17 @@ pub async fn connect_ssh_transport(transport: &ResolvedTransport) -> Result<(Cue
     let SpawnedSshTransport { stream, stderr } =
         spawn_ssh_transport(destination, gateway_command).await?;
     let mut client = CuedClient::from_stream(stream);
+    if let Err(error) = client.handshake().await {
+        return Err(ssh_connect_error(
+            profile_name,
+            destination,
+            gateway_command,
+            start_command,
+            &stderr,
+            error,
+        )
+        .await);
+    }
     match client.ping_for_version().await {
         Ok(version) => Ok((client, version)),
         Err(error) => Err(ssh_connect_error(

@@ -20,7 +20,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 - **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
 - **Chain syntax**: `->` serial · `~>` ignore-failure · `|||` parallel · `|?|` any-success; `&&` / `||` stay inside one job
-- **Daemon durability**: persisted HEAD scope, job history, cron definitions, auto-reconnect TUI
+- **Daemon durability**: job history, cron definitions, and per-session cursor reconnects
 
 ## Architecture
 

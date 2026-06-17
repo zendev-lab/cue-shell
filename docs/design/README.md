@@ -80,16 +80,17 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 ```
 
 Parenthesized `key=value` pairs immediately after the command name configure
-execution behavior. Only launcher-style commands support mode params: `:run`
-and `:cron`; the concrete support matrix lives in
-`crates/cue-core/src/command_spec.rs`. Supported execution params derive a job or
-cron start scope without moving the default HEAD. Resource keys are provider-owned
-via the `need.<resource>=<quantity>` namespace rather than hardcoded in core.
-`:run` can opt into an overlayfs workspace view with `sandbox=overlay` and, on
-Linux, `sandbox.upper=tmpfs` for ephemeral in-memory writes. Overlay sandboxing
-is a workspace view, not a security boundary: it does not isolate absolute paths
-outside the working tree, network access, process credentials, or inherited
-environment variables.
+launch behavior. Only launcher-style commands support mode params: `:run` and
+`:cron`; the concrete support matrix lives in
+`crates/cue-core/src/command_spec.rs`. `cwd=...` derives a job or cron start
+scope without changing the caller's session cursor. `pty`, `need.*`, and
+`sandbox.*` are per-job launch options; they are not part of scope identity.
+Resource keys are provider-owned via the `need.<resource>=<quantity>` namespace
+rather than hardcoded in core. `:run` can opt into an overlayfs workspace view
+with `sandbox=overlay` and, on Linux, `sandbox.upper=tmpfs` for ephemeral
+in-memory writes. Overlay sandboxing is a workspace view, not a security
+boundary: it does not isolate absolute paths outside the working tree, network
+access, process credentials, or inherited environment variables.
 
 TODO: add a macOS-compatible copy-on-write workspace backend for `sandbox=overlay`.
 Prefer APFS clonefile / `cp -c` for fast CoW materialization, fall back to
@@ -104,10 +105,11 @@ Scopes are **immutable, content-addressed environment snapshots**:
 - Delta storage: `parent_hash` + `EnvDelta` (exact schema in `crates/cue-core/src/scope.rs`)
 - Display: `S@a3f1` (short content hash)
 - Job holds `start_scope` and `end_scope` (None until complete)
-- Default scope = movable HEAD pointer, modified via `:env set` / `:cd`
-- Mode params derive child scopes for jobs/crons without moving HEAD
+- Each logical client session owns a mutable scope cursor, modified via `:env set` / `:cd`
+- `cwd=...` mode params derive child scopes for jobs/crons without moving the session cursor
+- Launch options such as `pty`, `need.*`, and `sandbox.*` live with the job launch request, not the scope
 
-Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, default scope ≈ HEAD.
+Analogy: Scope ≈ git commit, Job ≈ git diff, fork ≈ git branch, session cursor ≈ a checked-out ref.
 
 ## IPC Protocol
 

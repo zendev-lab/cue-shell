@@ -122,7 +122,7 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 其语义是：
 
 - 立即生成该 job 的 `end_scope`
-- **不会**自动移动默认 HEAD
+- **不会**自动移动当前 session cursor
 - serial chain 中，后一 leaf 会继承前一 leaf 的 `end_scope`
 - parallel / pipeline 中若出现这类 scope-transform leaf，当前直接拒绝，避免作用域歧义
 
@@ -194,7 +194,7 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 
 | 命令 | 语法 | 语义 | 定位 |
 |------|------|------|------|
-| `:env` | `:env` | 查看当前持久化 HEAD env | 核心 |
+| `:env` | `:env` | 查看当前 session env | 核心 |
 | `:env set` | `:env set FOO=bar` | 设置 env 并打印实际副作用 | 核心 |
 | `:help` | `:help` / `:help run` | 帮助 | 核心 |
 | `?` | `?` | 当前 mode 的详细帮助 | 核心 |
@@ -206,9 +206,10 @@ JOB 模式下的交互多行输入不再是 script 入口；需要多个顶层 i
 
 这里需要区分：
 
-- 顶层 `:cd ...` / `:env set ...`：修改默认 HEAD scope，并持久化
+- 顶层 `:cd ...` / `:env set ...`：只修改当前 logical session 的 scope cursor
   - 响应返回新的 scope hash，并打印**实际生效的副作用**（如 `cwd old -> new`、`KEY: old -> new`）
   - `:env set` 对重复变量按最终 key 去重，只展示最终实际变化
+  - 使用相同 session id 重连会恢复该 cursor；其他 session 不受影响
 - `:run cd ...` / `:run env set ...`：只修改该 job 的 `end_scope`
 
 前端补充：
@@ -270,16 +271,17 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 - `()` 紧跟命令名 = 模式参数（执行行为配置）
 - `()` 出现在其他位置 = chain 分组括号
 - Tokenizer 根据**位置规则**消歧（前一个 token 是 Command → 模式参数）
-- 影响执行的 mode params 会派生新的 job/cron start scope，不会移动默认 HEAD
+- `cwd=...` 会派生新的 job/cron start scope，不会移动当前 session cursor；`pty`、`need.*`、`sandbox.*` 是 launch options，不参与 scope identity
 
 ### 支持模式参数的命令
 
 支持矩阵以 `crates/cue-core/src/command_spec.rs` 为准；parser 和 snapshot
 测试在 `crates/cue-daemon/src/parser/parse.rs` 中保护错误消息与动态命名空间。
 
-执行态 mode params 是 Scope-owned execution state：`:run(cwd=/repo,
-pty=false)` 的 job 使用派生 start scope，但不会移动默认 HEAD；`:cron(cwd=/repo)`
-把 cwd 固定在 cron 的 scope_hash 中，后续触发从该 scope 运行。
+模式参数分成两类：`cwd=...` 会派生 job/cron 的 start scope，但不会移动当前
+session cursor；`:cron(cwd=/repo)` 把 cwd 固定在 cron 的 `scope_hash` 中，后续
+触发从该 scope 运行。`pty`、`need.<resource>`、`sandbox`、`sandbox.upper` 是
+job launch options，不进入 `Scope` hash，也不会改变 session cursor。
 `need.<resource>` 的 resource key 不由 core 写死，而是由 daemon 的 provider
 registry 从配置/内建 provider 声明，当前仅 `:run` 支持。`sandbox=overlay` /
 `sandbox.upper=tmpfs` 只适用于 `:run`，且 overlay sandbox 是 Linux-only 工作目录
@@ -374,7 +376,7 @@ Pipeline 内退出码 = 最后一个进程的退出码
 ├── Scope ──────────────────────────────────┤
 │ :scope list    列出 scope                  │
 │ :scopes        列出所有 scope（简写）       │
-│ :cd <path>     修改默认 scope 的 cwd       │
+│ :cd <path>     修改当前 session 的 cwd     │
 ├── Control ────────────────────────────────┤
 │ :send J<n> <input>  向 job 写 stdin        │
 │ :cancel J<n>        取消 queued job        │

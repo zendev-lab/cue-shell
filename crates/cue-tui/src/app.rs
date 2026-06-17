@@ -2048,9 +2048,6 @@ impl AppState {
                     self.pending_script_finishes.clear();
                     self.status_bar.update(StatusBarMsg::Connected(false));
                 }
-                _ => {
-                    tracing::debug!(?event, "unhandled server event");
-                }
             },
 
             AppMsg::KeyEvent(key) => {

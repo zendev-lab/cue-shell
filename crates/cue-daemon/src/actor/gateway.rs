@@ -17,6 +17,7 @@ use cue_core::ipc::{
     CompletionItem, CompletionKind, EventPayload, HighlightKind, HighlightSpan, MAX_MESSAGE_SIZE,
     Message, OkPayload, RequestPayload, ResponsePayload, encode_message, error_code,
 };
+use cue_core::scope::EnvSnapshot;
 
 use crate::parser::{ResolvedCommand, Token, Tokenizer, parse_command, parse_file_script_command};
 
@@ -255,6 +256,14 @@ async fn handle_client(
     {
         debug!(%client_id, "gateway: process manager unavailable during client cleanup");
     }
+    if sys
+        .scheduler
+        .send(SchedulerMsg::Disconnect { client_id })
+        .await
+        .is_err()
+    {
+        debug!(%client_id, "gateway: scheduler unavailable during client cleanup");
+    }
 }
 
 /// Route an incoming request to the appropriate actor.
@@ -266,6 +275,62 @@ async fn route_request(
     evt_tx: &mpsc::Sender<EventPayload>,
 ) -> Result<()> {
     match payload {
+        RequestPayload::Handshake {
+            session_id,
+            cwd,
+            env,
+        } => {
+            let snapshot = EnvSnapshot {
+                env,
+                cwd: PathBuf::from(cwd),
+            };
+            let (reply, result) = tokio::sync::oneshot::channel();
+            sys.scheduler
+                .send(SchedulerMsg::Connect {
+                    client_id,
+                    session_id,
+                    snapshot,
+                    reply,
+                })
+                .await
+                .context("send session handshake to scheduler")?;
+            match result.await {
+                Ok(Ok(_scope)) => {
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: ResponsePayload::ack(),
+                        })
+                        .await
+                        .context("send handshake ack")?;
+                }
+                Ok(Err(error)) => {
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: ResponsePayload::err(error_code::INTERNAL, error.to_string()),
+                        })
+                        .await
+                        .context("send handshake error")?;
+                }
+                Err(_) => {
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: ResponsePayload::err(
+                                error_code::INTERNAL,
+                                "scheduler session reply dropped",
+                            ),
+                        })
+                        .await
+                        .context("send handshake dropped error")?;
+                }
+            }
+        }
+
         RequestPayload::Eval { input, mode } => {
             let input = sys.config.aliases.apply(&input);
             match parse_command(&input, mode) {

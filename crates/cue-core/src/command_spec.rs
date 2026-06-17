@@ -113,7 +113,7 @@ const MODE_PARAM_SPECS: &[ModeParamSpec] = &[
         commands: &["run", "cron"],
         value_kind: ModeParamValueKind::String,
         value_hint: "/path",
-        detail: "Run from this working directory without moving HEAD",
+        detail: "Run from this working directory without changing the session cwd",
     },
     ModeParamSpec {
         name: "wrapper",
@@ -323,7 +323,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         category: CommandCategory::Scope,
         arg_kind: CommandArgKind::OptionalText,
         usage: ":env [subcommand]",
-        detail: "Inspect or update the persisted HEAD environment",
+        detail: "Inspect or update the current session environment",
         documented: true,
     },
     CommandSpec {
@@ -331,7 +331,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         category: CommandCategory::Scope,
         arg_kind: CommandArgKind::OptionalText,
         usage: ":cd <path>",
-        detail: "Move the persisted HEAD working directory",
+        detail: "Move the current session working directory",
         documented: true,
     },
     CommandSpec {
@@ -364,6 +364,14 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         arg_kind: CommandArgKind::OptionalText,
         usage: ":wrap [on|off|status]",
         detail: "Override or inspect the runtime wrapper",
+        documented: true,
+    },
+    CommandSpec {
+        name: "pty",
+        category: CommandCategory::System,
+        arg_kind: CommandArgKind::OptionalText,
+        usage: ":pty [on|off|status]",
+        detail: "Override or inspect this session's PTY default",
         documented: true,
     },
     CommandSpec {

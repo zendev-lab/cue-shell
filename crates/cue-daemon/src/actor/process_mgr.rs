@@ -626,23 +626,9 @@ fn configure_command(
 
 fn effective_process_options(
     options: &ProcessJobOptions,
-    snapshot: &EnvSnapshot,
+    _snapshot: &EnvSnapshot,
 ) -> ProcessJobOptions {
-    ProcessJobOptions {
-        cwd_override: options.cwd_override.clone(),
-        sandbox: snapshot
-            .execution
-            .sandbox
-            .as_ref()
-            .map(crate::sandbox::SandboxConfig::from)
-            .or_else(|| options.sandbox.clone()),
-        wrapper_enabled: options.wrapper_enabled,
-        pty_enabled: snapshot
-            .execution
-            .pty_enabled
-            .unwrap_or(options.pty_enabled),
-        direct_output_client: options.direct_output_client,
-    }
+    options.clone()
 }
 
 fn effective_cwd<'a>(snapshot: &'a EnvSnapshot, cwd_override: Option<&'a Path>) -> &'a Path {
@@ -2375,7 +2361,6 @@ mod tests {
                 ("USER".into(), "tester".into()),
             ]),
             cwd: PathBuf::from("/tmp/work"),
-            execution: Default::default(),
         }
     }
 
@@ -2387,27 +2372,6 @@ mod tests {
             pty_enabled: true,
             direct_output_client: None,
         }
-    }
-
-    #[test]
-    fn effective_process_options_read_execution_settings_from_scope() {
-        let mut snapshot = snapshot();
-        snapshot.execution.pty_enabled = Some(false);
-        snapshot.execution.sandbox = Some(cue_core::scope::SandboxSettings {
-            mode: cue_core::scope::SandboxMode::Overlay,
-            upper: Some(cue_core::scope::SandboxUpper::Tmpfs),
-        });
-
-        let options = effective_process_options(&process_options(), &snapshot);
-
-        assert!(!options.pty_enabled);
-        assert_eq!(
-            options.sandbox,
-            Some(crate::sandbox::SandboxConfig {
-                mode: crate::sandbox::SandboxMode::Overlay,
-                upper: Some(crate::sandbox::SandboxUpper::Tmpfs),
-            })
-        );
     }
 
     #[test]
@@ -2839,7 +2803,6 @@ mod tests {
                                     snapshot: Some(EnvSnapshot {
                                         env: BTreeMap::new(),
                                         cwd: cwd.clone(),
-                                        execution: Default::default(),
                                     }),
                                 })))
                                 .expect("send scope reply");

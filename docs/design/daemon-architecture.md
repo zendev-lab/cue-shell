@@ -97,15 +97,14 @@ State: running process table (pid, pty fd, ring buffer, job id mapping)
 ### 3.4 ScopeStore
 
 Responsibilities:
-- Create new Scope snapshots (blake3 hash of env + cwd + ...)
-- Fork scopes (create new snapshot with parent link)
+- Insert Scope snapshots (blake3 hash of env + cwd)
+- Fork scopes from an explicit base (create new snapshot with parent link)
 - Delta storage: parent_hash + EnvDelta (set/unset/cwd changes)
 - Reconstruct full Scope by walking parent chain
-- Manage HEAD pointer (default scope)
 - Persist to SQLite (scopes table)
-- Respond to scope queries from Scheduler/Gateway
+- Respond to explicit scope queries from Scheduler/Gateway
 
-State: in-memory cache of recently used scopes, HEAD pointer
+State: in-memory cache of recently used scopes. Mutable session cursors live in Scheduler session state, not ScopeStore.
 
 ### 3.5 EventBus
 
@@ -157,11 +156,9 @@ CREATE TABLE scopes (
     created_at  TEXT NOT NULL       -- ISO 8601
 );
 
--- HEAD pointer
-CREATE TABLE scope_head (
-    id   INTEGER PRIMARY KEY CHECK (id = 1),
-    hash TEXT NOT NULL REFERENCES scopes(hash)
-);
+-- Legacy databases may still contain an obsolete scope pointer table, but the
+-- current runtime does not use a daemon-global scope pointer. Session cursors
+-- are in-memory Scheduler state with reconnect TTL.
 
 -- Cron registry + history (restored on daemon restart)
 CREATE TABLE crons (
@@ -237,15 +234,15 @@ is absent.
 5. Initialize tracing (file appender + rotation)
 6. Open/create SQLite database (WAL mode, run migrations)
 7. Create data directories (output/, etc.)
-8. Restore state from SQLite:
-   a. Load Scope HEAD
-   b. Load active Crons → register timers in Scheduler
+8. Restore durable state from SQLite:
+   a. Load active Crons → register timers in Scheduler
+   b. Load retained job/script history counters
 9. Spawn Actor tasks:
    a. EventBus
-   b. ScopeStore (with SQLite handle)
+   b. ScopeStore (with SQLite handle, immutable scope storage)
    c. ProcessManager
-   d. Scheduler (with Cron timers)
-   e. Gateway (bind Unix socket)
+   d. Scheduler (with Cron timers and in-memory session cursors/defaults)
+   e. Gateway (bind Unix socket; clients handshake with session id + cwd + env)
 10. Enter tokio runtime main loop
 ```
 
@@ -270,8 +267,8 @@ Triggered by: `cued stop`, SIGTERM, SIGINT, or `:shutdown` command.
 
 4. Persist final state:
    a. Flush Cron definitions to SQLite (already persistent, but ensure consistency)
-   b. Flush Scope HEAD to SQLite
-   c. Write jobs_history for any interrupted jobs (state = Killed)
+   b. Write jobs_history for any interrupted jobs (state = Killed)
+   c. Let disconnected in-memory sessions expire by TTL; they are not persisted
 
 5. Close Unix socket
 6. Remove PID file

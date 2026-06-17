@@ -52,22 +52,21 @@ Stable job identities with an associated lifecycle state. See [`core-types.md`](
 
 ### Objects
 
-**Content-addressed environment snapshots** (`ScopeHash`): immutable
-snapshots of environment, cwd, and scope-owned execution settings. Identity is
-purely by content (e.g. blake3) — no names or versions as sources of truth. The
-concrete schema lives in `crates/cue-core/src/scope.rs`.
+**Content-addressed environment snapshots** (`ScopeHash`): immutable snapshots
+of environment and cwd. Identity is purely by content (e.g. blake3) — no names
+or versions as sources of truth. The concrete schema lives in
+`crates/cue-core/src/scope.rs`.
 
 ### Morphisms
 
 An **environment delta** (`EnvDelta`) is the step from one snapshot to another.
-Deltas can update environment variables, cwd, and execution settings; omitted
-fields inherit from the parent. See `crates/cue-core/src/scope.rs` for the exact
-schema.
+Deltas can update environment variables and cwd; omitted fields inherit from the
+parent. See `crates/cue-core/src/scope.rs` for the exact schema.
 
 ### Composition
 
 Deltas compose by overlay: later environment writes win, unsets accumulate, and
-later cwd/execution settings replace earlier ones.
+later cwd values replace earlier ones.
 
 ### Properties
 
@@ -76,8 +75,8 @@ later cwd/execution settings replace earlier ones.
 - **Content-addressed equality**: two scopes are equal iff their hashes match
   (same design idea as Spore’s `sig hash`).
 - **Immutable store**: scopes are not mutated in place — forking creates a new
-  hash; HEAD moves, history does not rewrite. `:run(...)` and `:cron(...)`
-  mode params can fork start scopes for execution without moving HEAD.
+  hash; session cursors move, history does not rewrite. `cwd=...` mode params
+  can fork start scopes for execution without moving the session cursor.
 
 Implementation: `crates/cue-daemon/src/actor/scope_store.rs`.
 
@@ -92,7 +91,7 @@ F(σ)  =  { jobs whose scope_hash = σ }
 ```
 
 On a scope fork, **existing jobs stay in their spawn scope** — the set
-`F(σ)` does not “move” when the shell’s HEAD advances.
+`F(σ)` does not “move” when a session cursor advances.
 
 Why it matters:
 
@@ -163,7 +162,7 @@ Command names and flags: [`commands-and-modes.md`](commands-and-modes.md).
 | Concept | Role |
 |--------|------|
 | `scopes` / queries | Enumerate or inspect known scopes |
-| `env` / `:cd` flow | Read or advance HEAD scope |
+| `env` / `:cd` flow | Read or advance the current session cursor |
 
 ### On crons (recurring factories)
 

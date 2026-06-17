@@ -215,9 +215,11 @@ The Resolver transforms `Ast` → `RequestPayload`:
    `cue-core::command_spec`; dynamic namespaces such as `need.<resource>` are
    still gated by that metadata.
 
-5. **Scope resolution**: jobs and crons start from HEAD or an explicit `scope`,
-   then supported execution mode params derive a start scope without mutating
-   HEAD. The concrete scope schema lives in `crates/cue-core/src/scope.rs`.
+5. **Scope resolution**: jobs and crons start from the caller's session cursor
+   or an explicit scope override, then `cwd=...` can derive a start scope without
+   mutating that cursor. Launch options such as `pty`, `need.*`, and `sandbox.*`
+   are validated from command metadata but do not enter the scope hash. The
+   concrete scope schema lives in `crates/cue-core/src/scope.rs`.
 
 ## 7. Completion Service
 
@@ -321,6 +323,7 @@ Which argument type each command expects:
 | `:resume` | Cron IdRef (`C<n>`) | ✗ |
 | `:config` | Text | ✗ |
 | `:wrap` | Text (`on`, `off`, `status`) | ✗ |
+| `:pty` | Text (`on`, `off`, `status`) | ✗ |
 | `:log` | Job/Cron IdRef (`J<n>` or `C<n>`) or Empty | ✗ |
 | `:clear` | Empty | ✗ |
 | `:quit` | Empty | ✗ |

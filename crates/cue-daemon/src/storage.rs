@@ -375,32 +375,6 @@ fn scope_from_row_parts(
     })
 }
 
-/// Get the current HEAD scope hash.
-pub fn get_head(conn: &Connection) -> Result<Option<ScopeHash>> {
-    let mut stmt = conn.prepare("SELECT hash FROM scope_head WHERE id = 0")?;
-    let result = stmt
-        .query_row([], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
-        })
-        .optional()?;
-
-    match result {
-        Some(blob) => Ok(Some(blob_to_scope_hash(&blob)?)),
-        None => Ok(None),
-    }
-}
-
-/// Set (or create) the HEAD pointer.
-pub fn set_head(conn: &Connection, hash: &ScopeHash) -> Result<()> {
-    conn.execute(
-        "INSERT INTO scope_head (id, hash) VALUES (0, ?1)
-         ON CONFLICT(id) DO UPDATE SET hash = excluded.hash",
-        rusqlite::params![hash.0.as_slice()],
-    )?;
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredJob {
     pub id: String,
@@ -931,9 +905,7 @@ mod tests {
     use std::path::PathBuf;
 
     use cue_core::job::CancelReason;
-    use cue_core::scope::{
-        EnvSnapshot, ExecutionSettings, SandboxMode, SandboxSettings, SandboxUpper,
-    };
+    use cue_core::scope::EnvSnapshot;
 
     use super::*;
 
@@ -1009,14 +981,6 @@ mod tests {
         let snap = EnvSnapshot {
             env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp"),
-            execution: ExecutionSettings {
-                pty_enabled: Some(false),
-                needs: cue_core::Need::from_pairs([("gpu", cue_core::ResourceQuantity::Count(1))]),
-                sandbox: Some(SandboxSettings {
-                    mode: SandboxMode::Overlay,
-                    upper: Some(SandboxUpper::Tmpfs),
-                }),
-            },
         };
         let scope = Scope::root(snap);
         insert_scope(&conn, &scope).unwrap();
@@ -1034,7 +998,6 @@ mod tests {
         let root = Scope::root(EnvSnapshot {
             env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
             cwd: PathBuf::from("/tmp/root"),
-            execution: Default::default(),
         });
         let child = Scope::fork(
             root.hash,
@@ -1043,7 +1006,6 @@ mod tests {
                 set: BTreeMap::from([("FOO".into(), "bar".into())]),
                 unset: vec![],
                 cwd: Some(PathBuf::from("/tmp/child")),
-                execution: None,
             },
         );
         insert_scope(&conn, &root).unwrap();
@@ -1054,20 +1016,6 @@ mod tests {
 
         assert!(hashes.contains(&root.hash));
         assert!(hashes.contains(&child.hash));
-    }
-
-    #[test]
-    fn head_roundtrip() {
-        let conn = in_memory_db();
-        assert!(get_head(&conn).unwrap().is_none());
-        let hash = ScopeHash([42; 32]);
-        set_head(&conn, &hash).unwrap();
-        assert_eq!(get_head(&conn).unwrap(), Some(hash));
-
-        // Update head.
-        let hash2 = ScopeHash([99; 32]);
-        set_head(&conn, &hash2).unwrap();
-        assert_eq!(get_head(&conn).unwrap(), Some(hash2));
     }
 
     #[test]

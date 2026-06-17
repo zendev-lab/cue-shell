@@ -98,7 +98,7 @@ pub enum ResolvedCommand {
     ListScopes { limit: Option<usize> },
     /// Environment operations.
     Env { subcommand: Option<String> },
-    /// Show HEAD environment with output limits.
+    /// Show current session environment with output limits.
     ShowEnv { tail_bytes: Option<usize> },
     /// Change directory.
     Cd { path: String },
@@ -116,6 +116,8 @@ pub enum ResolvedCommand {
     Quit,
     /// Wrapper control: on / off / status.
     Wrap { subcommand: Option<String> },
+    /// Session PTY default control: on / off / status.
+    Pty { subcommand: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +299,9 @@ impl Resolver {
             "clear" => ResolvedCommand::Clear,
             "quit" | "exit" => ResolvedCommand::Quit,
             "wrap" => ResolvedCommand::Wrap {
+                subcommand: extract_optional_text(argument),
+            },
+            "pty" => ResolvedCommand::Pty {
                 subcommand: extract_optional_text(argument),
             },
             _ => unreachable!("parser rejects unknown commands"),

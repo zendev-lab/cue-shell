@@ -6,7 +6,8 @@ serialization, and command metadata is the code:
 
 - Core IDs, jobs, crons, chains, scopes, resources, and IPC payloads:
   `crates/cue-core/src/`
-- Scope schema and execution settings: `crates/cue-core/src/scope.rs`
+- Scope schema: `crates/cue-core/src/scope.rs`
+- Job launch options: `crates/cue-core/src/job.rs`
 - Command and mode-param metadata: `crates/cue-core/src/command_spec.rs`
 - Daemon scheduling/runtime state: `crates/cue-daemon/src/actor/`
 - Persistence schema/roundtrips: `crates/cue-daemon/src/storage.rs`
@@ -25,19 +26,19 @@ Use the concrete newtypes in `cue-core` when changing parsing, IPC, or storage.
 
 ## Scopes
 
-A scope is an immutable, content-addressed snapshot. It carries the environment,
-working directory, and scope-owned execution settings. Supported `:run(...)` and
-`:cron(...)` mode params derive child start scopes without moving the default
-HEAD.
+A scope is an immutable, content-addressed snapshot. It carries the environment
+and working directory only. Logical client sessions own mutable scope cursors;
+`cwd=...` on `:run(...)` and `:cron(...)` derives child start scopes without
+moving the caller's session cursor.
 
 Rules:
 
 - Scope identity is content-addressed; equivalent snapshots share a hash.
 - Scope deltas point at a parent and inherit unspecified fields.
-- `:env set` and `:cd` advance the default HEAD scope.
-- Launcher mode params derive a start scope for that job/cron only.
-- Resource needs and sandbox settings are execution settings, not environment
-  variables.
+- `:env set` and `:cd` advance only the current session cursor.
+- `cwd=...` launcher mode params derive a start scope for that job/cron only.
+- Resource needs, PTY choices, and sandbox settings are launch options, not
+  environment variables and not scope identity.
 
 Implementation references:
 
@@ -59,7 +60,7 @@ Pending -> Running -> Done | Failed | Killed | Cancelled(reason)
 
 Rules:
 
-- Jobs never move when HEAD changes.
+- Jobs never move when a session cursor changes.
 - Output belongs to jobs; scripts/chains only aggregate job outcomes.
 - A missing process exit status is represented explicitly in code; do not infer
   success from missing status.
@@ -79,7 +80,7 @@ Rules:
 
 - `:cron(cwd=...)` stores cwd in the cron scope.
 - Restored legacy cron records may still carry a daemon-side cwd override; new
-  records should prefer scope-owned execution state.
+  records should prefer captured start scopes.
 - Cron removal and job cancellation are separate lifecycle operations.
 
 Implementation references:
@@ -110,8 +111,10 @@ snapshot tests live under `crates/cue-daemon/src/parser/parse.rs`.
 
 Current design intent:
 
-- `cwd`, explicit PTY, resource needs, and sandbox settings are scope-owned
-  execution state where supported.
+- `cwd` is scope-affecting where supported; it derives a start scope without
+  moving the current session cursor.
+- Explicit PTY, resource needs, and sandbox settings are launch options for the
+  job request; they do not change scope hashes.
 - `need.<resource>` is provider-owned and currently accepted only for `:run`.
 - Sandbox mode params are currently accepted only for `:run`.
 - Unsupported mode params fail during parsing or command resolution instead of
