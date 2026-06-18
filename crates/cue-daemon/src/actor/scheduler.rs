@@ -904,32 +904,24 @@ async fn connect_session(
     state: &mut SchedulerState,
     sys: &ActorSystem,
 ) -> anyhow::Result<ScopeHash> {
-    if state
-        .client_sessions
-        .get(&client_id)
-        .is_some_and(|old_session_id| old_session_id == &session_id)
-    {
+    let mut old_session_id = state.client_sessions.get(&client_id).cloned();
+
+    if old_session_id.as_deref() == Some(session_id.as_str()) {
         if let Some(session) = state.sessions.get_mut(&session_id) {
             session.disconnected_at = None;
             return Ok(session.scope);
         }
         state.client_sessions.remove(&client_id);
-    }
-
-    if let Some(old_session_id) = state.client_sessions.insert(client_id, session_id.clone())
-        && old_session_id != session_id
-        && let Some(old_session) = state.sessions.get_mut(&old_session_id)
-    {
-        old_session.connected_clients = old_session.connected_clients.saturating_sub(1);
-        if old_session.connected_clients == 0 {
-            old_session.disconnected_at = Some(Instant::now());
-        }
+        old_session_id = None;
     }
 
     if let Some(session) = state.sessions.get_mut(&session_id) {
         session.connected_clients += 1;
         session.disconnected_at = None;
-        return Ok(session.scope);
+        let scope = session.scope;
+        state.client_sessions.insert(client_id, session_id.clone());
+        mark_replaced_session_disconnected(state, old_session_id, &session_id);
+        return Ok(scope);
     }
 
     let scope = Scope::root(snapshot);
@@ -943,7 +935,25 @@ async fn connect_session(
             disconnected_at: None,
         },
     );
+    state.client_sessions.insert(client_id, session_id.clone());
+    mark_replaced_session_disconnected(state, old_session_id, &session_id);
     Ok(hash)
+}
+
+fn mark_replaced_session_disconnected(
+    state: &mut SchedulerState,
+    old_session_id: Option<String>,
+    new_session_id: &str,
+) {
+    if let Some(old_session_id) = old_session_id
+        && old_session_id != new_session_id
+        && let Some(old_session) = state.sessions.get_mut(&old_session_id)
+    {
+        old_session.connected_clients = old_session.connected_clients.saturating_sub(1);
+        if old_session.connected_clients == 0 {
+            old_session.disconnected_at = Some(Instant::now());
+        }
+    }
 }
 
 fn disconnect_session(client_id: u64, state: &mut SchedulerState) {
@@ -5348,6 +5358,74 @@ mod tests {
         )
         .await
         .expect("bind test session");
+    }
+
+    fn test_handshake_snapshot() -> cue_core::scope::EnvSnapshot {
+        cue_core::scope::EnvSnapshot {
+            env: std::collections::BTreeMap::new(),
+            cwd: std::env::current_dir().expect("current dir"),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_initial_session_connect_does_not_record_client_mapping() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        drop(ss_rx);
+        let mut state = SchedulerState::new();
+
+        let error = connect_session(
+            7,
+            "failed-session".into(),
+            test_handshake_snapshot(),
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect_err("scope store should be unreachable");
+
+        assert!(error.to_string().contains("scope_store unreachable"));
+        assert!(!state.client_sessions.contains_key(&7));
+        assert!(!state.sessions.contains_key("failed-session"));
+        assert!(state.session_for_client(7).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_session_switch_preserves_existing_client_binding() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let mut state = SchedulerState::new();
+        connect_session(
+            7,
+            "old-session".into(),
+            test_handshake_snapshot(),
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("initial session connects");
+        let old_scope = state.client_scope(7).expect("old session scope");
+
+        let (broken_sys, _gw_rx, _sched_rx, _pm_rx, broken_ss_rx, _eb_rx) = test_actor_system();
+        drop(broken_ss_rx);
+        let error = connect_session(
+            7,
+            "new-session".into(),
+            test_handshake_snapshot(),
+            &mut state,
+            &broken_sys,
+        )
+        .await
+        .expect_err("new session scope insert should fail");
+
+        assert!(error.to_string().contains("scope_store unreachable"));
+        assert_eq!(
+            state.client_sessions.get(&7).map(String::as_str),
+            Some("old-session")
+        );
+        assert_eq!(state.client_scope(7), Some(old_scope));
+        assert_eq!(state.sessions["old-session"].connected_clients, 1);
+        assert!(state.sessions["old-session"].disconnected_at.is_none());
+        assert!(!state.sessions.contains_key("new-session"));
     }
 
     fn spawn_fake_process_mgr(mut rx: mpsc::Receiver<ProcessMgrMsg>) {
