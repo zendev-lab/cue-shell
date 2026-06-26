@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -116,6 +117,21 @@ fn token_spans(input: &str) -> Vec<(usize, usize)> {
 }
 
 const DEFAULT_GIT_NO_VERIFY_HINT: &str = "Run the commit normally; if hooks fail, inspect and fix the hook/check or ask before any alternative.";
+const DEFAULT_DAEMON_CONFIG: &str = r#"# cue-shell daemon runtime configuration.
+# This file is created automatically on first daemon startup and is safe to edit.
+# Existing files are never overwritten; missing built-in guardrails are still
+# merged at load time.
+
+[block.versioned_commands]
+python = "Use `script_run`/`script_eval` for Python, or run `uv run python ...` explicitly; direct Python launchers are blocked so Python execution goes through uv."
+
+[block.commands.git]
+"--no-verify" = "Run the commit normally; if hooks fail, inspect and fix the hook/check or ask before any alternative."
+
+[retention]
+max_job_history = 200
+max_script_runs = 100
+"#;
 
 /// Hard command guardrails.
 ///
@@ -141,6 +157,10 @@ pub struct BlockConfig {
     /// Map from command name → whole-command or argument-level block rule.
     #[serde(default = "default_block_commands")]
     pub commands: BTreeMap<String, BlockCommandRule>,
+    /// Map from versioned command stem → whole-command block rule. A stem `python`
+    /// matches `python`, `python3`, `python3.12`, etc., but not `python-config`.
+    #[serde(default)]
+    pub versioned_commands: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,6 +200,7 @@ impl Default for BlockConfig {
     fn default() -> Self {
         Self {
             commands: default_block_commands(),
+            versioned_commands: BTreeMap::new(),
         }
     }
 }
@@ -206,24 +227,31 @@ impl BlockConfig {
         let cmd_name = command_line.first()?;
         let base = command_base(cmd_name);
 
-        match self.commands.get(base)? {
-            BlockCommandRule::WholeCommand(hint) => Some(BlockDecision::Block(
-                self.command_block_reason(cmd_name, hint),
-            )),
-            BlockCommandRule::Args(rules) => {
-                for arg in &command_line[1..] {
-                    if let Some((pattern, hint)) = rules
-                        .iter()
-                        .find(|(pattern, _)| blocked_arg_matches(arg, pattern))
-                    {
-                        return Some(BlockDecision::Block(
-                            self.arg_block_reason(cmd_name, pattern, hint),
-                        ));
+        if let Some(rule) = self.commands.get(base) {
+            return match rule {
+                BlockCommandRule::WholeCommand(hint) => Some(BlockDecision::Block(
+                    self.command_block_reason(cmd_name, hint),
+                )),
+                BlockCommandRule::Args(rules) => {
+                    for arg in &command_line[1..] {
+                        if let Some((pattern, hint)) = rules
+                            .iter()
+                            .find(|(pattern, _)| blocked_arg_matches(arg, pattern))
+                        {
+                            return Some(BlockDecision::Block(
+                                self.arg_block_reason(cmd_name, pattern, hint),
+                            ));
+                        }
                     }
+                    None
                 }
-                None
-            }
+            };
         }
+
+        self.versioned_commands
+            .iter()
+            .find(|(stem, _)| versioned_command_matches(base, stem))
+            .map(|(_, hint)| BlockDecision::Block(self.command_block_reason(cmd_name, hint)))
     }
 
     fn command_block_reason(&self, cmd_name: &str, hint: &str) -> String {
@@ -254,6 +282,22 @@ fn command_base(cmd_name: &str) -> &str {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(cmd_name)
+}
+
+fn versioned_command_matches(base: &str, stem: &str) -> bool {
+    if stem.is_empty() {
+        return false;
+    }
+    if base == stem {
+        return true;
+    }
+    let Some(suffix) = base.strip_prefix(stem) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +571,7 @@ impl Config {
     pub fn load() -> Result<Self> {
         let config_dir = dirs::config_dir()?;
         let daemon_path = config_dir.join(DAEMON_CONFIG_FILE);
+        ensure_default_daemon_config(&daemon_path)?;
         Self::load_from_source(
             read_source(&daemon_path)?
                 .as_deref()
@@ -688,6 +733,31 @@ fn default_wrapper_binary() -> String {
 // Helpers
 // ────────────────────────────────────────────────────────────────────
 
+fn ensure_default_daemon_config(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create config directory {}", parent.display()))?;
+    }
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            file.write_all(DEFAULT_DAEMON_CONFIG.as_bytes())
+                .with_context(|| format!("write default config {}", path.display()))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("create default config {}", path.display()))
+        }
+    }
+}
+
 fn read_source(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
@@ -702,6 +772,52 @@ fn read_source(path: &Path) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn default_daemon_config_text_parses_and_blocks_python() {
+        let config =
+            Config::load_from_source(Some((Path::new("daemon.toml"), DEFAULT_DAEMON_CONFIG)))
+                .expect("default config parses");
+
+        assert!(matches!(
+            config.check_command_guardrail(&["python".into(), "script.py".into()]),
+            Some(BlockDecision::Block(_))
+        ));
+        assert!(matches!(
+            config.check_command_guardrail(&["python3.13".into(), "script.py".into()]),
+            Some(BlockDecision::Block(_))
+        ));
+        assert!(
+            config
+                .check_command_guardrail(&[
+                    "uv".into(),
+                    "run".into(),
+                    "python".into(),
+                    "script.py".into()
+                ])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_daemon_config_is_bootstrapped() {
+        let root = std::env::temp_dir().join(format!(
+            "cue-daemon-config-bootstrap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let path = root.join("cue-shell").join("daemon.toml");
+
+        ensure_default_daemon_config(&path).expect("write default config");
+
+        let text = std::fs::read_to_string(&path).expect("read generated config");
+        assert!(text.contains("python ="));
+        Config::load_from_source(Some((&path, &text))).expect("generated config parses");
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn invalid_config_is_not_silently_defaulted() {
@@ -1100,6 +1216,12 @@ pip = "uv pip"
     #[test]
     fn block_config_default_blocks_git_no_verify_with_hint() {
         let config = Config::default();
+        assert!(
+            config
+                .check_command_guardrail(&["python".into(), "script.py".into()])
+                .is_none(),
+            "Config::default should not hard-code the generated daemon.toml python block"
+        );
         let decision = config
             .check_command_guardrail(&["git".into(), "commit".into(), "--no-verify".into()])
             .expect("git --no-verify should be blocked by default");

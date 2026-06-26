@@ -210,11 +210,15 @@ path_lookup = true
 
 ### Daemon runtime config
 
+On first startup, `cued` creates `~/.config/cue-shell/daemon.toml` with the built-in guardrails.
 `daemon.toml` can block unsafe commands or command arguments and attach remediation hints.
 Block rules run before advisory warnings, so a command can both warn generally
 and fail fast for specific arguments.
 
 ```toml
+[block.versioned_commands]
+python = "Use script_run/script_eval or uv run python ...; direct Python launchers are blocked."
+
 [block.commands]
 sh = "Avoid shell wrappers. Use cue-shell direct-exec, cwd=..., or cue operators."
 
@@ -231,6 +235,8 @@ cd = "Prefer cwd=... over cd in command strings."
 Matching is literal, not glob or regex based:
 
 - `[block.commands] sh = "..."` blocks a command whose `argv[0]` basename is exactly `sh`. It matches `sh` and `/bin/sh`; it does not match `zsh`, `/bin/zsh`, or `shellcheck`.
+- `[block.versioned_commands] python = "..."` blocks command basenames `python`, `python2`, `python3`, `python3.12`, etc.; it does not match `python-config`.
+- The generated default config uses `[block.versioned_commands] python = "..."` to block direct `python`, `python3`, and versioned launchers such as `python3.12`, so Python execution goes through `script_run` / `script_eval` or explicit `uv run python ...`.
 - Each `[block.commands.<name>]` entry maps one blocked argument pattern to its remediation hint. The command name is also matched by exact `argv[0]` basename.
 - Argument patterns are checked against each argv token independently, not against the joined command line. `"--no-verify"` matches an argument token `--no-verify`; it also matches `--no-verify=...` via the `--flag=value` convention.
 - `[warn.commands]` maps an exact command basename to an advisory hint.

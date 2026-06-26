@@ -1019,8 +1019,11 @@ async fn test_run_need_params_are_admitted_from_start_scope() {
         let bin_dir = env.root.join("bin");
         std::fs::create_dir_all(&bin_dir).expect("create bin dir");
         write_executable_script(
-            &bin_dir.join("python"),
+            &bin_dir.join("uv"),
             r#"#!/bin/sh
+if [ "$1" != "run" ] || [ "$2" != "python" ]; then
+  exit 64
+fi
 printf '%s\n' "$GPU_TOKEN"
 "#,
         );
@@ -1081,7 +1084,7 @@ timeout_ms = 5000
             &mut stream,
             1,
             RequestPayload::Eval {
-                input: ":run(need.gpu=1, need.gpu_mem=24GiB) python train.py".into(),
+                input: ":run(need.gpu=1, need.gpu_mem=24GiB) uv run python train.py".into(),
                 mode: Mode::Job,
             },
         )

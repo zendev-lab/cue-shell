@@ -80,7 +80,7 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 | `run the tests` | `:run run the tests` | `:cron run the tests` |
 | `:kill J1` | 内建 kill ✅ | 内建 kill ✅ |
 | `:jobs` | 内建 jobs ✅ | 内建 jobs ✅ |
-| `/usr/bin/python a.py` | `:run /usr/bin/python a.py` ✅ | `:cron /usr/bin/python a.py` |
+| `uv run python a.py` | `:run uv run python a.py` ✅ | `:cron uv run python a.py` |
 | `every 5m cargo test` | `:run every 5m cargo test` | `:cron every 5m cargo test` ✅ |
 
 **零歧义**：`:` 开头 = 内建，否则 = 模式默认。没有命名冲突，没有 fallthrough，没有上下文依赖。
@@ -263,7 +263,7 @@ Active → Idle (队列空) → Persisted (TTL 到期，落盘)
 
 ```
 :run(cwd=/repo, pty=false) cargo test --release
-:run(need.gpu=1, need.gpu_mem=24GiB) python train.py
+:run(need.gpu=1, need.gpu_mem=24GiB) uv run python train.py
 :run(sandbox=overlay, sandbox.upper=tmpfs) cargo test
 :cron(cwd=/repo) every 5m cargo clippy
 ```

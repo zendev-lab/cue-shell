@@ -74,7 +74,7 @@ Shift+Tab cycles modes. `:` prefix always invokes a builtin command regardless o
 
 ```
 :run(cwd=/repo, pty=false) cargo test
-:run(need.gpu=1, need.gpu_mem=24GiB) python train.py
+:run(need.gpu=1, need.gpu_mem=24GiB) uv run python train.py
 :run(sandbox=overlay, sandbox.upper=tmpfs) cargo test
 :cron(cwd=/repo) every 5m cargo clippy
 ```
