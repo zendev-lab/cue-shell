@@ -116,6 +116,9 @@ submission order:
 - output for jobs spawned by a `RunScript` request is delivered directly to the
   requesting client, while still being published on normal `output:J<n>`
   channels for other observers
+- each item created after `ScriptCreated` is associated by a direct
+  `ScriptItemCreated { script_id, item }` event; consumers must not infer this
+  mapping from globally visible `JobCreated` events or numeric Job ID order
 - terminal `ScriptFinished` status is delivered directly to the requesting
   client, while still being published on the `jobs` channel for other observers
 - the daemon remains the canonical owner of job output logs

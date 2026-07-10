@@ -33,6 +33,12 @@ pub fn install(exe_path: &Path) -> Result<()> {
     }
 
     let log = crate::dirs::log_path()?;
+    if let Some(parent) = log.parent() {
+        crate::dirs::ensure_private_dir(parent)
+            .with_context(|| format!("create log directory {}", parent.display()))?;
+    }
+    crate::dirs::ensure_private_file(&log)
+        .with_context(|| format!("secure log file {}", log.display()))?;
     let content = service_file_content(exe_path, &log)?;
     std::fs::write(&file, &content)
         .with_context(|| format!("write service file {}", file.display()))?;

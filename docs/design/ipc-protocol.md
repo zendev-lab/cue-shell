@@ -57,7 +57,10 @@ enum Message {
 {"type": "request", "id": 4, "payload": {"RunScript": {"path": "scripts/build.cue", "input": "cargo test\ncargo fmt -> cargo clippy"}}}
 
 // Response (success — file script submission created)
-{"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "source": {"kind": "file", "path": "scripts/build.cue"}, "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}, {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10", "J11"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": "J11", "start_scope": null, "end_scope": null, "open_hint": null}]}}}], "submit_error": null}}}}
+{"type": "response", "id": 4, "payload": {"Ok": {"ScriptCreated": {"script_id": "R7", "source": {"kind": "file", "path": "scripts/build.cue"}, "items": [{"index": 0, "source": "cargo test", "result": {"kind": "job", "job_id": "J9", "start_scope": "S@32b17bec", "open_hint": "Stream"}}], "submit_error": null}}}}
+
+// Event (an item created after the initial response; authoritative script-to-job association)
+{"type": "event", "payload": {"ScriptItemCreated": {"script_id": "R7", "item": {"index": 1, "source": "cargo fmt -> cargo clippy", "result": {"kind": "chain", "chain_id": "CH5", "job_ids": ["J10"], "chain": {"id": "CH5", "pipeline": "cargo fmt -> cargo clippy", "total_jobs": 2, "jobs": [{"index": 0, "pipeline": "cargo fmt", "status": "Running", "job_id": "J10", "start_scope": "S@32b17bec", "end_scope": null, "open_hint": "Stream"}, {"index": 1, "pipeline": "cargo clippy", "status": "Pending", "job_id": null, "start_scope": null, "end_scope": null, "open_hint": null}]}}}}}}
 
 // Event (script terminal aggregate status; sent directly to the RunScript requester and published on jobs for other observers)
 {"type": "event", "payload": {"ScriptFinished": {"script_id": "R7", "status": "done", "exit_code": 0, "failed_item_index": null}}}
@@ -126,11 +129,12 @@ relying on pushed events from a channel.
 TUI default subscription on connect: `["jobs", "crons", "system"]`
 `:out J1` triggers additional: `Subscribe { channels: ["output:J1"] }`
 `RunScript` is the exception to subscription-only delivery: output from jobs
-spawned by that request and terminal `ScriptFinished` status are also delivered
-directly to the requesting client. Output is published to other `output:J<n>`
-subscribers and terminal status is published to other `jobs` subscribers, so
-`cue run` does not race daemon-side execution against event-channel
-subscriptions or receive duplicate direct-delivery events.
+spawned by that request, each later `ScriptItemCreated` association, and terminal
+`ScriptFinished` status are also delivered directly to the requesting client.
+These events are published to the corresponding channels for other observers.
+Clients must use `ScriptCreated.items` plus matching `ScriptItemCreated` events
+as the authority for script membership; global `JobCreated` order is unrelated
+and must never be used to infer that a job belongs to a script.
 
 ## 6. Request Types (Client → cued)
 
@@ -180,6 +184,9 @@ enum RequestPayload {
     ShowLog { id: Option<String>, limit: Option<usize>, tail_bytes: Option<usize> },
     JobOutput { id: String, stdout_bytes: Option<usize>, stderr_bytes: Option<usize> },
     KillJob { id: String },
+    // Idempotent foreground cancellation. Ack is emitted only after active
+    // child processes for J<n>, CH<n>, or R<n> have stopped.
+    CancelExecution { id: String },
     RemoveCron { id: String },
     ShowEnv { tail_bytes: Option<usize> },
     ShowConfig { tail_bytes: Option<usize> },
@@ -226,13 +233,24 @@ enum OkPayload {
     ScopeInfo(ScopeInfo),
     ScopeList(Vec<ScopeInfo>),
     ScopeListPage { scopes: Vec<ScopeInfo>, page: PageInfo },
-    Output { id: String, data: String, truncated: bool },
+    Output {
+        id: String,
+        data: String,             // compatible UTF-8 view (lossy only for binary output)
+        truncated: bool,
+        encoding: OutputEncoding, // "utf8" or "base64"
+        base64: Option<String>,   // authoritative bytes when encoding == Base64
+    },
     JobOutput { id: String, stdout: StreamText, stderr: StreamText, stderr_pty_merged: bool },
 
     // Eval can return any of the above depending on the parsed command.
     // Additionally, some commands produce text output:
     EvalText { text: String },  // for :help, :env list, etc.
-    TextOutput { text: String, truncated: bool },
+    TextOutput {
+        text: String,
+        truncated: bool,
+        encoding: OutputEncoding,
+        base64: Option<String>,
+    },
     // Editor services
     CompletionList { items: Vec<CompletionItem> },
     HighlightResult { spans: Vec<HighlightSpan> },
@@ -241,7 +259,7 @@ enum OkPayload {
     Pong {
         version: String,           // reports cued's build version
         protocol_version: u32,     // current sessionized IPC protocol version
-        capabilities: Vec<String>, // includes "session-handshake-required"
+        capabilities: Vec<String>, // session-handshake-required, script-item-created, cancel-execution
     }
 }
 
@@ -253,8 +271,10 @@ struct PageInfo {
 }
 
 struct StreamText {
-    data: String,
+    data: String,             // compatible UTF-8 view
     truncated: bool,
+    encoding: OutputEncoding, // defaults to Utf8 when reading legacy payloads
+    base64: Option<String>,   // exact bytes for Base64 payloads
 }
 
 // Completion item (for Complete request)
@@ -272,10 +292,10 @@ struct HighlightSpan {
 }
 ```
 
-`Ping`/`Pong` is also the feature gate for typed clients. Sessionized clients
-must require `protocol_version >= 2` and the `session-handshake-required`
-capability; older daemons that only report `Pong { version }` are stale and
-should be upgraded/restarted before jobs are submitted.
+`Ping`/`Pong` is also the feature gate for typed clients. Current Spark clients
+require `protocol_version >= 2` plus `session-handshake-required`,
+`script-item-created`, and `cancel-execution`; a daemon missing any required
+capability must be upgraded/restarted before jobs are submitted.
 
 ## 8. Event Types (cued → Client, pushed)
 
@@ -300,6 +320,10 @@ enum EventPayload {
         chain_total: Option<usize>,
     },
     ChainProgress { chain: ChainInfo },
+    ScriptItemCreated {
+        script_id: String,
+        item: ScriptItemInfo,
+    },
     ScriptFinished {
         script_id: String,
         status: ScriptRunStatus,
@@ -315,8 +339,9 @@ enum EventPayload {
     // Output events (channel: "output:<id>")
     OutputChunk { id: String, stream: Stream, data: String },
     // stream: "stdout" | "stderr"
-    // data: UTF-8 text; for non-UTF-8 bytes, base64-encoded with a sibling field:
-    // OutputChunkBinary { id: String, stream: Stream, base64: String }
+    // data is UTF-8 text. Non-UTF-8 bytes use the distinct event below and
+    // must remain bytes/base64 until a display layer explicitly renders them.
+    OutputChunkBinary { id: String, stream: Stream, base64: String },
     OutputEof { id: String },  // process closed its output
 
     // Scope cursor changes are per-session responses (`ScopeCreated`), not global events.
@@ -410,6 +435,12 @@ Job scope fields are intentionally split:
 - For no-side-effect jobs, `end_scope` may equal `start_scope`.
 - `open_hint` is a server-computed display hint for running jobs: `Stream` means the preferred open action is `:out`; `Fg` means the preferred open action is `:fg`.
 - Clients should merge repeated `JobStateChanged` events by `job_id` and treat a later non-`None` `end_scope` as authoritative.
+- `Cancelled(reason)` remains structured on the wire. Compatibility clients may
+  display the status as `Cancelled`, but must retain `User`, `ChainAborted`, or
+  `Timeout`; Spark exposes it as `cancelReason` for the event's `new_state`.
+- Buffered output always reports truncation. When `encoding` is `base64`, the
+  `base64` field is authoritative and `data`/`text` is only an explicit lossy
+  compatibility view.
 - `chain_id` / `chain_index` / `chain_total` let clients correlate per-job events with a serial/parallel chain without waiting for a `:jobs` refresh.
 - `ChainCreated` and `ChainProgress` carry the authoritative leaf-by-leaf chain snapshot, including pending leaves that do not have job IDs yet and serial scope handoffs via `start_scope` / `end_scope`.
 

@@ -43,6 +43,8 @@ pub enum ResolvedCommand {
     Kill { id: String },
     /// Kill a job only.
     KillJob { id: String },
+    /// Typed IPC cancellation for jobs, chains, and file-script runs.
+    CancelExecution { id: String },
     /// Remove a cron only.
     RemoveCron { id: String },
     /// Retry a failed job.

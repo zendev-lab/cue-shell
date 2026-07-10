@@ -29,9 +29,10 @@ cov-open:
     cargo llvm-cov test --html -- --no-capture
     open target/llvm-cov/html/index.html || xdg-open target/llvm-cov/html/index.html
 
-# MSRV check
+# MSRV check. Cargo enforces workspace.package.rust-version (1.95), so this
+# works with both rustup-managed and standalone/Homebrew toolchains.
 msrv:
-    cargo +1.90 check --all-targets
+    cargo check --workspace --all-targets
 
 # Clean build artifacts
 clean:

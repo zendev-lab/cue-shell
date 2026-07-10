@@ -24,6 +24,13 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+pub(crate) fn daemon_instance_id() -> &'static str {
+    static INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE_ID
+        .get_or_init(|| uuid::Uuid::new_v4().to_string())
+        .as_str()
+}
+
 pub fn run_cli() -> i32 {
     cli::run()
 }

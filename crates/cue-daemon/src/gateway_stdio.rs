@@ -154,6 +154,7 @@ mod tests {
 
         let request = encode_message(&Message::Request {
             id: 7,
+            operation_id: None,
             payload: RequestPayload::Ping {},
         })
         .unwrap();
@@ -170,6 +171,7 @@ mod tests {
             id: 7,
             payload: ResponsePayload::Ok(OkPayload::Pong {
                 version: "0.1.0".into(),
+                instance_id: "00000000-0000-4000-8000-000000000000".into(),
                 protocol_version: IPC_PROTOCOL_VERSION,
                 capabilities: current_protocol_capabilities(),
             }),

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, warn};
 
 use cue_core::{EventChannel, ipc::EventPayload};
@@ -11,13 +11,20 @@ use super::EventBusMsg;
 
 #[derive(Default)]
 struct EventSubscriptions {
-    // channel_name -> (client_id -> sender)
-    channels: HashMap<EventChannel, HashMap<u64, mpsc::Sender<EventPayload>>>,
+    // channel_name -> (client_id -> lossless delivery sink)
+    channels: HashMap<EventChannel, HashMap<u64, EventSubscriber>>,
+}
+
+#[derive(Clone)]
+struct EventSubscriber {
+    sender: mpsc::Sender<EventPayload>,
+    disconnect: watch::Sender<bool>,
 }
 
 #[derive(Debug, Default)]
 struct PublishStats {
     delivered: usize,
+    lagging: usize,
     closed: usize,
 }
 
@@ -27,11 +34,12 @@ impl EventSubscriptions {
         client_id: u64,
         channel: EventChannel,
         sender: mpsc::Sender<EventPayload>,
+        disconnect: watch::Sender<bool>,
     ) {
         self.channels
             .entry(channel)
             .or_default()
-            .insert(client_id, sender);
+            .insert(client_id, EventSubscriber { sender, disconnect });
     }
 
     fn unsubscribe(&mut self, client_id: u64, channel: &EventChannel) {
@@ -50,7 +58,7 @@ impl EventSubscriptions {
         });
     }
 
-    async fn publish(
+    fn publish(
         &mut self,
         channel: &EventChannel,
         payload: &EventPayload,
@@ -64,30 +72,33 @@ impl EventSubscriptions {
                 clients
                     .iter()
                     .filter(|(client_id, _)| Some(**client_id) != excluded_client_id)
-                    .map(|(client_id, sender)| (*client_id, sender.clone()))
+                    .map(|(client_id, subscriber)| (*client_id, subscriber.clone()))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
-        let mut closed_clients = Vec::new();
-        for (client_id, sender) in deliveries {
-            if sender.send(payload.clone()).await.is_ok() {
-                stats.delivered += 1;
-            } else {
-                stats.closed += 1;
-                closed_clients.push(client_id);
+        let mut evicted_clients = Vec::new();
+        for (client_id, subscriber) in deliveries {
+            match subscriber.sender.try_send(payload.clone()) {
+                Ok(()) => stats.delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    stats.lagging += 1;
+                    let _ = subscriber.disconnect.send(true);
+                    evicted_clients.push(client_id);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    stats.closed += 1;
+                    let _ = subscriber.disconnect.send(true);
+                    evicted_clients.push(client_id);
+                }
             }
         }
 
-        if !closed_clients.is_empty()
-            && let Some(clients) = self.channels.get_mut(channel)
-        {
-            for client_id in closed_clients {
-                clients.remove(&client_id);
-            }
-            if clients.is_empty() {
-                self.channels.remove(channel);
-            }
+        // Losing even one event invalidates the client's view of every stream.
+        // Remove all subscriptions immediately; the gateway watch signal above
+        // closes the connection so the client must reconnect and resubscribe.
+        for client_id in evicted_clients {
+            self.unsubscribe_all(client_id);
         }
 
         stats
@@ -112,9 +123,10 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<EventBusMsg>) {
                     client_id,
                     channel,
                     sender,
+                    disconnect,
                 } => {
                     debug!(%client_id, %channel, "event_bus: subscribe");
-                    subs.subscribe(client_id, channel, sender);
+                    subs.subscribe(client_id, channel, sender, disconnect);
                 }
 
                 EventBusMsg::Unsubscribe { client_id, channel } => {
@@ -128,13 +140,14 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<EventBusMsg>) {
                 }
 
                 EventBusMsg::Publish { payload, channel } => {
-                    let stats = subs.publish(&channel, &payload, None).await;
-                    if stats.closed > 0 {
+                    let stats = subs.publish(&channel, &payload, None);
+                    if stats.lagging > 0 || stats.closed > 0 {
                         warn!(
                             %channel,
                             delivered = stats.delivered,
+                            lagging = stats.lagging,
                             closed = stats.closed,
-                            "event_bus: removed closed subscribers while publishing"
+                            "event_bus: evicted unavailable subscribers while publishing"
                         );
                     }
                 }
@@ -144,15 +157,14 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<EventBusMsg>) {
                     channel,
                     excluded_client_id,
                 } => {
-                    let stats = subs
-                        .publish(&channel, &payload, Some(excluded_client_id))
-                        .await;
-                    if stats.closed > 0 {
+                    let stats = subs.publish(&channel, &payload, Some(excluded_client_id));
+                    if stats.lagging > 0 || stats.closed > 0 {
                         warn!(
                             %channel,
                             delivered = stats.delivered,
+                            lagging = stats.lagging,
                             closed = stats.closed,
-                            "event_bus: removed closed subscribers while publishing"
+                            "event_bus: evicted unavailable subscribers while publishing"
                         );
                     }
                 }
@@ -178,62 +190,82 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn publish_removes_closed_subscribers() {
+    #[test]
+    fn publish_removes_closed_subscribers() {
         let mut subscriptions = EventSubscriptions::default();
         let (tx, rx) = mpsc::channel(1);
+        let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
         drop(rx);
-        subscriptions.subscribe(1, EventChannel::System, tx);
+        subscriptions.subscribe(1, EventChannel::System, tx, disconnect_tx);
 
-        let stats = subscriptions
-            .publish(&EventChannel::System, &event(), None)
-            .await;
+        let stats = subscriptions.publish(&EventChannel::System, &event(), None);
 
         assert_eq!(stats.delivered, 0);
+        assert_eq!(stats.lagging, 0);
         assert_eq!(stats.closed, 1);
+        assert!(*disconnect_rx.borrow_and_update());
         assert_eq!(subscriptions.subscriber_count(&EventChannel::System), 0);
     }
 
-    #[tokio::test]
-    async fn publish_backpressures_slow_subscribers_without_dropping_events() {
+    #[test]
+    fn publish_evicts_lagging_subscriber_without_blocking_healthy_subscriber() {
         let mut subscriptions = EventSubscriptions::default();
-        let (tx, mut rx) = mpsc::channel(1);
-        subscriptions.subscribe(1, EventChannel::System, tx);
+        let (slow_tx, mut slow_rx) = mpsc::channel(1);
+        let (healthy_tx, mut healthy_rx) = mpsc::channel(1);
+        let (slow_disconnect_tx, mut slow_disconnect_rx) = watch::channel(false);
+        let (healthy_disconnect_tx, healthy_disconnect_rx) = watch::channel(false);
+        subscriptions.subscribe(
+            1,
+            EventChannel::System,
+            slow_tx.clone(),
+            slow_disconnect_tx.clone(),
+        );
+        subscriptions.subscribe(1, EventChannel::Jobs, slow_tx, slow_disconnect_tx);
+        subscriptions.subscribe(2, EventChannel::System, healthy_tx, healthy_disconnect_tx);
 
-        let first = subscriptions
-            .publish(&EventChannel::System, &event(), None)
-            .await;
-        let second = event();
-        let second_stats = {
-            let second_publish = subscriptions.publish(&EventChannel::System, &second, None);
-            tokio::pin!(second_publish);
+        let first = subscriptions.publish(&EventChannel::System, &event(), None);
+        assert_eq!(first.delivered, 2);
+        assert!(healthy_rx.try_recv().is_ok());
 
-            assert_eq!(first.delivered, 1);
-            tokio::select! {
-                stats = &mut second_publish => panic!("second publish should wait for subscriber capacity: {stats:?}"),
-                () = tokio::task::yield_now() => {}
-            }
-
-            assert!(rx.try_recv().is_ok());
-            second_publish.await
-        };
+        let second_stats = subscriptions.publish(&EventChannel::System, &event(), None);
 
         assert_eq!(second_stats.delivered, 1);
-        assert!(rx.try_recv().is_ok());
+        assert_eq!(second_stats.lagging, 1);
+        assert_eq!(second_stats.closed, 0);
+        assert!(*slow_disconnect_rx.borrow_and_update());
+        assert!(!*healthy_disconnect_rx.borrow());
+        assert!(slow_rx.try_recv().is_ok());
+        assert!(healthy_rx.try_recv().is_ok());
         assert_eq!(subscriptions.subscriber_count(&EventChannel::System), 1);
+        assert_eq!(subscriptions.subscriber_count(&EventChannel::Jobs), 0);
+
+        // A fresh transport can subscribe normally after the evicted one closes.
+        let (reconnected_tx, mut reconnected_rx) = mpsc::channel(1);
+        let (reconnected_disconnect_tx, reconnected_disconnect_rx) = watch::channel(false);
+        subscriptions.subscribe(
+            3,
+            EventChannel::System,
+            reconnected_tx,
+            reconnected_disconnect_tx,
+        );
+        let reconnect_stats = subscriptions.publish(&EventChannel::System, &event(), None);
+        assert_eq!(reconnect_stats.delivered, 2);
+        assert!(healthy_rx.try_recv().is_ok());
+        assert!(reconnected_rx.try_recv().is_ok());
+        assert!(!*reconnected_disconnect_rx.borrow());
     }
 
-    #[tokio::test]
-    async fn publish_can_skip_one_subscriber_without_unsubscribing_it() {
+    #[test]
+    fn publish_can_skip_one_subscriber_without_unsubscribing_it() {
         let mut subscriptions = EventSubscriptions::default();
         let (first_tx, mut first_rx) = mpsc::channel(1);
         let (second_tx, mut second_rx) = mpsc::channel(1);
-        subscriptions.subscribe(1, EventChannel::System, first_tx);
-        subscriptions.subscribe(2, EventChannel::System, second_tx);
+        let (first_disconnect, _first_disconnect_rx) = watch::channel(false);
+        let (second_disconnect, _second_disconnect_rx) = watch::channel(false);
+        subscriptions.subscribe(1, EventChannel::System, first_tx, first_disconnect);
+        subscriptions.subscribe(2, EventChannel::System, second_tx, second_disconnect);
 
-        let stats = subscriptions
-            .publish(&EventChannel::System, &event(), Some(1))
-            .await;
+        let stats = subscriptions.publish(&EventChannel::System, &event(), Some(1));
 
         assert_eq!(stats.delivered, 1);
         assert!(first_rx.try_recv().is_err());

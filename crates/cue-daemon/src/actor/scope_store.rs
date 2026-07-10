@@ -4,16 +4,16 @@
 //! scheduler; this actor stores scopes only and has no daemon-global HEAD.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::Connection;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use cue_core::ScopeHash;
 use cue_core::scope::{EnvSnapshot, Scope};
 
-use super::ScopeStoreMsg;
+use super::{ScopeGcReport, ScopeStoreMsg};
 use crate::storage;
 
 /// Spawn the ScopeStore actor task.
@@ -40,12 +40,13 @@ pub(super) async fn spawn(
                     let hash = scope.hash;
                     let scope_for_db = scope.clone();
                     let result = storage::with_connection(&db, move |conn| {
-                        storage::insert_scope(conn, &scope_for_db)?;
-                        Ok(hash)
+                        let persistence = storage::insert_scope(conn, &scope_for_db)?;
+                        Ok((hash, persistence))
                     })
                     .await;
                     match result {
-                        Ok(hash) => {
+                        Ok((hash, persistence)) => {
+                            warn_if_volatile(hash, persistence);
                             cache.insert(hash, scope);
                             let _ = reply.send(Ok(hash));
                         }
@@ -91,19 +92,41 @@ pub(super) async fn spawn(
                     let child = Scope::fork(parent.hash, parent_snap, delta);
                     let child_hash = child.hash;
                     let child_for_db = child.clone();
-                    if let Err(e) = storage::with_connection(&db, move |conn| {
+                    let persistence = match storage::with_connection(&db, move |conn| {
                         storage::insert_scope(conn, &child_for_db)
                     })
                     .await
                     {
-                        error!("scope_store: persist derived scope failed: {e}");
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "persist derived scope {child_hash}: {e}"
-                        )));
-                        continue;
-                    }
+                        Ok(persistence) => persistence,
+                        Err(error) => {
+                            error!("scope_store: persist derived scope failed: {error}");
+                            let _ = reply.send(Err(anyhow::anyhow!(
+                                "persist derived scope {child_hash}: {error}"
+                            )));
+                            continue;
+                        }
+                    };
+                    warn_if_volatile(child_hash, persistence);
                     cache.insert(child_hash, child);
                     let _ = reply.send(Ok(child_hash));
+                }
+
+                ScopeStoreMsg::GarbageCollect { roots, reply } => {
+                    let result = garbage_collect_scopes(&mut cache, &db, roots).await;
+                    match &result {
+                        Ok(report) => {
+                            debug!(
+                                retained = report.retained,
+                                removed_cached = report.removed_cached,
+                                removed_persisted = report.removed_persisted,
+                                "scope_store: completed mark-and-sweep"
+                            );
+                        }
+                        Err(error) => {
+                            error!("scope_store: garbage collection failed: {error}");
+                        }
+                    }
+                    let _ = reply.send(result);
                 }
 
                 ScopeStoreMsg::Shutdown => {
@@ -121,18 +144,19 @@ pub(super) async fn spawn(
                             continue;
                         }
                     };
-                    let mut scope_infos = Vec::with_capacity(scopes.len());
-                    let mut list_error = None;
                     for scope in scopes {
-                        let info = match scope_info(&scope) {
-                            Ok(info) => info,
+                        cache.insert(scope.hash, scope);
+                    }
+                    let mut scope_infos = Vec::with_capacity(cache.len());
+                    let mut list_error = None;
+                    for scope in cache.values() {
+                        match scope_info(scope) {
+                            Ok(info) => scope_infos.push(info),
                             Err(error) => {
                                 list_error = Some(error);
                                 break;
                             }
-                        };
-                        cache.insert(scope.hash, scope.clone());
-                        scope_infos.push(info);
+                        }
                     }
                     if let Some(error) = list_error {
                         error!("scope_store: list scopes failed: {error}");
@@ -148,6 +172,40 @@ pub(super) async fn spawn(
         debug!("scope_store: stopped");
     });
     Ok(())
+}
+
+async fn garbage_collect_scopes(
+    cache: &mut HashMap<ScopeHash, Scope>,
+    db: &storage::SharedConnection,
+    roots: HashSet<ScopeHash>,
+) -> Result<ScopeGcReport> {
+    let mut reachable = HashSet::new();
+    let mut pending = roots.into_iter().collect::<Vec<_>>();
+    while let Some(hash) = pending.pop() {
+        if !reachable.insert(hash) {
+            continue;
+        }
+        let scope = load_scope(cache, db, hash)
+            .await?
+            .with_context(|| format!("scope GC root or ancestor {hash} does not exist"))?;
+        if let Some(parent) = scope.parent {
+            pending.push(parent);
+        }
+    }
+
+    let reachable_for_db = reachable.clone();
+    let removed_persisted = storage::with_connection(db, move |conn| {
+        storage::sweep_scopes(conn, &reachable_for_db)
+    })
+    .await?;
+    let cached_before = cache.len();
+    cache.retain(|hash, _| reachable.contains(hash));
+
+    Ok(ScopeGcReport {
+        retained: reachable.len(),
+        removed_cached: cached_before.saturating_sub(cache.len()),
+        removed_persisted,
+    })
 }
 
 async fn load_scope(
@@ -179,6 +237,16 @@ fn scope_info(scope: &Scope) -> Result<cue_core::ipc::ScopeInfo> {
     })
 }
 
+fn warn_if_volatile(hash: ScopeHash, persistence: storage::ScopePersistence) {
+    if persistence.is_volatile() {
+        warn!(
+            %hash,
+            reason = persistence.reason(),
+            "scope_store: retaining scope in memory only"
+        );
+    }
+}
+
 async fn create_and_persist_root_scope(
     db: &storage::SharedConnection,
 ) -> Result<HashMap<ScopeHash, Scope>> {
@@ -190,7 +258,9 @@ async fn create_and_persist_root_scope(
     let root = Scope::root(snapshot);
 
     let root_for_db = root.clone();
-    storage::with_connection(db, move |conn| storage::insert_scope(conn, &root_for_db)).await?;
+    let persistence =
+        storage::with_connection(db, move |conn| storage::insert_scope(conn, &root_for_db)).await?;
+    warn_if_volatile(root.hash, persistence);
     cache.insert(root.hash, root);
 
     Ok(cache)
@@ -283,6 +353,162 @@ mod tests {
         assert_eq!(restored.snapshot, scope.snapshot);
 
         let _ = scope_tx.send(ScopeStoreMsg::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn sensitive_scope_remains_available_in_cache_but_not_sqlite() {
+        let dir = make_temp_dir();
+        let db_path = dir.join("scope.db");
+        let conn = storage::open_db(&db_path).expect("open scope db");
+        let (scope_tx, scope_rx) = mpsc::channel::<ScopeStoreMsg>(ACTOR_CHANNEL_CAP);
+        spawn(scope_rx, conn, test_actor_system(scope_tx.clone()))
+            .await
+            .expect("spawn scope store");
+
+        let scope = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/bin".into()),
+                ("API_TOKEN".into(), "in-memory-fixture".into()),
+            ]),
+            cwd: PathBuf::from("/tmp/session"),
+        });
+        let (insert_tx, insert_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::Insert {
+                scope: scope.clone(),
+                reply: insert_tx,
+            })
+            .await
+            .expect("insert scope");
+        let hash = insert_rx
+            .await
+            .expect("insert sender")
+            .expect("insert result");
+
+        let (get_tx, get_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::GetScope {
+                hash,
+                reply: get_tx,
+            })
+            .await
+            .expect("get scope");
+        let cached = get_rx
+            .await
+            .expect("get sender")
+            .expect("get result")
+            .expect("scope exists in cache");
+        assert_eq!(cached.snapshot, scope.snapshot);
+
+        let persisted = Connection::open(&db_path).expect("open external db");
+        assert!(
+            storage::get_scope(&persisted, &hash)
+                .expect("query persisted scope")
+                .is_none()
+        );
+
+        let (list_tx, list_rx) = oneshot::channel();
+        scope_tx
+            .send(ScopeStoreMsg::ListScopes { reply: list_tx })
+            .await
+            .expect("list scopes");
+        let listed = list_rx.await.expect("list sender").expect("list result");
+        assert!(listed.iter().any(|info| info.hash == hash.to_string()));
+
+        let _ = scope_tx.send(ScopeStoreMsg::Shutdown).await;
+        drop(persisted);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_keeps_roots_and_their_ancestors() {
+        let conn = in_memory_db();
+        let root = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from("/tmp/root"),
+        });
+        let child = Scope::fork(
+            root.hash,
+            root.snapshot.as_ref().expect("root snapshot"),
+            cue_core::scope::EnvDelta {
+                set: BTreeMap::from([("BUILD_MODE".into(), "debug".into())]),
+                unset: vec![],
+                cwd: None,
+            },
+        );
+        let grandchild = Scope::fork(
+            child.hash,
+            child.snapshot.as_ref().expect("child snapshot"),
+            cue_core::scope::EnvDelta {
+                set: BTreeMap::new(),
+                unset: vec![],
+                cwd: Some(PathBuf::from("/tmp/grandchild")),
+            },
+        );
+        let orphan = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/bin".into())]),
+            cwd: PathBuf::from("/tmp/orphan"),
+        });
+        for scope in [&root, &child, &grandchild, &orphan] {
+            storage::insert_scope(&conn, scope).expect("persist scope fixture");
+        }
+        let db = storage::shared_connection(conn);
+        let mut cache = [
+            root.clone(),
+            child.clone(),
+            grandchild.clone(),
+            orphan.clone(),
+        ]
+        .into_iter()
+        .map(|scope| (scope.hash, scope))
+        .collect::<HashMap<_, _>>();
+
+        let report = garbage_collect_scopes(&mut cache, &db, HashSet::from([grandchild.hash]))
+            .await
+            .expect("collect unreachable scope");
+
+        assert_eq!(report.retained, 3);
+        assert_eq!(report.removed_cached, 1);
+        assert_eq!(report.removed_persisted, 1);
+        assert!(cache.contains_key(&root.hash));
+        assert!(cache.contains_key(&child.hash));
+        assert!(cache.contains_key(&grandchild.hash));
+        assert!(!cache.contains_key(&orphan.hash));
+        let orphan_hash = orphan.hash;
+        assert!(
+            storage::with_connection(&db, move |conn| { storage::get_scope(conn, &orphan_hash) })
+                .await
+                .expect("query collected scope")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_drops_unreachable_volatile_scopes_from_cache() {
+        let keep = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("API_TOKEN".into(), "keep-in-memory".into())]),
+            cwd: PathBuf::from("/tmp/keep"),
+        });
+        let drop_scope = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("API_TOKEN".into(), "drop-in-memory".into())]),
+            cwd: PathBuf::from("/tmp/drop"),
+        });
+        let db = storage::shared_connection(in_memory_db());
+        let mut cache = [keep.clone(), drop_scope.clone()]
+            .into_iter()
+            .map(|scope| (scope.hash, scope))
+            .collect::<HashMap<_, _>>();
+
+        let report = garbage_collect_scopes(&mut cache, &db, HashSet::from([keep.hash]))
+            .await
+            .expect("collect volatile scope cache");
+
+        assert_eq!(report.retained, 1);
+        assert_eq!(report.removed_cached, 1);
+        assert_eq!(report.removed_persisted, 0);
+        assert!(cache.contains_key(&keep.hash));
+        assert!(!cache.contains_key(&drop_scope.hash));
     }
 
     #[tokio::test]

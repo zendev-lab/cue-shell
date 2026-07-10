@@ -13,15 +13,23 @@
 mod cron_schedule;
 mod event_bus;
 pub(crate) mod gateway;
+mod operation_ledger;
 mod process_mgr;
 mod scheduler;
 mod scope_store;
 mod script_record;
 
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionBinding {
+    pub scope: ScopeHash,
+    pub incarnation: u64,
+}
 
 use cue_core::ipc::{EventPayload, ResponsePayload, ScopeInfo};
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
@@ -79,7 +87,7 @@ pub(crate) enum SchedulerMsg {
         snapshot: EnvSnapshot,
         /// Explicitly refresh an existing session cursor from the handshake snapshot.
         refresh: bool,
-        reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
+        reply: tokio::sync::oneshot::Sender<Result<SessionBinding>>,
     },
     /// Mark a transport client as disconnected and start session TTL handling.
     Disconnect { client_id: u64 },
@@ -88,6 +96,12 @@ pub(crate) enum SchedulerMsg {
         client_id: u64,
         request_id: u32,
         command: Box<ResolvedCommand>,
+    },
+    /// Recover a daemon-lifetime script snapshot after a client reconnect.
+    ScriptInfo {
+        client_id: u64,
+        request_id: u32,
+        id: String,
     },
     /// A job has finished execution.
     JobFinished {
@@ -194,12 +208,26 @@ pub(crate) enum ScopeStoreMsg {
         delta: EnvDelta,
         reply: tokio::sync::oneshot::Sender<Result<ScopeHash>>,
     },
+    /// Retain the supplied roots and every ancestor they reference, removing
+    /// all other persisted and process-local scopes.
+    GarbageCollect {
+        roots: HashSet<ScopeHash>,
+        reply: tokio::sync::oneshot::Sender<Result<ScopeGcReport>>,
+    },
     /// Graceful shutdown.
     Shutdown,
     /// List all known scopes.
     ListScopes {
         reply: tokio::sync::oneshot::Sender<Result<Vec<ScopeInfo>>>,
     },
+}
+
+/// Result of one scope mark-and-sweep pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScopeGcReport {
+    pub retained: usize,
+    pub removed_cached: usize,
+    pub removed_persisted: usize,
 }
 
 /// Messages handled by the EventBus actor.
@@ -209,6 +237,9 @@ pub(crate) enum EventBusMsg {
         client_id: u64,
         channel: EventChannel,
         sender: mpsc::Sender<EventPayload>,
+        /// Signals the gateway to close the whole client connection when event
+        /// delivery can no longer be lossless.
+        disconnect: tokio::sync::watch::Sender<bool>,
     },
     /// Remove a client from a channel.
     Unsubscribe {

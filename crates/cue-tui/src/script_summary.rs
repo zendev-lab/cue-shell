@@ -59,6 +59,15 @@ pub(crate) fn format_finished(
     text
 }
 
+pub(crate) fn format_item_created(item: &ScriptItemInfo) -> String {
+    format!(
+        "\n{}. {} -> {}",
+        item.index + 1,
+        summarize_source(&item.source),
+        format_item_result(&item.result),
+    )
+}
+
 fn format_item_result(result: &ScriptItemResult) -> String {
     match result {
         ScriptItemResult::Job { job_id, .. } => job_id.clone(),

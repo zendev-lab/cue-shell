@@ -17,7 +17,21 @@ use crate::mode::Mode;
 pub const IPC_PROTOCOL_VERSION: u32 = 2;
 /// Capability advertised by daemons that reject session-dependent requests before `Handshake`.
 pub const IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED: &str = "session-handshake-required";
-const IPC_CAPABILITIES: &[&str] = &[IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED];
+/// Script item ownership is reported by authoritative `ScriptItemCreated` events.
+pub const IPC_CAPABILITY_SCRIPT_ITEM_CREATED: &str = "script-item-created";
+/// Typed, quiescent cancellation for jobs, chains, and script runs.
+pub const IPC_CAPABILITY_CANCEL_EXECUTION: &str = "cancel-execution";
+/// Cross-connection replay and conflict detection for side-effecting requests.
+pub const IPC_CAPABILITY_OPERATION_IDEMPOTENCY: &str = "operation-idempotency";
+/// Typed daemon-lifetime snapshots for reconnect-safe file-script recovery.
+pub const IPC_CAPABILITY_SCRIPT_INFO_RECOVERY: &str = "script-info-recovery";
+const IPC_CAPABILITIES: &[&str] = &[
+    IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED,
+    IPC_CAPABILITY_SCRIPT_ITEM_CREATED,
+    IPC_CAPABILITY_CANCEL_EXECUTION,
+    IPC_CAPABILITY_OPERATION_IDEMPOTENCY,
+    IPC_CAPABILITY_SCRIPT_INFO_RECOVERY,
+];
 
 pub fn current_protocol_capabilities() -> Vec<String> {
     IPC_CAPABILITIES
@@ -35,9 +49,21 @@ pub fn current_protocol_capabilities() -> Vec<String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Message {
-    Request { id: u32, payload: RequestPayload },
-    Response { id: u32, payload: ResponsePayload },
-    Event { payload: EventPayload },
+    Request {
+        id: u32,
+        /// Stable logical operation key used to deduplicate side effects across
+        /// transport reconnects. It is optional for backward compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        payload: RequestPayload,
+    },
+    Response {
+        id: u32,
+        payload: ResponsePayload,
+    },
+    Event {
+        payload: EventPayload,
+    },
 }
 
 // ── Requests (Client → cued) ──
@@ -108,6 +134,10 @@ pub enum RequestPayload {
     ListScopes {
         limit: Option<usize>,
     },
+    /// Recover the authoritative state of a daemon-lifetime file-script run.
+    ScriptInfo {
+        id: String,
+    },
     ShowLog {
         id: Option<String>,
         limit: Option<usize>,
@@ -119,6 +149,12 @@ pub enum RequestPayload {
         stderr_bytes: Option<usize>,
     },
     KillJob {
+        id: String,
+    },
+    /// Idempotently cancel a foreground execution by job (`J<n>`), chain
+    /// (`CH<n>`), or script-run (`R<n>`) id. The acknowledgement is sent only
+    /// after any currently running child processes have stopped.
+    CancelExecution {
         id: String,
     },
     RemoveCron {
@@ -213,10 +249,15 @@ pub enum OkPayload {
         scopes: Vec<ScopeInfo>,
         page: PageInfo,
     },
+    ScriptInfo(ScriptInfo),
     Output {
         id: String,
         data: String,
         truncated: bool,
+        #[serde(default)]
+        encoding: OutputEncoding,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base64: Option<String>,
     },
     JobOutput {
         id: String,
@@ -231,6 +272,10 @@ pub enum OkPayload {
     TextOutput {
         text: String,
         truncated: bool,
+        #[serde(default)]
+        encoding: OutputEncoding,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base64: Option<String>,
     },
 
     CompletionList {
@@ -246,6 +291,8 @@ pub enum OkPayload {
     Pong {
         /// Daemon `cued` build version reported by the running daemon.
         version: String,
+        /// Stable UUID for this daemon process. Changes after every restart.
+        instance_id: String,
         /// IPC protocol version implemented by the daemon.
         protocol_version: u32,
         /// Feature flags implemented by the daemon for explicit client gating.
@@ -277,6 +324,15 @@ pub enum EventPayload {
     },
     ChainProgress {
         chain: ChainInfo,
+    },
+    /// A file-script item created after the initial `ScriptCreated` response.
+    ///
+    /// The daemon is the authority for the item-to-job/chain association.
+    /// Clients must not infer script membership from globally ordered job IDs
+    /// or unrelated `JobCreated` events.
+    ScriptItemCreated {
+        script_id: String,
+        item: ScriptItemInfo,
     },
     ScriptFinished {
         script_id: String,
@@ -357,8 +413,22 @@ pub struct PageInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamText {
+    /// Backward-compatible display text. For binary output this is an explicit
+    /// lossy UTF-8 view; `base64` is the authoritative byte representation.
     pub data: String,
     pub truncated: bool,
+    #[serde(default)]
+    pub encoding: OutputEncoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputEncoding {
+    #[default]
+    Utf8,
+    Base64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +504,27 @@ pub enum ScriptSource {
 pub enum ScriptRunStatus {
     Done,
     Failed,
+}
+
+/// Recoverable lifecycle state for a daemon-lifetime script snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptInfoStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+/// Authoritative snapshot used to reconcile script events missed during a
+/// transport disconnect. It is intentionally daemon-lifetime, not crash-safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptInfo {
+    pub script_id: String,
+    pub status: ScriptInfoStatus,
+    pub items: Vec<ScriptItemInfo>,
+    pub exit_code: Option<i32>,
+    pub failed_item_index: Option<usize>,
+    pub submit_error: Option<ScriptSubmitError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +675,7 @@ mod tests {
     fn roundtrip_eval_request() {
         let msg = Message::Request {
             id: 1,
+            operation_id: Some("tool-call-1:eval".into()),
             payload: RequestPayload::Eval {
                 input: ":run cargo test".into(),
                 mode: Mode::Job,
@@ -597,10 +689,12 @@ mod tests {
         let decoded: Message = serde_json::from_slice(&encoded[4..]).unwrap();
         if let Message::Request {
             id,
+            operation_id,
             payload: RequestPayload::Eval { input, mode },
         } = decoded
         {
             assert_eq!(id, 1);
+            assert_eq!(operation_id.as_deref(), Some("tool-call-1:eval"));
             assert_eq!(input, ":run cargo test");
             assert_eq!(mode, Mode::Job);
         } else {
@@ -677,6 +771,7 @@ mod tests {
     fn typed_query_payloads_roundtrip() {
         let msg = Message::Request {
             id: 7,
+            operation_id: None,
             payload: RequestPayload::ShowLog {
                 id: Some("J1".into()),
                 limit: Some(20),
@@ -710,10 +805,14 @@ mod tests {
             stdout: StreamText {
                 data: "out".into(),
                 truncated: false,
+                encoding: OutputEncoding::Utf8,
+                base64: None,
             },
             stderr: StreamText {
                 data: "err".into(),
                 truncated: true,
+                encoding: OutputEncoding::Utf8,
+                base64: None,
             },
             stderr_pty_merged: false,
         });
@@ -723,6 +822,54 @@ mod tests {
             ResponsePayload::Ok(OkPayload::JobOutput { stderr, .. }) => {
                 assert_eq!(stderr.data, "err");
                 assert!(stderr.truncated);
+                assert_eq!(stderr.encoding, OutputEncoding::Utf8);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn legacy_output_without_encoding_defaults_to_utf8() {
+        let decoded: ResponsePayload = serde_json::from_str(
+            r#"{"Ok":{"JobOutput":{"id":"J1","stdout":{"data":"out","truncated":false},"stderr":{"data":"","truncated":false},"stderr_pty_merged":false}}}"#,
+        )
+        .unwrap();
+
+        match decoded {
+            ResponsePayload::Ok(OkPayload::JobOutput { stdout, stderr, .. }) => {
+                assert_eq!(stdout.encoding, OutputEncoding::Utf8);
+                assert_eq!(stderr.encoding, OutputEncoding::Utf8);
+                assert!(stdout.base64.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn binary_stream_text_roundtrips_with_authoritative_base64() {
+        let payload = ResponsePayload::Ok(OkPayload::JobOutput {
+            id: "J1".into(),
+            stdout: StreamText {
+                data: "�bin".into(),
+                truncated: false,
+                encoding: OutputEncoding::Base64,
+                base64: Some("/2Jpbg==".into()),
+            },
+            stderr: StreamText {
+                data: String::new(),
+                truncated: false,
+                encoding: OutputEncoding::Utf8,
+                base64: None,
+            },
+            stderr_pty_merged: false,
+        });
+
+        let decoded: ResponsePayload =
+            serde_json::from_str(&serde_json::to_string(&payload).unwrap()).unwrap();
+        match decoded {
+            ResponsePayload::Ok(OkPayload::JobOutput { stdout, .. }) => {
+                assert_eq!(stdout.encoding, OutputEncoding::Base64);
+                assert_eq!(stdout.base64.as_deref(), Some("/2Jpbg=="));
             }
             _ => panic!("wrong variant"),
         }
@@ -732,6 +879,7 @@ mod tests {
     fn run_script_request_roundtrips() {
         let msg = Message::Request {
             id: 9,
+            operation_id: None,
             payload: RequestPayload::RunScript {
                 path: "scripts/build.cue".into(),
                 input: ":run cargo build".into(),
@@ -743,6 +891,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::RunScript { path, input },
+                ..
             } => {
                 assert_eq!(id, 9);
                 assert_eq!(path, "scripts/build.cue");
@@ -769,6 +918,7 @@ mod tests {
     fn complete_request_roundtrips_without_mode() {
         let msg = Message::Request {
             id: 3,
+            operation_id: None,
             payload: RequestPayload::Complete {
                 input: ":ru".into(),
                 cursor: 3,
@@ -782,6 +932,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::Complete { input, cursor },
+                ..
             } => {
                 assert_eq!(id, 3);
                 assert_eq!(input, ":ru");
@@ -792,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn script_created_and_finished_payloads_roundtrip() {
+    fn script_created_item_and_finished_payloads_roundtrip() {
         let created = ResponsePayload::Ok(OkPayload::ScriptCreated {
             script_id: "R7".into(),
             source: ScriptSource::File {
@@ -811,6 +962,36 @@ mod tests {
                         path: "scripts/build.cue".into()
                     }
                 );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let item_created = Message::Event {
+            payload: EventPayload::ScriptItemCreated {
+                script_id: "R7".into(),
+                item: ScriptItemInfo {
+                    index: 1,
+                    source: "echo second".into(),
+                    result: ScriptItemResult::Job {
+                        job_id: "J9".into(),
+                        start_scope: Some("S@abc12345".into()),
+                        open_hint: JobOpenHint::Stream,
+                    },
+                },
+            },
+        };
+        let json = serde_json::to_string(&item_created).unwrap();
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Message::Event {
+                payload: EventPayload::ScriptItemCreated { script_id, item },
+            } => {
+                assert_eq!(script_id, "R7");
+                assert_eq!(item.index, 1);
+                assert!(matches!(
+                    item.result,
+                    ScriptItemResult::Job { ref job_id, .. } if job_id == "J9"
+                ));
             }
             _ => panic!("wrong variant"),
         }
@@ -926,7 +1107,7 @@ mod tests {
 
     #[test]
     fn pong_requires_capabilities_field() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","protocol_version":2}}}"#;
         let error = serde_json::from_str::<ResponsePayload>(json)
             .expect_err("Pong must carry protocol capabilities");
 
@@ -938,15 +1119,17 @@ mod tests {
 
     #[test]
     fn pong_decodes_versioned_payload() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2,"capabilities":["session-handshake-required"]}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery"]}}}"#;
         let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
         match decoded {
             ResponsePayload::Ok(OkPayload::Pong {
                 version,
+                instance_id,
                 protocol_version,
                 capabilities,
             }) => {
                 assert_eq!(version, "0.1.0");
+                assert_eq!(instance_id, "00000000-0000-4000-8000-000000000000");
                 assert_eq!(protocol_version, IPC_PROTOCOL_VERSION);
                 assert_eq!(capabilities, current_protocol_capabilities());
             }
@@ -958,13 +1141,36 @@ mod tests {
     fn pong_serializes_reported_version() {
         let payload = ResponsePayload::Ok(OkPayload::Pong {
             version: "0.1.0".into(),
+            instance_id: "00000000-0000-4000-8000-000000000000".into(),
             protocol_version: IPC_PROTOCOL_VERSION,
             capabilities: current_protocol_capabilities(),
         });
         let json = serde_json::to_string(&payload).unwrap();
         assert_eq!(
             json,
-            r#"{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2,"capabilities":["session-handshake-required"]}}}"#
+            r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery"]}}}"#
         );
+    }
+
+    #[test]
+    fn cancel_execution_roundtrips_as_typed_request() {
+        let message = Message::Request {
+            id: 42,
+            operation_id: None,
+            payload: RequestPayload::CancelExecution { id: "R7".into() },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"request","id":42,"payload":{"CancelExecution":{"id":"R7"}}}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<Message>(&json).unwrap(),
+            Message::Request {
+                id: 42,
+                payload: RequestPayload::CancelExecution { id },
+                ..
+            } if id == "R7"
+        ));
     }
 }

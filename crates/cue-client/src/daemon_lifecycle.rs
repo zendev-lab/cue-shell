@@ -215,15 +215,6 @@ pub async fn ensure_daemon_running(socket_path: &Path) -> Option<CuedClient> {
         return Some(client);
     }
 
-    if let Err(error) = remove_stale_socket(socket_path) {
-        tracing::warn!(
-            %error,
-            socket_path = %socket_path.display(),
-            "failed to remove stale cued socket"
-        );
-        return None;
-    }
-
     info!("cued not running, attempting to start");
     if let Err(error) = start_local_daemon(socket_path) {
         tracing::warn!(%error, "failed to run cued start");
@@ -246,20 +237,6 @@ pub async fn ensure_daemon_running(socket_path: &Path) -> Option<CuedClient> {
 
     tracing::warn!("cued did not start in time, entering offline mode");
     None
-}
-
-fn remove_stale_socket(socket_path: &Path) -> Result<()> {
-    if !socket_path.exists() {
-        return Ok(());
-    }
-
-    info!("stale socket detected, removing {}", socket_path.display());
-    match std::fs::remove_file(socket_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("remove stale cued socket {}", socket_path.display())),
-    }
 }
 
 /// Query the freshly connected local `cued` for its version and warn if it
@@ -568,28 +545,6 @@ mod tests {
             daemon_bin_candidates_from_sources(None, None, None),
             vec!["cued".to_string(), "cue-daemon".to_string()]
         );
-    }
-
-    #[test]
-    fn stale_socket_cleanup_removes_existing_socket_file() {
-        let dir = make_temp_bin_dir();
-        let socket = dir.join("cued.sock");
-        touch(&socket);
-
-        remove_stale_socket(&socket).expect("remove stale socket");
-
-        assert!(!socket.exists());
-        std::fs::remove_dir_all(dir).expect("remove temp bin dir");
-    }
-
-    #[test]
-    fn stale_socket_cleanup_allows_missing_socket() {
-        let dir = make_temp_bin_dir();
-        let socket = dir.join("cued.sock");
-
-        remove_stale_socket(&socket).expect("missing socket is already clean");
-
-        std::fs::remove_dir_all(dir).expect("remove temp bin dir");
     }
 
     #[cfg(unix)]

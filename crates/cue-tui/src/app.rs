@@ -13,7 +13,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
     CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
-    ScriptItemResult, ScriptRunStatus, Stream,
+    ScriptItemInfo, ScriptItemResult, ScriptRunStatus, Stream,
 };
 use cue_core::job::JobStatus;
 use cue_core::{EventChannel, Mode};
@@ -496,6 +496,58 @@ impl AppState {
             },
         );
         true
+    }
+
+    fn apply_script_item_created(&mut self, script_id: &str, item: ScriptItemInfo) {
+        let mut sidebar_dirty = false;
+        match &item.result {
+            ScriptItemResult::Job {
+                job_id,
+                start_scope,
+                open_hint,
+            } => {
+                self.upsert_job(
+                    job_id.clone(),
+                    script_summary::summarize_source(&item.source),
+                    JobStatus::Running,
+                    start_scope.clone(),
+                    *open_hint,
+                    Vec::new(),
+                );
+                sidebar_dirty = true;
+            }
+            ScriptItemResult::Chain { chain, .. } => {
+                for job in &chain.jobs {
+                    if let (Some(job_id), Some(open_hint)) = (&job.job_id, &job.open_hint) {
+                        self.upsert_job(
+                            job_id.clone(),
+                            script_summary::summarize_source(&job.pipeline),
+                            job.status.clone(),
+                            job.start_scope.clone(),
+                            *open_hint,
+                            Vec::new(),
+                        );
+                        sidebar_dirty = true;
+                    }
+                }
+            }
+            ScriptItemResult::Cron { cron_id } => {
+                self.upsert_cron(
+                    cron_id.clone(),
+                    script_summary::summarize_source(&item.source),
+                    CronStatus::Scheduled,
+                );
+                sidebar_dirty = true;
+            }
+            ScriptItemResult::Message { .. } => {}
+        }
+        if sidebar_dirty {
+            self.sync_sidebar_items();
+        }
+        if let Some(&card_index) = self.script_cards.get(script_id) {
+            self.main_view
+                .append_card_output(card_index, &script_summary::format_item_created(&item));
+        }
     }
 
     fn has_pending_user_submission(&self) -> bool {
@@ -1873,6 +1925,7 @@ impl AppState {
                             id,
                             data,
                             truncated,
+                            ..
                         } => {
                             if let Some(pending) = pending.as_ref()
                                 && pending.is_user_visible()
@@ -2025,6 +2078,9 @@ impl AppState {
                             });
                         }
                     }
+                }
+                EventPayload::ScriptItemCreated { script_id, item } => {
+                    self.apply_script_item_created(&script_id, item);
                 }
                 EventPayload::ScriptFinished {
                     script_id,
@@ -2513,6 +2569,52 @@ mod tests {
     }
 
     #[test]
+    fn script_item_created_updates_the_matching_script_card() {
+        let mut state = AppState::new();
+        let card_index = state
+            .main_view
+            .push_card("cue run two.cue".into(), Mode::Job);
+        queue_pending(
+            &mut state,
+            1,
+            PendingSubmission::user(
+                Some(card_index),
+                "cue run two.cue".into(),
+                Mode::Job,
+                Vec::new(),
+            ),
+        );
+        state.update(AppMsg::Response {
+            id: 1,
+            payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
+                script_id: "R1".into(),
+                source: ScriptSource::File {
+                    path: "two.cue".into(),
+                },
+                items: vec![],
+                submit_error: None,
+            }),
+        });
+
+        state.update(AppMsg::ServerEvent(EventPayload::ScriptItemCreated {
+            script_id: "R1".into(),
+            item: ScriptItemInfo {
+                index: 1,
+                source: "echo second".into(),
+                result: ScriptItemResult::Job {
+                    job_id: "J2".into(),
+                    start_scope: Some("S@abc12345".into()),
+                    open_hint: JobOpenHint::Stream,
+                },
+            },
+        }));
+
+        let card = &state.main_view.cards[card_index];
+        assert!(card.output.contains("2. echo second -> J2"));
+        assert!(state.jobs.iter().any(|job| job.id == "J2"));
+    }
+
+    #[test]
     fn unknown_script_finished_without_pending_submission_is_not_cached() {
         let mut state = AppState::new();
 
@@ -2730,6 +2832,8 @@ mod tests {
                 id: "J1".into(),
                 data: "hello\n".into(),
                 truncated: false,
+                encoding: Default::default(),
+                base64: None,
             }),
         });
 
@@ -2761,6 +2865,8 @@ mod tests {
                 id: "J1".into(),
                 data: "hello\n".into(),
                 truncated: false,
+                encoding: Default::default(),
+                base64: None,
             }),
         });
         state.update(AppMsg::ServerEvent(EventPayload::OutputChunk {
@@ -2793,6 +2899,8 @@ mod tests {
                 id: "J1".into(),
                 data: "boom\n".into(),
                 truncated: false,
+                encoding: Default::default(),
+                base64: None,
             }),
         });
 

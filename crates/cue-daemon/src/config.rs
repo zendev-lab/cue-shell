@@ -734,24 +734,17 @@ fn default_wrapper_binary() -> String {
 // ────────────────────────────────────────────────────────────────────
 
 fn ensure_default_daemon_config(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        dirs::ensure_private_dir(parent)
             .with_context(|| format!("create config directory {}", parent.display()))?;
     }
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(mut file) => {
+    match dirs::create_private_file(path) {
+        Ok(Some(mut file)) => {
             file.write_all(DEFAULT_DAEMON_CONFIG.as_bytes())
                 .with_context(|| format!("write default config {}", path.display()))?;
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Ok(None) => Ok(()),
         Err(error) => {
             Err(error).with_context(|| format!("create default config {}", path.display()))
         }
@@ -815,8 +808,74 @@ mod tests {
 
         let text = std::fs::read_to_string(&path).expect("read generated config");
         assert!(text.contains("python ="));
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(path.parent().expect("config parent"))
+                .expect("stat config parent")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("stat generated config")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         Config::load_from_source(Some((&path, &text))).expect("generated config parses");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_daemon_config_is_migrated_to_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cue-daemon-config-permissions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let path = root.join("cue-shell/daemon.toml");
+        std::fs::create_dir_all(path.parent().expect("config parent"))
+            .expect("create config parent");
+        std::fs::write(&path, "[warn]\ncommands = []\n").expect("write config");
+        std::fs::set_permissions(
+            path.parent().expect("config parent"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("set wide directory permissions");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set wide config permissions");
+
+        ensure_default_daemon_config(&path).expect("secure existing config");
+
+        assert_eq!(
+            std::fs::metadata(path.parent().expect("config parent"))
+                .expect("stat config parent")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("stat config")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read existing config"),
+            "[warn]\ncommands = []\n"
+        );
+        std::fs::remove_dir_all(root).expect("remove temp root");
     }
 
     #[test]

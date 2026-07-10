@@ -1,10 +1,11 @@
 //! Scheduler actor — command routing, ID assignment, chain execution, cron timer heap.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -18,9 +19,9 @@ use cue_core::command::ModeParams;
 use cue_core::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
 use cue_core::cron::{CronSchedule, CronStatus, parse_schedule_text};
 use cue_core::ipc::{
-    ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, PageInfo,
-    ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus, ScriptSource,
-    ScriptSubmitError, StreamText, error_code,
+    ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload,
+    OutputEncoding, PageInfo, ResponsePayload, ScriptInfo, ScriptInfoStatus, ScriptItemInfo,
+    ScriptItemResult, ScriptRunStatus, ScriptSource, ScriptSubmitError, StreamText, error_code,
 };
 use cue_core::job::{CancelReason, EXIT_CODE_UNAVAILABLE, JobStatus, LaunchOptions};
 use cue_core::mode::Mode;
@@ -44,12 +45,18 @@ use super::script_record::{
 };
 use super::{
     ActorSystem, GatewayMsg, ProcessJobOptions, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg,
-    StderrSnapshot, publish_event as publish_actor_event,
+    SessionBinding, StderrSnapshot, publish_event as publish_actor_event,
     publish_event_except as publish_actor_event_except,
     send_gateway_event as send_actor_gateway_event,
 };
 
 const MAX_OUTPUT_TAIL_BYTES: usize = cue_core::ipc::MAX_MESSAGE_SIZE / 4;
+const SCOPE_GC_INTERVAL: Duration = Duration::from_secs(60);
+const SCRIPT_SNAPSHOT_IDENTITY_CAPACITY: usize = 65_536;
+const SCRIPT_SNAPSHOT_RESPONSE_CAPACITY: usize = 1_024;
+const SCRIPT_SNAPSHOT_MAX_ITEM_BYTES: usize = 8 * 1024 * 1024;
+const SCRIPT_SNAPSHOT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const SCRIPT_SNAPSHOT_TTL: Duration = Duration::from_secs(15 * 60);
 
 // ── Chain state ─────────────────────────────────────────────────────────────
 
@@ -129,6 +136,12 @@ struct PendingScriptRun {
     waiting_index: Option<usize>,
 }
 
+struct CompletedScriptSnapshot {
+    info: Option<ScriptInfo>,
+    completed_at: Instant,
+    response_bytes: usize,
+}
+
 #[derive(Clone, Copy, Default)]
 struct CommandExecutionContext {
     scope_override: Option<ScopeHash>,
@@ -143,6 +156,7 @@ struct LaunchDefaults {
 
 struct SessionState {
     scope: ScopeHash,
+    incarnation: u64,
     defaults: LaunchDefaults,
     connected_clients: usize,
     disconnected_at: Option<Instant>,
@@ -171,6 +185,7 @@ struct SchedulerState {
     next_cron: u32,
     next_chain: u32,
     next_script: u32,
+    next_session_incarnation: u64,
 
     /// Active chains keyed by `ChainId`.
     chains: HashMap<ChainId, ChainState>,
@@ -188,6 +203,11 @@ struct SchedulerState {
     pending_script_chains: HashMap<ChainId, ScriptId>,
     /// Completed chain results retained only until their owning script consumes them.
     completed_chains: HashMap<ChainId, ChainCompletion>,
+    /// Bounded daemon-lifetime recovery snapshots for completed scripts.
+    completed_script_snapshots: HashMap<ScriptId, CompletedScriptSnapshot>,
+    completed_script_snapshot_order: VecDeque<ScriptId>,
+    completed_script_snapshot_responses: usize,
+    completed_script_snapshot_bytes: usize,
     /// Logical sessions keyed by stable client-provided session id.
     sessions: HashMap<String, SessionState>,
     /// Transport client id to logical session id.
@@ -232,6 +252,7 @@ impl SchedulerState {
             next_cron: 1,
             next_chain: 1,
             next_script: 1,
+            next_session_incarnation: 1,
             chains: HashMap::new(),
             job_to_chain: HashMap::new(),
             jobs: HashMap::new(),
@@ -241,6 +262,10 @@ impl SchedulerState {
             pending_script_jobs: HashMap::new(),
             pending_script_chains: HashMap::new(),
             completed_chains: HashMap::new(),
+            completed_script_snapshots: HashMap::new(),
+            completed_script_snapshot_order: VecDeque::new(),
+            completed_script_snapshot_responses: 0,
+            completed_script_snapshot_bytes: 0,
             sessions: HashMap::new(),
             client_sessions: HashMap::new(),
             pending_resource_jobs: VecDeque::new(),
@@ -301,6 +326,44 @@ impl SchedulerState {
     }
 }
 
+/// Compute the complete set of live scope leaves owned by scheduler state.
+///
+/// `jobs` contains both active jobs and retained durable history, while `crons`
+/// contains every durable cron record restored by the daemon. ScopeStore owns
+/// ancestor traversal; the scheduler owns only these domain-level references.
+fn scope_gc_roots(state: &SchedulerState) -> HashSet<ScopeHash> {
+    let mut roots = HashSet::new();
+    roots.extend(state.sessions.values().map(|session| session.scope));
+    roots.extend(state.chains.values().map(|chain| chain.scope_hash));
+    roots.extend(
+        state
+            .jobs
+            .values()
+            .flat_map(|job| [job.start_scope, job.end_scope])
+            .flatten(),
+    );
+    roots.extend(state.crons.values().map(|cron| cron.scope_hash));
+    roots.extend(
+        state
+            .pending_scripts
+            .values()
+            .map(|script| script.item_scope),
+    );
+    roots.extend(
+        state
+            .completed_chains
+            .values()
+            .filter_map(|chain| chain.end_scope),
+    );
+    roots.extend(
+        state
+            .pending_resource
+            .values()
+            .map(|pending| pending.base_scope),
+    );
+    roots
+}
+
 // ── Spawn the actor ─────────────────────────────────────────────────────────
 
 /// Restore durable Scheduler state and spawn the actor task.
@@ -318,10 +381,14 @@ pub(super) async fn spawn(
 
     tokio::spawn(async move {
         prune_retained_job_history(&mut state, &db, &config, &sys).await;
+        garbage_collect_scopes(&state, &sys).await;
+        let mut next_scope_gc = Instant::now() + SCOPE_GC_INTERVAL;
         debug!("scheduler: started");
 
         loop {
-            sweep_disconnected_sessions(&mut state);
+            if sweep_disconnected_sessions(&mut state) > 0 {
+                garbage_collect_scopes(&state, &sys).await;
+            }
             // Compute the sleep deadline from the nearest enabled cron trigger.
             let next_cron_deadline = state
                 .crons
@@ -329,12 +396,23 @@ pub(super) async fn spawn(
                 .filter(|c| c.status.is_runnable())
                 .map(|c| c.next_trigger)
                 .min();
-
-            let sleep = match next_cron_deadline {
-                Some(deadline) => tokio::time::sleep_until(deadline),
-                // No crons → sleep "forever" (will be cancelled by select).
-                None => tokio::time::sleep(std::time::Duration::from_secs(86400 * 365)),
-            };
+            let next_session_gc_deadline = state
+                .sessions
+                .values()
+                .filter(|session| session.connected_clients == 0)
+                .filter_map(|session| session.disconnected_at)
+                .map(|disconnected_at| disconnected_at + SESSION_GC_TTL)
+                .min();
+            let wake_deadline = [
+                next_cron_deadline,
+                next_session_gc_deadline,
+                Some(next_scope_gc),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .expect("periodic scope GC always supplies a scheduler deadline");
+            let sleep = tokio::time::sleep_until(wake_deadline);
             tokio::pin!(sleep);
 
             tokio::select! {
@@ -350,6 +428,18 @@ pub(super) async fn spawn(
 
                         SchedulerMsg::Disconnect { client_id } => {
                             disconnect_session(client_id, &mut state);
+                        }
+
+                        SchedulerMsg::ScriptInfo { client_id, request_id, id } => {
+                            let response = if state.session_for_client(client_id).is_none() {
+                                ResponsePayload::err(
+                                    error_code::INVALID_REQUEST,
+                                    "client session handshake required",
+                                )
+                            } else {
+                                script_info_response(&id, &mut state)
+                            };
+                            send_gateway_response(&sys, client_id, request_id, response).await;
                         }
 
                         SchedulerMsg::Eval { client_id, request_id, command } => {
@@ -524,12 +614,20 @@ pub(super) async fn spawn(
                             break;
                         }
                     }
-                    prune_retained_job_history(&mut state, &db, &config, &sys).await;
+                    if prune_retained_job_history(&mut state, &db, &config, &sys).await {
+                        garbage_collect_scopes(&state, &sys).await;
+                    }
                 }
 
                 () = &mut sleep => {
-                    // A cron timer has fired.
-                    fire_due_crons(&mut state, &db, &config, &sys).await;
+                    let now = Instant::now();
+                    if next_cron_deadline.is_some_and(|deadline| deadline <= now) {
+                        fire_due_crons(&mut state, &db, &config, &sys).await;
+                    }
+                    if next_scope_gc <= now {
+                        garbage_collect_scopes(&state, &sys).await;
+                        next_scope_gc = now + SCOPE_GC_INTERVAL;
+                    }
                 }
             }
         }
@@ -603,8 +701,15 @@ async fn restore_crons(
         max_cron = max_cron.max(cron_id.0);
 
         let Some(scope_hash) = cron.scope_hash else {
+            if cron.status == CronStatus::Paused {
+                warn!(
+                    cron_id = %cron.id,
+                    "scheduler: skipping disabled cron whose sensitive scope was removed"
+                );
+                continue;
+            }
             return Err(anyhow::anyhow!(
-                "persisted cron {} has no scope hash",
+                "persisted runnable cron {} has no scope hash",
                 cron.id
             ));
         };
@@ -706,7 +811,7 @@ async fn prune_retained_job_history(
     db: &storage::SharedConnection,
     config: &Config,
     sys: &ActorSystem,
-) {
+) -> bool {
     let keep = config.retention.max_job_history;
     let removed = match storage::with_connection(db, move |conn| {
         storage::prune_job_history(conn, keep)
@@ -716,10 +821,11 @@ async fn prune_retained_job_history(
         Ok(removed) => removed,
         Err(error) => {
             warn!("scheduler: failed to prune job history: {error}");
-            return;
+            return false;
         }
     };
 
+    let removed_any = !removed.is_empty();
     for id in removed {
         if let Some(job_id) = parse_job_id(&id) {
             state.jobs.remove(&job_id);
@@ -733,6 +839,32 @@ async fn prune_retained_job_history(
             .await;
             remove_job_logs(job_id).await;
         }
+    }
+    removed_any
+}
+
+async fn garbage_collect_scopes(state: &SchedulerState, sys: &ActorSystem) {
+    let roots = scope_gc_roots(state);
+    let (reply, result) = tokio::sync::oneshot::channel();
+    if let Err(error) = sys
+        .scope_store
+        .send(ScopeStoreMsg::GarbageCollect { roots, reply })
+        .await
+    {
+        warn!("scheduler: failed to request scope garbage collection: {error}");
+        return;
+    }
+    match result.await {
+        Ok(Ok(report)) => {
+            debug!(
+                retained = report.retained,
+                removed_cached = report.removed_cached,
+                removed_persisted = report.removed_persisted,
+                "scheduler: scope garbage collection complete"
+            );
+        }
+        Ok(Err(error)) => warn!("scheduler: scope garbage collection failed: {error}"),
+        Err(error) => warn!("scheduler: scope garbage collection reply dropped: {error}"),
     }
 }
 
@@ -904,7 +1036,7 @@ async fn connect_session(
     refresh: bool,
     state: &mut SchedulerState,
     sys: &ActorSystem,
-) -> anyhow::Result<ScopeHash> {
+) -> anyhow::Result<SessionBinding> {
     let mut old_session_id = state.client_sessions.get(&client_id).cloned();
     let mut same_client_session = old_session_id.as_deref() == Some(session_id.as_str());
 
@@ -932,17 +1064,25 @@ async fn connect_session(
             session.scope = scope;
         }
         let scope = session.scope;
+        let incarnation = session.incarnation;
         state.client_sessions.insert(client_id, session_id.clone());
         mark_replaced_session_disconnected(state, old_session_id, &session_id);
-        return Ok(scope);
+        return Ok(SessionBinding { scope, incarnation });
     }
 
+    let incarnation = state.next_session_incarnation;
+    let next_session_incarnation = state
+        .next_session_incarnation
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("session incarnation space exhausted"))?;
     let scope = Scope::root(snapshot);
     let hash = insert_scope(sys, scope).await?;
+    state.next_session_incarnation = next_session_incarnation;
     state.sessions.insert(
         session_id.clone(),
         SessionState {
             scope: hash,
+            incarnation,
             defaults: LaunchDefaults::default(),
             connected_clients: 1,
             disconnected_at: None,
@@ -950,7 +1090,10 @@ async fn connect_session(
     );
     state.client_sessions.insert(client_id, session_id.clone());
     mark_replaced_session_disconnected(state, old_session_id, &session_id);
-    Ok(hash)
+    Ok(SessionBinding {
+        scope: hash,
+        incarnation,
+    })
 }
 
 fn mark_replaced_session_disconnected(
@@ -982,14 +1125,16 @@ fn disconnect_session(client_id: u64, state: &mut SchedulerState) {
     }
 }
 
-fn sweep_disconnected_sessions(state: &mut SchedulerState) {
+fn sweep_disconnected_sessions(state: &mut SchedulerState) -> usize {
     let now = Instant::now();
+    let before = state.sessions.len();
     state.sessions.retain(|_, session| {
         session.connected_clients > 0
             || session
                 .disconnected_at
                 .is_none_or(|disconnected_at| now.duration_since(disconnected_at) < SESSION_GC_TTL)
     });
+    before.saturating_sub(state.sessions.len())
 }
 
 async fn insert_scope(sys: &ActorSystem, scope: Scope) -> anyhow::Result<ScopeHash> {
@@ -1145,16 +1290,55 @@ fn leaf_status_to_job_status(status: LeafStatus) -> JobStatus {
     }
 }
 
-async fn publish_chain_progress(sys: &ActorSystem, state: &SchedulerState, chain_id: ChainId) {
+async fn publish_chain_progress(sys: &ActorSystem, state: &mut SchedulerState, chain_id: ChainId) {
     let Some(chain) = build_chain_info(state, chain_id) else {
         return;
     };
+    synchronize_pending_script_chain(state, chain_id, &chain);
     publish_event(
         sys,
         EventChannel::Jobs,
         EventPayload::ChainProgress { chain },
     )
     .await;
+}
+
+fn synchronize_pending_script_chain(
+    state: &mut SchedulerState,
+    chain_id: ChainId,
+    chain: &ChainInfo,
+) {
+    let Some(script_id) = state.pending_script_chains.get(&chain_id).copied() else {
+        return;
+    };
+    let Some(pending) = state.pending_scripts.get_mut(&script_id) else {
+        return;
+    };
+    let Some(item) = pending.created_items.iter_mut().find(|item| {
+        matches!(
+            &item.result,
+            ScriptItemResult::Chain {
+                chain_id: item_chain_id,
+                ..
+            } if item_chain_id == &chain_id.to_string()
+        )
+    }) else {
+        return;
+    };
+    let ScriptItemResult::Chain {
+        job_ids,
+        chain: item_chain,
+        ..
+    } = &mut item.result
+    else {
+        return;
+    };
+    *job_ids = chain
+        .jobs
+        .iter()
+        .filter_map(|job| job.job_id.clone())
+        .collect();
+    *item_chain = chain.clone();
 }
 
 #[derive(Debug, Clone)]
@@ -1631,6 +1815,17 @@ async fn kill_process_job(sys: &ActorSystem, job_id: JobId) -> Result<(), String
         .map_err(|_| "process_mgr reply dropped".to_string())?
 }
 
+async fn cancel_process_job(sys: &ActorSystem, job_id: JobId) -> Result<(), String> {
+    match kill_process_job(sys, job_id).await {
+        Ok(()) => Ok(()),
+        // The process reader may have already reaped the child and queued its
+        // scheduler notification. For idempotent cancellation, absence at the
+        // process owner is equivalent to already stopped.
+        Err(error) if error == format!("job {job_id} not found") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 struct TerminalStateUpdate {
     status: JobStatus,
     exit_code: i32,
@@ -1968,7 +2163,7 @@ async fn cancel_chain_leaves(
                 .jobs
                 .get(&jid)
                 .is_some_and(|entry| entry.status == JobStatus::Running);
-            if is_running && let Err(error) = kill_process_job(sys, jid).await {
+            if is_running && let Err(error) = cancel_process_job(sys, jid).await {
                 warn!(%chain_id, %jid, "scheduler: failed to kill chain leaf: {error}");
                 continue;
             }
@@ -2581,6 +2776,119 @@ async fn apply_user_terminal_job_update(
     persist_error
 }
 
+async fn cancel_job_execution(
+    job_id: JobId,
+    state: &mut SchedulerState,
+    runtime: SchedulerRuntime<'_>,
+) -> Result<(), String> {
+    let status = state.jobs.get(&job_id).map(|entry| entry.status.clone());
+    match status {
+        Some(JobStatus::Pending) | Some(JobStatus::Running) => {
+            if matches!(status, Some(JobStatus::Running)) {
+                cancel_process_job(runtime.io.sys, job_id).await?;
+            }
+            if let Some(error) = apply_user_terminal_job_update(
+                job_id,
+                TerminalStateUpdate {
+                    status: JobStatus::Cancelled(CancelReason::User),
+                    exit_code: EXIT_CODE_UNAVAILABLE,
+                    end_scope: None,
+                    advance_chain: true,
+                },
+                state,
+                runtime,
+            )
+            .await
+            {
+                return Err(error);
+            }
+            Ok(())
+        }
+        // Cancellation is deliberately idempotent. A terminal or retained
+        // execution is already quiescent and therefore satisfies the request.
+        Some(_) => Ok(()),
+        None if job_id.0 < state.next_job => Ok(()),
+        None => Err(format!("job {job_id} not found")),
+    }
+}
+
+async fn cancel_chain_execution(
+    chain_id: ChainId,
+    state: &mut SchedulerState,
+    runtime: SchedulerRuntime<'_>,
+) -> Result<(), String> {
+    let Some(chain) = state.chains.get(&chain_id) else {
+        return if chain_id.0 < state.next_chain {
+            Ok(())
+        } else {
+            Err(format!("chain {chain_id} not found"))
+        };
+    };
+    let to_cancel = flatten_leaves(&chain.node)
+        .into_iter()
+        .map(|leaf| leaf.index)
+        .collect::<Vec<_>>();
+    let outcome = process_chain_advance(
+        ChainAdvanceRequest {
+            chain_id,
+            newly_ready: Vec::new(),
+            to_cancel,
+            capture_first: 0,
+            retain_completed_chain: false,
+        },
+        state,
+        runtime.io,
+    )
+    .await;
+    if let Some(error) = outcome.spawn_error.or(outcome.persist_error) {
+        return Err(error);
+    }
+    advance_pending_scripts_after_completed_chains(state, runtime).await;
+    Ok(())
+}
+
+async fn cancel_script_execution(
+    script_id: ScriptId,
+    state: &mut SchedulerState,
+    runtime: SchedulerRuntime<'_>,
+) -> Result<(), String> {
+    let Some(pending) = state.pending_scripts.remove(&script_id) else {
+        return if script_id.0 < state.next_script {
+            Ok(())
+        } else {
+            Err(format!("script {script_id} not found"))
+        };
+    };
+
+    // Remove ownership links before cancelling the active item so terminal
+    // callbacks cannot advance this script to its next item.
+    let current_job = state
+        .pending_script_jobs
+        .iter()
+        .find_map(|(job_id, owner)| (*owner == script_id).then_some(*job_id));
+    let current_chain = state
+        .pending_script_chains
+        .iter()
+        .find_map(|(chain_id, owner)| (*owner == script_id).then_some(*chain_id));
+    if let Some(job_id) = current_job {
+        state.pending_script_jobs.remove(&job_id);
+    }
+    if let Some(chain_id) = current_chain {
+        state.pending_script_chains.remove(&chain_id);
+    }
+
+    let cancel_result = if let Some(job_id) = current_job {
+        cancel_job_execution(job_id, state, runtime).await
+    } else if let Some(chain_id) = current_chain {
+        cancel_chain_execution(chain_id, state, runtime).await
+    } else {
+        Ok(())
+    };
+
+    finish_pending_script_failed(pending, EXIT_CODE_UNAVAILABLE, state, runtime).await;
+    cancel_result
+}
+
 /// Shared logic for processing chain advancement results (cancels + spawns + cleanup).
 ///
 /// Used by `handle_job_finished`, `:kill`, and `:cancel` handlers.
@@ -2935,6 +3243,15 @@ async fn start_pending_script_run(
 ) -> Option<ResponsePayload> {
     #[cfg(test)]
     ensure_test_session(state, runtime.io.sys, client_id).await;
+    prune_completed_script_snapshots(state, Instant::now());
+    if state.pending_scripts.len() + state.completed_script_snapshots.len()
+        >= SCRIPT_SNAPSHOT_IDENTITY_CAPACITY
+    {
+        return Some(ResponsePayload::err(
+            error_code::INVALID_STATE,
+            "script recovery identity ledger is saturated; refusing a new script",
+        ));
+    }
     let script_id = state.alloc_script();
     let item_scope = match create_isolated_script_scope(state, client_id, runtime.io.sys).await {
         Ok(scope) => scope,
@@ -3018,12 +3335,17 @@ async fn submit_pending_script_next(
                     }
                 }
                 publish_script_finished(
+                    state,
                     runtime.io.sys,
                     pending.client_id,
                     pending.script_id,
-                    ScriptRunStatus::Failed,
-                    EXIT_CODE_UNAVAILABLE,
-                    Some(index),
+                    ScriptCompletion {
+                        status: ScriptRunStatus::Failed,
+                        exit_code: EXIT_CODE_UNAVAILABLE,
+                        failed_item_index: Some(index),
+                        items: &pending.created_items,
+                        submit_error: submit_error.as_ref(),
+                    },
                 )
                 .await;
                 return respond_created.then(|| {
@@ -3040,11 +3362,21 @@ async fn submit_pending_script_next(
                     pending.item_scope = next_scope;
                 }
                 let result = script_item_result_from_ok(&payload);
-                pending.created_items.push(ScriptItemInfo {
+                let created_item = ScriptItemInfo {
                     index,
                     source: source_text,
                     result,
-                });
+                };
+                pending.created_items.push(created_item.clone());
+                if !respond_created {
+                    publish_script_item_created(
+                        runtime.io.sys,
+                        pending.client_id,
+                        pending.script_id,
+                        created_item,
+                    )
+                    .await;
+                }
 
                 if let Some(exit_code) = immediate_script_item_exit_code(&payload, state) {
                     pending.last_exit_code = exit_code;
@@ -3067,12 +3399,17 @@ async fn submit_pending_script_next(
                             }
                         }
                         publish_script_finished(
+                            state,
                             runtime.io.sys,
                             pending.client_id,
                             pending.script_id,
-                            ScriptRunStatus::Failed,
-                            exit_code,
-                            Some(index),
+                            ScriptCompletion {
+                                status: ScriptRunStatus::Failed,
+                                exit_code,
+                                failed_item_index: Some(index),
+                                items: &pending.created_items,
+                                submit_error: None,
+                            },
                         )
                         .await;
                         return respond_created.then(|| script_created_response(&pending, None));
@@ -3104,12 +3441,17 @@ async fn submit_pending_script_next(
                                 }
                             }
                             publish_script_finished(
+                                state,
                                 runtime.io.sys,
                                 pending.client_id,
                                 pending.script_id,
-                                ScriptRunStatus::Failed,
-                                EXIT_CODE_UNAVAILABLE,
-                                Some(index),
+                                ScriptCompletion {
+                                    status: ScriptRunStatus::Failed,
+                                    exit_code: EXIT_CODE_UNAVAILABLE,
+                                    failed_item_index: Some(index),
+                                    items: &pending.created_items,
+                                    submit_error: None,
+                                },
                             )
                             .await;
                             return respond_created
@@ -3162,12 +3504,17 @@ async fn submit_pending_script_next(
                                 }
                             }
                             publish_script_finished(
+                                state,
                                 runtime.io.sys,
                                 pending.client_id,
                                 pending.script_id,
-                                ScriptRunStatus::Failed,
-                                EXIT_CODE_UNAVAILABLE,
-                                Some(index),
+                                ScriptCompletion {
+                                    status: ScriptRunStatus::Failed,
+                                    exit_code: EXIT_CODE_UNAVAILABLE,
+                                    failed_item_index: Some(index),
+                                    items: &pending.created_items,
+                                    submit_error: None,
+                                },
                             )
                             .await;
                             return respond_created
@@ -3185,6 +3532,7 @@ async fn submit_pending_script_next(
                                 finish_pending_script_failed(
                                     pending,
                                     completion.exit_code,
+                                    state,
                                     runtime,
                                 )
                                 .await;
@@ -3239,12 +3587,17 @@ async fn submit_pending_script_next(
         }
     }
     publish_script_finished(
+        state,
         runtime.io.sys,
         pending.client_id,
         pending.script_id,
-        ScriptRunStatus::Done,
-        pending.last_exit_code,
-        None,
+        ScriptCompletion {
+            status: ScriptRunStatus::Done,
+            exit_code: pending.last_exit_code,
+            failed_item_index: None,
+            items: &pending.created_items,
+            submit_error: None,
+        },
     )
     .await;
     respond_created.then(|| script_created_response(&pending, None))
@@ -3271,12 +3624,19 @@ async fn advance_pending_scripts_after_terminal_job(
         }
         pending.last_exit_code = exit_code;
         if exit_code != 0 {
-            finish_pending_script_failed(pending, exit_code, runtime).await;
+            finish_pending_script_failed(pending, exit_code, state, runtime).await;
         } else {
             continue_pending_script(pending, state, runtime).await;
         }
     }
 
+    advance_pending_scripts_after_completed_chains(state, runtime).await;
+}
+
+async fn advance_pending_scripts_after_completed_chains(
+    state: &mut SchedulerState,
+    runtime: SchedulerRuntime<'_>,
+) {
     let finished_chains = state
         .pending_script_chains
         .keys()
@@ -3298,7 +3658,7 @@ async fn advance_pending_scripts_after_terminal_job(
         }
         pending.last_exit_code = completion.exit_code;
         if completion.exit_code != 0 {
-            finish_pending_script_failed(pending, completion.exit_code, runtime).await;
+            finish_pending_script_failed(pending, completion.exit_code, state, runtime).await;
         } else {
             continue_pending_script(pending, state, runtime).await;
         }
@@ -3321,6 +3681,7 @@ fn script_exit_code_for_job(state: &SchedulerState, job_id: JobId, reported_exit
 async fn finish_pending_script_failed(
     pending: PendingScriptRun,
     exit_code: i32,
+    state: &mut SchedulerState,
     runtime: SchedulerRuntime<'_>,
 ) {
     let failed_index = pending.waiting_index;
@@ -3338,12 +3699,17 @@ async fn finish_pending_script_failed(
         warn!(script = %pending.script_id, "scheduler: failed to persist script completion: {error}");
     }
     publish_script_finished(
+        state,
         runtime.io.sys,
         pending.client_id,
         pending.script_id,
-        ScriptRunStatus::Failed,
-        exit_code,
-        failed_index,
+        ScriptCompletion {
+            status: ScriptRunStatus::Failed,
+            exit_code,
+            failed_item_index: failed_index,
+            items: &pending.created_items,
+            submit_error: None,
+        },
     )
     .await;
 }
@@ -3361,7 +3727,7 @@ async fn fail_pending_scripts_on_shutdown(
     state.completed_chains.clear();
 
     for pending in pending {
-        finish_pending_script_failed(pending, EXIT_CODE_UNAVAILABLE, runtime).await;
+        finish_pending_script_failed(pending, EXIT_CODE_UNAVAILABLE, state, runtime).await;
     }
 }
 
@@ -3384,6 +3750,146 @@ fn immediate_script_item_exit_code(payload: &OkPayload, state: &SchedulerState) 
     }
 }
 
+fn script_info_response(id: &str, state: &mut SchedulerState) -> ResponsePayload {
+    let Some(script_id) = parse_script_id(id) else {
+        return ResponsePayload::err(
+            error_code::INVALID_REQUEST,
+            format!("invalid script id {id}"),
+        );
+    };
+    prune_completed_script_snapshots(state, Instant::now());
+    if let Some(pending) = state.pending_scripts.get(&script_id) {
+        let info = ScriptInfo {
+            script_id: script_id.to_string(),
+            status: ScriptInfoStatus::Running,
+            items: pending.created_items.clone(),
+            exit_code: None,
+            failed_item_index: None,
+            submit_error: None,
+        };
+        if serialized_script_info_size(&info) > SCRIPT_SNAPSHOT_MAX_ITEM_BYTES {
+            return ResponsePayload::err(
+                error_code::INVALID_STATE,
+                format!("script {script_id} recovery snapshot exceeds the replay limit"),
+            );
+        }
+        return ResponsePayload::Ok(OkPayload::ScriptInfo(info));
+    }
+    if let Some(snapshot) = state.completed_script_snapshots.get(&script_id) {
+        return match &snapshot.info {
+            Some(info) => ResponsePayload::Ok(OkPayload::ScriptInfo(info.clone())),
+            None => ResponsePayload::err(
+                error_code::INVALID_STATE,
+                format!("script {script_id} completed, but its recovery snapshot is unavailable"),
+            ),
+        };
+    }
+    if script_id.0 < state.next_script {
+        ResponsePayload::err(
+            error_code::INVALID_STATE,
+            format!("script {script_id} recovery snapshot expired or is unavailable"),
+        )
+    } else {
+        ResponsePayload::err(
+            error_code::NOT_FOUND,
+            format!("script {script_id} not found"),
+        )
+    }
+}
+
+fn record_completed_script_snapshot(state: &mut SchedulerState, info: ScriptInfo) {
+    prune_completed_script_snapshots(state, Instant::now());
+    let script_id = parse_script_id(&info.script_id).expect("scheduler created valid script id");
+    let response_bytes = serialized_script_info_size(&info);
+    let (info, response_bytes) = if response_bytes <= SCRIPT_SNAPSHOT_MAX_ITEM_BYTES {
+        (Some(info), response_bytes)
+    } else {
+        (None, 0)
+    };
+    if let Some(previous) = state.completed_script_snapshots.insert(
+        script_id,
+        CompletedScriptSnapshot {
+            info,
+            completed_at: Instant::now(),
+            response_bytes,
+        },
+    ) {
+        if previous.info.is_some() {
+            state.completed_script_snapshot_responses =
+                state.completed_script_snapshot_responses.saturating_sub(1);
+            state.completed_script_snapshot_bytes = state
+                .completed_script_snapshot_bytes
+                .saturating_sub(previous.response_bytes);
+        }
+        state
+            .completed_script_snapshot_order
+            .retain(|existing| *existing != script_id);
+    }
+    if response_bytes > 0 {
+        state.completed_script_snapshot_responses += 1;
+        state.completed_script_snapshot_bytes += response_bytes;
+    }
+    state.completed_script_snapshot_order.push_back(script_id);
+    while state.completed_script_snapshot_responses > SCRIPT_SNAPSHOT_RESPONSE_CAPACITY
+        || state.completed_script_snapshot_bytes > SCRIPT_SNAPSHOT_MAX_TOTAL_BYTES
+    {
+        let Some(oldest) = state
+            .completed_script_snapshot_order
+            .iter()
+            .copied()
+            .find(|id| {
+                state
+                    .completed_script_snapshots
+                    .get(id)
+                    .is_some_and(|snapshot| snapshot.info.is_some())
+            })
+        else {
+            break;
+        };
+        let snapshot = state
+            .completed_script_snapshots
+            .get_mut(&oldest)
+            .expect("snapshot exists after lookup");
+        snapshot.info = None;
+        state.completed_script_snapshot_responses =
+            state.completed_script_snapshot_responses.saturating_sub(1);
+        state.completed_script_snapshot_bytes = state
+            .completed_script_snapshot_bytes
+            .saturating_sub(snapshot.response_bytes);
+        snapshot.response_bytes = 0;
+    }
+}
+
+fn serialized_script_info_size(info: &ScriptInfo) -> usize {
+    serde_json::to_vec(info)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn prune_completed_script_snapshots(state: &mut SchedulerState, now: Instant) {
+    while let Some(oldest) = state.completed_script_snapshot_order.front().copied() {
+        let expired = state
+            .completed_script_snapshots
+            .get(&oldest)
+            .is_none_or(|snapshot| {
+                now.saturating_duration_since(snapshot.completed_at) >= SCRIPT_SNAPSHOT_TTL
+            });
+        if !expired {
+            break;
+        }
+        state.completed_script_snapshot_order.pop_front();
+        if let Some(snapshot) = state.completed_script_snapshots.remove(&oldest)
+            && snapshot.info.is_some()
+        {
+            state.completed_script_snapshot_responses =
+                state.completed_script_snapshot_responses.saturating_sub(1);
+            state.completed_script_snapshot_bytes = state
+                .completed_script_snapshot_bytes
+                .saturating_sub(snapshot.response_bytes);
+        }
+    }
+}
+
 fn script_created_response(
     pending: &PendingScriptRun,
     submit_error: Option<ScriptSubmitError>,
@@ -3396,19 +3902,54 @@ fn script_created_response(
     })
 }
 
-async fn publish_script_finished(
+async fn publish_script_item_created(
     sys: &ActorSystem,
     client_id: u64,
     script_id: ScriptId,
+    item: ScriptItemInfo,
+) {
+    let payload = EventPayload::ScriptItemCreated {
+        script_id: script_id.to_string(),
+        item,
+    };
+    send_actor_gateway_event("scheduler", sys, client_id, payload.clone()).await;
+    publish_event_except(sys, EventChannel::Jobs, payload, client_id).await;
+}
+
+struct ScriptCompletion<'a> {
     status: ScriptRunStatus,
     exit_code: i32,
     failed_item_index: Option<usize>,
+    items: &'a [ScriptItemInfo],
+    submit_error: Option<&'a ScriptSubmitError>,
+}
+
+async fn publish_script_finished(
+    state: &mut SchedulerState,
+    sys: &ActorSystem,
+    client_id: u64,
+    script_id: ScriptId,
+    completion: ScriptCompletion<'_>,
 ) {
+    record_completed_script_snapshot(
+        state,
+        ScriptInfo {
+            script_id: script_id.to_string(),
+            status: match completion.status {
+                ScriptRunStatus::Done => ScriptInfoStatus::Done,
+                ScriptRunStatus::Failed => ScriptInfoStatus::Failed,
+            },
+            items: completion.items.to_vec(),
+            exit_code: Some(completion.exit_code),
+            failed_item_index: completion.failed_item_index,
+            submit_error: completion.submit_error.cloned(),
+        },
+    );
     let payload = EventPayload::ScriptFinished {
         script_id: script_id.to_string(),
-        status,
-        exit_code,
-        failed_item_index,
+        status: completion.status,
+        exit_code: completion.exit_code,
+        failed_item_index: completion.failed_item_index,
     };
     send_actor_gateway_event("scheduler", sys, client_id, payload.clone()).await;
     publish_event_except(sys, EventChannel::Jobs, payload, client_id).await;
@@ -3681,6 +4222,29 @@ async fn handle_command_with_scope(
             }
         }
 
+        ResolvedCommand::CancelExecution { id } => {
+            let runtime = SchedulerRuntime::new(db, config, sys);
+            let result = if let Some(job_id) = parse_job_id(&id) {
+                cancel_job_execution(job_id, state, runtime).await
+            } else if let Some(chain_id) = parse_chain_id(&id) {
+                cancel_chain_execution(chain_id, state, runtime).await
+            } else if let Some(script_id) = parse_script_id(&id) {
+                cancel_script_execution(script_id, state, runtime).await
+            } else {
+                return ResponsePayload::err(
+                    error_code::INVALID_REQUEST,
+                    format!("unsupported execution id {id}; expected J<n>, CH<n>, or R<n>"),
+                );
+            };
+            match result {
+                Ok(()) => ResponsePayload::ack(),
+                Err(message) if message.ends_with("not found") => {
+                    ResponsePayload::err(error_code::NOT_FOUND, message)
+                }
+                Err(message) => ResponsePayload::err(error_code::INTERNAL, message),
+            }
+        }
+
         ResolvedCommand::RemoveCron { id } => {
             let Some(cid) = parse_cron_id(&id) else {
                 return ResponsePayload::err(
@@ -3927,7 +4491,7 @@ async fn handle_command_with_scope(
             }
             let text = format_snapshot_env(&snapshot);
             let (text, truncated) = limit_text(text, None, tail_bytes);
-            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
+            text_output_response(text, truncated)
         }
 
         ResolvedCommand::Help { topic } => {
@@ -4145,7 +4709,7 @@ async fn handle_command_with_scope(
             }
             let text = format_log_text(state, id.as_deref());
             let (text, truncated) = limit_text(text, limit, tail_bytes);
-            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
+            text_output_response(text, truncated)
         }
 
         ResolvedCommand::Scope { subcommand } => {
@@ -4176,7 +4740,7 @@ async fn handle_command_with_scope(
             }
             let text = format_config_text(config);
             let (text, truncated) = limit_text(text, None, tail_bytes);
-            ResponsePayload::Ok(OkPayload::TextOutput { text, truncated })
+            text_output_response(text, truncated)
         }
     }
 }
@@ -4291,6 +4855,7 @@ async fn ensure_test_session(state: &mut SchedulerState, _sys: &ActorSystem, cli
         session_id,
         SessionState {
             scope: ScopeHash([0; 32]),
+            incarnation: 1,
             defaults: LaunchDefaults::default(),
             connected_clients: 1,
             disconnected_at: None,
@@ -4354,6 +4919,11 @@ fn parse_job_id(s: &str) -> Option<JobId> {
 
 /// Parse a string like `"CH3"` into a `ChainId`.
 fn parse_chain_id(s: &str) -> Option<ChainId> {
+    s.trim().parse().ok()
+}
+
+/// Parse a string like `"R3"` into a `ScriptId`.
+fn parse_script_id(s: &str) -> Option<ScriptId> {
     s.trim().parse().ok()
 }
 
@@ -4896,6 +5466,46 @@ fn format_config_text(config: &Config) -> String {
     lines.join("\n")
 }
 
+fn encode_output(data: Vec<u8>, truncated: bool) -> StreamText {
+    match String::from_utf8(data) {
+        Ok(data) => StreamText {
+            data,
+            truncated,
+            encoding: OutputEncoding::Utf8,
+            base64: None,
+        },
+        Err(error) => {
+            let bytes = error.into_bytes();
+            StreamText {
+                data: String::from_utf8_lossy(&bytes).into_owned(),
+                truncated,
+                encoding: OutputEncoding::Base64,
+                base64: Some(BASE64_STANDARD.encode(bytes)),
+            }
+        }
+    }
+}
+
+fn output_response(id: String, data: Vec<u8>, truncated: bool) -> ResponsePayload {
+    let output = encode_output(data, truncated);
+    ResponsePayload::Ok(OkPayload::Output {
+        id,
+        data: output.data,
+        truncated: output.truncated,
+        encoding: output.encoding,
+        base64: output.base64,
+    })
+}
+
+fn text_output_response(text: String, truncated: bool) -> ResponsePayload {
+    ResponsePayload::Ok(OkPayload::TextOutput {
+        text,
+        truncated,
+        encoding: OutputEncoding::Utf8,
+        base64: None,
+    })
+}
+
 async fn read_job_output(
     sys: &ActorSystem,
     job_id: JobId,
@@ -4917,14 +5527,7 @@ async fn read_job_output(
     }
 
     match rx.await {
-        Ok(Some(snapshot)) => {
-            let text = String::from_utf8_lossy(&snapshot.data).into_owned();
-            ResponsePayload::Ok(OkPayload::Output {
-                id,
-                data: text,
-                truncated: snapshot.truncated,
-            })
-        }
+        Ok(Some(snapshot)) => output_response(id, snapshot.data, snapshot.truncated),
         Ok(None) => read_output_from_log(job_id, &id, tail_bytes).await,
         Err(_) => ResponsePayload::err(error_code::INTERNAL, "process_mgr reply dropped"),
     }
@@ -4977,14 +5580,32 @@ async fn read_job_output_pair(
     let stderr_limit = stderr_bytes.unwrap_or(crate::ring_buffer::DEFAULT_CAPACITY);
     let stdout = match read_job_output(sys, job_id, display_id, stdout_limit).await {
         ResponsePayload::Ok(OkPayload::Output {
-            data, truncated, ..
-        }) => StreamText { data, truncated },
+            data,
+            truncated,
+            encoding,
+            base64,
+            ..
+        }) => StreamText {
+            data,
+            truncated,
+            encoding,
+            base64,
+        },
         error => return error,
     };
     let stderr = match read_job_stderr(sys, job_id, display_id, stderr_limit).await {
         ResponsePayload::Ok(OkPayload::Output {
-            data, truncated, ..
-        }) => StreamText { data, truncated },
+            data,
+            truncated,
+            encoding,
+            base64,
+            ..
+        }) => StreamText {
+            data,
+            truncated,
+            encoding,
+            base64,
+        },
         error => return error,
     };
     let stderr_pty_merged = stderr
@@ -5025,14 +5646,7 @@ async fn read_job_stderr(
             pty_merged: false,
             data,
             truncated,
-        })) => {
-            let text = String::from_utf8_lossy(&data).into_owned();
-            ResponsePayload::Ok(OkPayload::Output {
-                id,
-                data: text,
-                truncated,
-            })
-        }
+        })) => output_response(id, data, truncated),
         // Live PTY job: streams are merged — fall back to combined log with notice.
         Ok(Some(StderrSnapshot {
             pty_merged: true, ..
@@ -5045,8 +5659,26 @@ async fn read_job_stderr(
 
 /// Prepend a PTY-merged notice to an `Output` response.
 fn prepend_pty_notice(mut resp: ResponsePayload) -> ResponsePayload {
-    if let ResponsePayload::Ok(OkPayload::Output { ref mut data, .. }) = resp {
-        *data = format!("[PTY: stdout and stderr are merged]\n{data}");
+    if let ResponsePayload::Ok(OkPayload::Output {
+        ref mut data,
+        ref mut encoding,
+        ref mut base64,
+        ..
+    }) = resp
+    {
+        const NOTICE: &[u8] = b"[PTY: stdout and stderr are merged]\n";
+        if *encoding == OutputEncoding::Base64 {
+            let mut bytes = NOTICE.to_vec();
+            if let Some(encoded) = base64.as_deref()
+                && let Ok(decoded) = BASE64_STANDARD.decode(encoded)
+            {
+                bytes.extend_from_slice(&decoded);
+            }
+            *data = String::from_utf8_lossy(&bytes).into_owned();
+            *base64 = Some(BASE64_STANDARD.encode(bytes));
+        } else {
+            *data = format!("{}{}", String::from_utf8_lossy(NOTICE), data);
+        }
     }
     resp
 }
@@ -5079,13 +5711,7 @@ async fn read_stderr_from_log(
     })
     .await;
     match stderr_data {
-        Ok(Ok(LogTail { data, truncated })) => {
-            return ResponsePayload::Ok(OkPayload::Output {
-                id,
-                data: String::from_utf8_lossy(&data).into_owned(),
-                truncated,
-            });
-        }
+        Ok(Ok(LogTail { data, truncated })) => return output_response(id, data, truncated),
         Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
         Ok(Err(error)) => return output_log_error_response(&id, error),
         Err(error) => {
@@ -5105,12 +5731,7 @@ async fn read_stderr_from_log(
     .await
     {
         Ok(Ok(LogTail { data, truncated })) => {
-            let body = String::from_utf8_lossy(&data).into_owned();
-            ResponsePayload::Ok(OkPayload::Output {
-                id: id2,
-                data: format!("[PTY: stdout and stderr are merged]\n{body}"),
-                truncated,
-            })
+            prepend_pty_notice(output_response(id2, data, truncated))
         }
         Ok(Err(error)) if error.kind() == io::ErrorKind::NotFound => {
             ResponsePayload::err(error_code::NOT_FOUND, format!("no output found for {id}"))
@@ -5146,11 +5767,7 @@ fn read_log_tail(path: std::path::PathBuf, tail_bytes: usize) -> io::Result<LogT
 
 fn output_from_log_result(id: String, result: io::Result<LogTail>) -> ResponsePayload {
     match result {
-        Ok(LogTail { data, truncated }) => ResponsePayload::Ok(OkPayload::Output {
-            id,
-            data: String::from_utf8_lossy(&data).into_owned(),
-            truncated,
-        }),
+        Ok(LogTail { data, truncated }) => output_response(id, data, truncated),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             ResponsePayload::err(error_code::NOT_FOUND, format!("no output found for {id}"))
         }
@@ -5228,6 +5845,18 @@ mod tests {
         Arc::new(Mutex::new(
             storage::open_db(Path::new(":memory:")).expect("open test db"),
         ))
+    }
+
+    fn insert_test_scope(conn: &Arc<Mutex<Connection>>, name: &str) -> ScopeHash {
+        let scope = Scope::root(EnvSnapshot {
+            env: std::collections::BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: std::path::PathBuf::from(format!("/tmp/cue-scheduler-{name}")),
+        });
+        assert_eq!(
+            storage::insert_scope(&conn.lock().unwrap(), &scope).expect("insert test scope"),
+            storage::ScopePersistence::Persisted
+        );
+        scope.hash
     }
 
     fn test_runtime<'a>(
@@ -5375,6 +6004,25 @@ mod tests {
                         scopes.insert(hash, child);
                         let _ = reply.send(Ok(hash));
                     }
+                    ScopeStoreMsg::GarbageCollect { roots, reply } => {
+                        let mut reachable = HashSet::new();
+                        let mut pending = roots.into_iter().collect::<Vec<_>>();
+                        while let Some(hash) = pending.pop() {
+                            if !reachable.insert(hash) {
+                                continue;
+                            }
+                            if let Some(parent) = scopes.get(&hash).and_then(|scope| scope.parent) {
+                                pending.push(parent);
+                            }
+                        }
+                        let before = scopes.len();
+                        scopes.retain(|hash, _| reachable.contains(hash));
+                        let _ = reply.send(Ok(super::super::ScopeGcReport {
+                            retained: reachable.len(),
+                            removed_cached: before.saturating_sub(scopes.len()),
+                            removed_persisted: 0,
+                        }));
+                    }
                     ScopeStoreMsg::ListScopes { reply } => {
                         let mut infos = scopes
                             .values()
@@ -5437,6 +6085,143 @@ mod tests {
                 .collect(),
             cwd: std::env::current_dir().expect("current dir"),
         }
+    }
+
+    #[test]
+    fn scope_gc_roots_cover_live_and_retained_scheduler_state() {
+        let hashes = (1u8..=8)
+            .map(|byte| ScopeHash([byte; 32]))
+            .collect::<Vec<_>>();
+        let mut state = SchedulerState::new();
+        state.sessions.insert(
+            "session".into(),
+            SessionState {
+                scope: hashes[0],
+                incarnation: 1,
+                defaults: LaunchDefaults::default(),
+                connected_clients: 1,
+                disconnected_at: None,
+            },
+        );
+        state.chains.insert(
+            ChainId(1),
+            ChainState {
+                node: leaf("echo chain"),
+                leaf_jobs: HashMap::new(),
+                leaf_status: HashMap::new(),
+                scope_hash: hashes[1],
+                pipeline_text: "echo chain".into(),
+                process: ProcessJobContext {
+                    cwd_override: None,
+                    launch: LaunchOptions::default(),
+                    wrapper_enabled: false,
+                    pty_default: false,
+                    direct_output_client: None,
+                },
+                scope_enabled: false,
+            },
+        );
+        state.jobs.insert(
+            JobId(1),
+            JobEntry {
+                job_id: JobId(1),
+                pipeline_text: "echo retained".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(hashes[2]),
+                end_scope: Some(hashes[3]),
+                open_hint: JobOpenHint::Stream,
+                chain_id: None,
+                chain_index: None,
+                chain_total: None,
+                pending_reason: None,
+            },
+        );
+        state.crons.insert(
+            CronId(1),
+            CronEntry {
+                cron_id: CronId(1),
+                schedule: parse_schedule_text("every 1m").expect("valid schedule"),
+                chain: leaf("echo cron"),
+                scope_hash: hashes[4],
+                status: CronStatus::Paused,
+                next_trigger: Instant::now(),
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+            },
+        );
+        state.pending_scripts.insert(
+            ScriptId(1),
+            PendingScriptRun {
+                client_id: 1,
+                script_id: ScriptId(1),
+                mode: Mode::Job,
+                source: ScriptSource::Inline,
+                items: VecDeque::new(),
+                next_index: 0,
+                item_scope: hashes[5],
+                created_items: Vec::new(),
+                last_exit_code: 0,
+                waiting_index: None,
+            },
+        );
+        state.completed_chains.insert(
+            ChainId(2),
+            ChainCompletion {
+                exit_code: 0,
+                end_scope: Some(hashes[6]),
+            },
+        );
+        state.pending_resource.insert(
+            JobId(2),
+            PendingResourceAdmission {
+                plan: match leaf("echo resource") {
+                    ChainNode::Leaf(plan) => plan,
+                    _ => unreachable!("leaf helper returns a leaf"),
+                },
+                base_scope: hashes[7],
+                options: ProcessJobOptions {
+                    cwd_override: None,
+                    sandbox: None,
+                    wrapper_enabled: false,
+                    pty_enabled: false,
+                    direct_output_client: None,
+                },
+                needs: Need::new(),
+            },
+        );
+
+        assert_eq!(scope_gc_roots(&state), hashes.into_iter().collect());
+    }
+
+    #[test]
+    fn session_ttl_sweep_reports_removed_roots() {
+        let mut state = SchedulerState::new();
+        state.sessions.insert(
+            "expired".into(),
+            SessionState {
+                scope: ScopeHash([1; 32]),
+                incarnation: 1,
+                defaults: LaunchDefaults::default(),
+                connected_clients: 0,
+                disconnected_at: Instant::now().checked_sub(SESSION_GC_TTL),
+            },
+        );
+        state.sessions.insert(
+            "connected".into(),
+            SessionState {
+                scope: ScopeHash([2; 32]),
+                incarnation: 2,
+                defaults: LaunchDefaults::default(),
+                connected_clients: 1,
+                disconnected_at: None,
+            },
+        );
+
+        assert_eq!(sweep_disconnected_sessions(&mut state), 1);
+        assert!(!state.sessions.contains_key("expired"));
+        assert!(state.sessions.contains_key("connected"));
     }
 
     #[tokio::test]
@@ -5531,7 +6316,7 @@ mod tests {
         .expect("ordinary reconnect reuses session");
 
         assert_eq!(reconnected, initial);
-        let snapshot = get_scope_snapshot_by_hash(&sys, reconnected)
+        let snapshot = get_scope_snapshot_by_hash(&sys, reconnected.scope)
             .await
             .expect("scope snapshot");
         assert_eq!(
@@ -5539,6 +6324,62 @@ mod tests {
             Some("24")
         );
         assert_eq!(state.sessions["sticky-session"].connected_clients, 1);
+    }
+
+    #[tokio::test]
+    async fn session_id_gets_new_incarnation_after_ttl_gc() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let mut state = SchedulerState::new();
+        let first = connect_session(
+            7,
+            "reused-session".into(),
+            test_handshake_snapshot(),
+            false,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("first incarnation");
+        disconnect_session(7, &mut state);
+        state
+            .sessions
+            .get_mut("reused-session")
+            .unwrap()
+            .disconnected_at = Instant::now().checked_sub(SESSION_GC_TTL);
+        assert_eq!(sweep_disconnected_sessions(&mut state), 1);
+
+        let second = connect_session(
+            8,
+            "reused-session".into(),
+            test_handshake_snapshot(),
+            false,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect("second incarnation");
+        assert_ne!(first.incarnation, second.incarnation);
+    }
+
+    #[tokio::test]
+    async fn session_incarnation_exhaustion_fails_closed() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, _ss_rx, _eb_rx) = test_actor_system();
+        let mut state = SchedulerState::new();
+        state.next_session_incarnation = u64::MAX;
+
+        let error = connect_session(
+            7,
+            "exhausted-session".into(),
+            test_handshake_snapshot(),
+            false,
+            &mut state,
+            &sys,
+        )
+        .await
+        .expect_err("incarnation reuse must fail closed");
+        assert!(error.to_string().contains("incarnation space exhausted"));
+        assert!(!state.sessions.contains_key("exhausted-session"));
     }
 
     #[tokio::test]
@@ -5569,9 +6410,9 @@ mod tests {
         .expect("explicit refresh replaces session scope");
 
         assert_ne!(refreshed, initial);
-        assert_eq!(state.client_scope(7), Some(refreshed));
+        assert_eq!(state.client_scope(7), Some(refreshed.scope));
         assert_eq!(state.sessions["refreshable-session"].connected_clients, 1);
-        let snapshot = get_scope_snapshot_by_hash(&sys, refreshed)
+        let snapshot = get_scope_snapshot_by_hash(&sys, refreshed.scope)
             .await
             .expect("refreshed scope snapshot");
         assert_eq!(
@@ -7002,6 +7843,22 @@ mod tests {
 
         let second = drain_spawn_jobs(&mut pm_rx).await;
         assert_eq!(second.len(), 1);
+        match recv_gateway_msg(&mut gw_rx).await {
+            GatewayMsg::SendEvent {
+                client_id,
+                payload: EventPayload::ScriptItemCreated { script_id, item },
+            } => {
+                assert_eq!(client_id, 42);
+                assert_eq!(script_id, "R1");
+                assert_eq!(item.index, 1);
+                assert_eq!(item.source, "echo two");
+                assert!(matches!(
+                    item.result,
+                    ScriptItemResult::Job { ref job_id, .. } if job_id == "J2"
+                ));
+            }
+            _ => panic!("expected authoritative script item event"),
+        }
         handle_job_finished(second[0], 0, &mut state, &conn, &sys).await;
         advance_pending_scripts_after_terminal_job(
             second[0],
@@ -7381,6 +8238,7 @@ mod tests {
         spawn_fake_scope_store(ss_rx);
 
         let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "guardrail-cron");
         let config = Config::default();
         let mut state = SchedulerState::new();
         state.crons.insert(
@@ -7389,7 +8247,7 @@ mod tests {
                 cron_id: CronId(1),
                 schedule: CronSchedule::Delay(std::time::Duration::from_secs(1)),
                 chain: leaf("git commit --no-verify"),
-                scope_hash: ScopeHash([0; 32]),
+                scope_hash,
                 status: CronStatus::Scheduled,
                 next_trigger: Instant::now(),
                 cwd_override: None,
@@ -7411,6 +8269,7 @@ mod tests {
         spawn_fake_scope_store(ss_rx);
 
         let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "spawn-failure-cron");
         let config = Config::default();
         let mut state = SchedulerState::new();
         state.crons.insert(
@@ -7419,7 +8278,7 @@ mod tests {
                 cron_id: CronId(1),
                 schedule: CronSchedule::Delay(std::time::Duration::from_secs(1)),
                 chain: leaf("echo due"),
-                scope_hash: ScopeHash([0; 32]),
+                scope_hash,
                 status: CronStatus::Scheduled,
                 next_trigger: Instant::now(),
                 cwd_override: None,
@@ -7880,6 +8739,16 @@ mod tests {
     }
 
     #[test]
+    fn buffered_binary_output_keeps_exact_base64_and_explicit_encoding() {
+        let encoded = encode_output(vec![0xff, b'b', b'i', b'n'], true);
+
+        assert_eq!(encoded.encoding, OutputEncoding::Base64);
+        assert_eq!(encoded.base64.as_deref(), Some("/2Jpbg=="));
+        assert_eq!(encoded.data, "�bin");
+        assert!(encoded.truncated);
+    }
+
+    #[test]
     fn log_result_reports_missing_output_only_for_not_found() {
         let missing = output_from_log_result(
             "J7".into(),
@@ -7946,6 +8815,7 @@ mod tests {
     #[test]
     fn restore_jobs_resumes_next_job_id() {
         let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "restored-job");
         let guard = conn.lock().unwrap();
         storage::upsert_job_history(
             &guard,
@@ -7954,8 +8824,8 @@ mod tests {
                 pipeline: "cargo test".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
-                start_scope: Some(ScopeHash([3; 32])),
-                end_scope: Some(ScopeHash([3; 32])),
+                start_scope: Some(scope_hash),
+                end_scope: Some(scope_hash),
                 chain_id: None,
                 stderr: String::new(),
             },
@@ -8020,6 +8890,7 @@ mod tests {
     #[test]
     fn restore_crons_resumes_next_cron_id() {
         let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "restored-cron");
         let guard = conn.lock().unwrap();
         storage::upsert_cron(
             &guard,
@@ -8028,7 +8899,7 @@ mod tests {
                 schedule: "every 5m".into(),
                 command: "echo hello".into(),
                 status: CronStatus::Scheduled,
-                scope_hash: Some(ScopeHash([5; 32])),
+                scope_hash: Some(scope_hash),
                 cwd_override: Some(std::path::PathBuf::from("/tmp/cue-cron-cwd")),
                 scope_enabled: true,
                 wrapper_enabled: true,
@@ -8056,6 +8927,7 @@ mod tests {
     #[test]
     fn restore_crons_expires_overdue_enabled_one_shot() {
         let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "overdue-cron");
         let guard = conn.lock().unwrap();
         storage::upsert_cron(
             &guard,
@@ -8064,7 +8936,7 @@ mod tests {
                 schedule: "in 1s".into(),
                 command: "echo late".into(),
                 status: CronStatus::Scheduled,
-                scope_hash: Some(ScopeHash([8; 32])),
+                scope_hash: Some(scope_hash),
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
@@ -8096,6 +8968,7 @@ mod tests {
     #[test]
     fn restore_crons_preserves_fresh_subsecond_one_shot() {
         let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "fresh-cron");
         let guard = conn.lock().unwrap();
         storage::upsert_cron(
             &guard,
@@ -8104,7 +8977,7 @@ mod tests {
                 schedule: "in 500ms".into(),
                 command: "echo soon".into(),
                 status: CronStatus::Scheduled,
-                scope_hash: Some(ScopeHash([8; 32])),
+                scope_hash: Some(scope_hash),
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
@@ -8128,6 +9001,7 @@ mod tests {
     #[test]
     fn restore_crons_expires_millisecond_overdue_one_shot() {
         let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "millisecond-overdue-cron");
         let guard = conn.lock().unwrap();
         storage::upsert_cron(
             &guard,
@@ -8136,7 +9010,7 @@ mod tests {
                 schedule: "in 1500ms".into(),
                 command: "echo late".into(),
                 status: CronStatus::Scheduled,
-                scope_hash: Some(ScopeHash([8; 32])),
+                scope_hash: Some(scope_hash),
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
@@ -8159,6 +9033,32 @@ mod tests {
 
         assert_eq!(state.crons.len(), 1);
         assert_eq!(state.crons[&CronId(1)].status, CronStatus::Expired);
+    }
+
+    #[test]
+    fn restore_crons_skips_paused_cron_with_removed_sensitive_scope() {
+        let conn = test_db();
+        storage::upsert_cron(
+            &conn.lock().unwrap(),
+            &storage::StoredCron {
+                id: "C1".into(),
+                schedule: "every 5m".into(),
+                command: "echo secret".into(),
+                status: CronStatus::Paused,
+                scope_hash: None,
+                cwd_override: None,
+                scope_enabled: true,
+                wrapper_enabled: false,
+            },
+        )
+        .unwrap();
+
+        let mut state = SchedulerState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(restore_crons(&conn, &mut state)).unwrap();
+
+        assert!(state.crons.is_empty());
+        assert_eq!(state.next_cron, 2);
     }
 
     #[test]

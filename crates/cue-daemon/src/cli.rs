@@ -11,6 +11,8 @@
 //!   `cued upgrade`                           — self-update from GitHub Releases
 
 use std::ffi::OsString;
+use std::fs::File;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -56,6 +58,13 @@ enum PidFileState {
     Running(u32),
     Dead(u32),
     Malformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonRuntimePaths {
+    socket: PathBuf,
+    pid: PathBuf,
+    lock: PathBuf,
 }
 
 fn socket_arg() -> impl bpaf::Parser<Option<PathBuf>> {
@@ -185,7 +194,7 @@ pub(crate) fn run() -> i32 {
 // ── Start ──
 
 fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<()> {
-    let socket_path = daemon_socket_path(socket_override.as_deref())?;
+    let paths = daemon_runtime_paths(socket_override.as_deref())?;
 
     if force {
         // When the service manager owns cued, delegate restart to it rather than
@@ -196,13 +205,15 @@ fn run_start(fg: bool, force: bool, socket_override: Option<PathBuf>) -> Result<
             println!("cued: daemon restarted");
             return Ok(());
         }
-        force_stop_if_running(&socket_path)?;
+        force_stop_if_running_with_pid_path(&paths.pid, &paths.socket, &paths.lock)?;
     } else {
-        ensure_not_running(&socket_path)?;
+        // This is only a fast preflight. The foreground process repeats the
+        // liveness check and any stale cleanup while holding `paths.lock`.
+        ensure_socket_not_live(&paths.socket, "startup preflight")?;
     }
 
     if fg {
-        return run_start_foreground(socket_override);
+        return run_start_foreground(paths);
     }
 
     run_start_background(socket_override)
@@ -261,33 +272,41 @@ fn run_start_background(socket_override: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn run_start_foreground(socket_override: Option<PathBuf>) -> Result<()> {
+fn run_start_foreground(paths: DaemonRuntimePaths) -> Result<()> {
     init_stderr_tracing("info")?;
-
-    let pid_path = crate::dirs::pid_path();
-    let socket_path = daemon_socket_path(socket_override.as_deref())?;
 
     // Ensure directories exist.
     crate::dirs::ensure_dirs().context("create directories")?;
 
+    // Hold the socket-specific lock for the entire daemon lifetime. All stale
+    // marker cleanup happens only after this succeeds, closing the check/bind
+    // race between concurrent foreground starts.
+    let _instance_lock = acquire_instance_lock(&paths.lock)?;
+    ensure_not_running_with_pid_path(&paths.pid, &paths.socket)?;
+
     // Write PID file.
-    std::fs::write(&pid_path, format!("{}", std::process::id()))
-        .with_context(|| format!("write PID file {}", pid_path.display()))?;
+    let owner_pid = std::process::id();
+    crate::dirs::write_private_file(&paths.pid, owner_pid.to_string().as_bytes())
+        .with_context(|| format!("write PID file {}", paths.pid.display()))?;
 
     info!(
         version = crate::version(),
-        pid = std::process::id(),
-        socket = %socket_path.display(),
+        pid = owner_pid,
+        socket = %paths.socket.display(),
         "cued starting"
     );
 
     // Build Tokio runtime and run the async entry point.
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
-    let result = rt.block_on(async_main(socket_path.clone()));
+    let result = rt.block_on(async_main(paths.socket.clone()));
     rt.shutdown_timeout(Duration::from_secs(2));
 
-    // Cleanup.
-    cleanup(&pid_path, &socket_path);
+    // Cleanup while the instance lock is still held. A failed bind must never
+    // unlink a socket that belongs to another process.
+    cleanup_owned_pid_file(&paths.pid, owner_pid);
+    if result.is_ok() {
+        cleanup_runtime_file(&paths.socket, "socket");
+    }
     if result.is_ok() {
         info!("cued stopped");
     }
@@ -335,11 +354,6 @@ async fn async_main(socket_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cleanup(pid_path: &Path, socket_path: &Path) {
-    cleanup_runtime_file(pid_path, "PID file");
-    cleanup_runtime_file(socket_path, "socket");
-}
-
 // ── Stop ──
 
 fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
@@ -352,6 +366,7 @@ fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
 
         let msg = cue_core::ipc::Message::Request {
             id: 0,
+            operation_id: None,
             payload: cue_core::ipc::RequestPayload::Shutdown {},
         };
         crate::actor::gateway::write_message(&mut stream, &msg).await?;
@@ -379,12 +394,11 @@ fn run_stop(socket_override: Option<PathBuf>) -> Result<()> {
 // ── Status ──
 
 fn run_status(socket_override: Option<PathBuf>) -> Result<()> {
-    let pid_path = crate::dirs::pid_path();
-    let socket_path = daemon_socket_path(socket_override.as_deref())?;
+    let paths = daemon_runtime_paths(socket_override.as_deref())?;
 
     println!(
         "{}",
-        daemon_status_message(&pid_path, &socket_path, is_process_alive, daemon_ready)?
+        daemon_status_message(&paths.pid, &paths.socket, is_process_alive, daemon_ready)?
     );
     Ok(())
 }
@@ -490,6 +504,15 @@ fn daemon_socket_path(socket_override: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+fn daemon_runtime_paths(socket_override: Option<&Path>) -> Result<DaemonRuntimePaths> {
+    let socket = daemon_socket_path(socket_override)?;
+    Ok(DaemonRuntimePaths {
+        pid: crate::dirs::pid_path_for_socket(&socket),
+        lock: crate::dirs::lock_path_for_socket(&socket),
+        socket,
+    })
+}
+
 fn validate_daemon_socket_path(field: &str, path: &Path) -> Result<()> {
     let Some(path) = path.to_str() else {
         anyhow::bail!("{field} must be valid UTF-8");
@@ -538,72 +561,115 @@ fn default_env_filter(default_directive: &str) -> Result<tracing_subscriber::Env
         .with_context(|| format!("parse default tracing directive `{default_directive}`"))
 }
 
+fn acquire_instance_lock(lock_path: &Path) -> Result<File> {
+    let file = crate::dirs::open_private_read_write(lock_path)
+        .with_context(|| format!("open daemon lock {}", lock_path.display()))?;
+    // SAFETY: `file` owns a valid descriptor for the full duration of the
+    // call, and the returned `File` keeps the successful advisory lock alive.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(file);
+    }
+
+    let error = std::io::Error::last_os_error();
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::AlreadyExists
+    ) {
+        anyhow::bail!(
+            "another cued instance is starting or running (lock {})",
+            lock_path.display()
+        );
+    }
+    Err(error).with_context(|| format!("lock daemon instance {}", lock_path.display()))
+}
+
 /// Kill any running daemon and wait for it to exit (used by `--force`).
-fn force_stop_if_running(socket_path: &Path) -> Result<()> {
-    let pid_path = crate::dirs::pid_path();
-    force_stop_if_running_with_pid_path(&pid_path, socket_path)
-}
-
-fn force_stop_if_running_with_pid_path(pid_path: &Path, socket_path: &Path) -> Result<()> {
-    let pid = match inspect_pid_file(pid_path)? {
-        PidFileState::Missing => {
-            ensure_socket_not_live(socket_path, "PID file is missing")?;
-            remove_runtime_file(socket_path, "stale socket")?;
-            return Ok(());
+fn force_stop_if_running_with_pid_path(
+    pid_path: &Path,
+    socket_path: &Path,
+    lock_path: &Path,
+) -> Result<()> {
+    let pid_state = inspect_pid_file(pid_path)?;
+    if !daemon_ready(socket_path) {
+        if let PidFileState::Running(pid) = pid_state {
+            anyhow::bail!(
+                "refusing --force: PID marker {} names live pid {pid}, but socket {} cannot be confirmed as cued",
+                pid_path.display(),
+                socket_path.display()
+            );
         }
-        PidFileState::Malformed => {
-            remove_stale_daemon_markers(pid_path, socket_path, "PID file is malformed")?;
-            return Ok(());
-        }
-        PidFileState::Dead(pid) => {
-            remove_stale_daemon_markers(
-                pid_path,
-                socket_path,
-                &format!("PID file points to dead pid {pid}"),
-            )?;
-            return Ok(());
-        }
-        PidFileState::Running(pid) => pid,
-    };
-
-    terminate_running_daemon(pid, pid_path, socket_path)
-}
-
-fn terminate_running_daemon(pid: u32, pid_path: &Path, socket_path: &Path) -> Result<()> {
-    if !is_process_alive(pid) {
-        remove_stale_daemon_markers(
-            pid_path,
-            socket_path,
-            &format!("PID file points to dead pid {pid}"),
-        )?;
         return Ok(());
     }
 
-    println!("cued: sending SIGTERM to pid {pid}");
-    // SAFETY: standard POSIX signal.
-    let rc = unsafe { libc_kill(pid as i32, 15) }; // 15 = SIGTERM
-    if rc != 0 {
-        anyhow::bail!("failed to send SIGTERM to pid {pid}");
-    }
-
-    // Poll for up to 5 s.
+    request_confirmed_shutdown(socket_path)?;
     for _ in 0..50 {
-        std::thread::sleep(Duration::from_millis(100));
-        if !is_process_alive(pid) {
+        if !daemon_ready(socket_path)
+            && let Ok(lock) = acquire_instance_lock(lock_path)
+        {
+            drop(lock);
             println!("cued: previous daemon stopped");
-            remove_daemon_markers(pid_path, socket_path)?;
             return Ok(());
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     anyhow::bail!(
-        "cued: pid {pid} did not exit within 5 s after SIGTERM; try `kill -9 {pid}` manually"
+        "confirmed cued daemon on {} did not release its socket and lock within 5 s",
+        socket_path.display()
     );
 }
 
-fn ensure_not_running(socket_path: &Path) -> Result<()> {
-    let pid_path = crate::dirs::pid_path();
-    ensure_not_running_with_pid_path(&pid_path, socket_path)
+fn request_confirmed_shutdown(socket_path: &Path) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("create shutdown confirmation runtime")?;
+    rt.block_on(async {
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::UnixStream::connect(socket_path),
+        )
+        .await
+        .context("time out connecting to candidate daemon")?
+        .with_context(|| format!("connect to {}", socket_path.display()))?;
+
+        let ping = cue_core::ipc::Message::Request {
+            id: 0,
+            operation_id: None,
+            payload: cue_core::ipc::RequestPayload::Ping {},
+        };
+        crate::actor::gateway::write_message(&mut stream, &ping).await?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::actor::gateway::read_message(&mut stream),
+        )
+        .await
+        .context("time out confirming candidate daemon")??;
+        anyhow::ensure!(
+            matches!(
+                response,
+                cue_core::ipc::Message::Response {
+                    id: 0,
+                    payload: cue_core::ipc::ResponsePayload::Ok(
+                        cue_core::ipc::OkPayload::Pong { .. }
+                    )
+                }
+            ),
+            "refusing --force: socket {} did not return a cued Pong",
+            socket_path.display()
+        );
+
+        let shutdown = cue_core::ipc::Message::Request {
+            id: 1,
+            operation_id: None,
+            payload: cue_core::ipc::RequestPayload::Shutdown {},
+        };
+        crate::actor::gateway::write_message(&mut stream, &shutdown).await?;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::actor::gateway::read_message(&mut stream),
+        )
+        .await;
+        Ok(())
+    })
 }
 
 fn ensure_not_running_with_pid_path(pid_path: &Path, socket_path: &Path) -> Result<()> {
@@ -729,16 +795,6 @@ fn daemon_status_message(
     Ok(message)
 }
 
-fn remove_daemon_markers(pid_path: &Path, socket_path: &Path) -> Result<()> {
-    remove_runtime_file(pid_path, "stale PID file")?;
-    remove_runtime_file(socket_path, "stale socket")?;
-    Ok(())
-}
-
-fn remove_stale_daemon_markers(pid_path: &Path, socket_path: &Path, reason: &str) -> Result<()> {
-    remove_stale_daemon_markers_with_ready(pid_path, socket_path, reason, daemon_ready)
-}
-
 fn remove_stale_daemon_markers_with_ready(
     pid_path: &Path,
     socket_path: &Path,
@@ -746,7 +802,8 @@ fn remove_stale_daemon_markers_with_ready(
     daemon_is_ready: impl Fn(&Path) -> bool,
 ) -> Result<()> {
     ensure_socket_not_live_with(socket_path, reason, daemon_is_ready)?;
-    remove_daemon_markers(pid_path, socket_path)
+    remove_runtime_file(pid_path, "stale PID file")?;
+    remove_runtime_file(socket_path, "stale socket")
 }
 
 fn ensure_socket_not_live(socket_path: &Path, reason: &str) -> Result<()> {
@@ -777,6 +834,35 @@ fn cleanup_runtime_file(path: &Path, label: &str) {
             "failed to remove cued runtime file"
         );
     }
+}
+
+fn cleanup_owned_pid_file(pid_path: &Path, owner_pid: u32) {
+    match std::fs::read_to_string(pid_path) {
+        Ok(contents) if contents.trim().parse::<u32>() == Ok(owner_pid) => {
+            cleanup_runtime_file(pid_path, "PID file");
+        }
+        Ok(contents) => {
+            warn_owned_pid_mismatch(pid_path, owner_pid, contents.trim());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            error!(
+                %error,
+                path = %pid_path.display(),
+                owner_pid,
+                "failed to inspect cued PID file during cleanup"
+            );
+        }
+    }
+}
+
+fn warn_owned_pid_mismatch(pid_path: &Path, owner_pid: u32, found: &str) {
+    tracing::warn!(
+        path = %pid_path.display(),
+        owner_pid,
+        found,
+        "leaving PID file not owned by this daemon"
+    );
 }
 
 fn remove_runtime_file(path: &Path, label: &str) -> Result<()> {
@@ -958,6 +1044,73 @@ mod tests {
         let path = dir.join("cued.sock");
 
         remove_runtime_file(&path, "socket").expect("missing file is clean");
+
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn custom_socket_derives_isolated_runtime_markers() {
+        let socket = PathBuf::from("/tmp/cue-custom/worker.sock");
+        let paths = daemon_runtime_paths(Some(&socket)).expect("derive daemon paths");
+
+        assert_eq!(paths.socket, socket);
+        assert_eq!(
+            paths.pid,
+            PathBuf::from("/tmp/cue-custom/worker.sock.cued.pid")
+        );
+        assert_eq!(
+            paths.lock,
+            PathBuf::from("/tmp/cue-custom/worker.sock.cued.lock")
+        );
+        assert_ne!(
+            paths.pid,
+            crate::dirs::pid_path_for_socket(&crate::dirs::socket_path())
+        );
+    }
+
+    #[test]
+    fn instance_lock_allows_only_one_holder() {
+        let dir = make_temp_dir();
+        let lock_path = dir.join("cued.lock");
+        let first = acquire_instance_lock(&lock_path).expect("acquire first lock");
+
+        let error = acquire_instance_lock(&lock_path).expect_err("second lock must fail");
+        assert!(error.to_string().contains("another cued instance"));
+
+        drop(first);
+        acquire_instance_lock(&lock_path).expect("lock is released when owner drops");
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn pid_cleanup_removes_only_the_current_daemon_marker() {
+        let dir = make_temp_dir();
+        let pid_path = dir.join("cued.pid");
+        let owner = std::process::id();
+
+        std::fs::write(&pid_path, (owner + 1).to_string()).expect("write foreign marker");
+        cleanup_owned_pid_file(&pid_path, owner);
+        assert!(pid_path.exists(), "foreign PID marker must be preserved");
+
+        std::fs::write(&pid_path, owner.to_string()).expect("write owned marker");
+        cleanup_owned_pid_file(&pid_path, owner);
+        assert!(!pid_path.exists(), "owned PID marker should be removed");
+
+        std::fs::remove_dir_all(dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn force_fails_closed_for_live_pid_without_confirmed_socket() {
+        let dir = make_temp_dir();
+        let socket = dir.join("cued.sock");
+        let pid_path = crate::dirs::pid_path_for_socket(&socket);
+        let lock_path = crate::dirs::lock_path_for_socket(&socket);
+        std::fs::write(&pid_path, std::process::id().to_string()).expect("write live PID marker");
+
+        let error = force_stop_if_running_with_pid_path(&pid_path, &socket, &lock_path)
+            .expect_err("unconfirmed live PID must never be signalled");
+        assert!(format!("{error:#}").contains("refusing --force"));
+        assert!(pid_path.exists(), "fail-closed force must preserve marker");
 
         std::fs::remove_dir_all(dir).expect("remove temp dir");
     }

@@ -193,6 +193,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::RunScript { path, input },
+                ..
             } => {
                 assert_eq!(id, 1);
                 assert_eq!(path, "fast.cue");

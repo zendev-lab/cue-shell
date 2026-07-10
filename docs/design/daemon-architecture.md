@@ -129,6 +129,9 @@ State: subscriber registry (Gateway handles per-client routing)
     requester; the output channel remains available for other subscribed clients
     without echoing the same chunks back to the requester
 - **Active state**: running Jobs, Chains, Scripts, and Crons (in respective Actors)
+  - File-script items created after the initial response send an authoritative
+    `ScriptItemCreated { script_id, item }` event directly to the requester;
+    clients never infer membership from global Job IDs
   - File-script completion sends `ScriptFinished` directly to the `RunScript`
     requester and publishes the same status on the `jobs` channel for other
     observers

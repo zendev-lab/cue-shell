@@ -407,10 +407,13 @@ implementation (client + server).
 lives in `cue-client`, so CLI and TUI frontends share the same Unix/SSH
 reconnect semantics. The remaining SSH transport work is:
 
-1. **Add remote auto-start** as a best-effort step before the first connection.
-2. **Add SSH invocation options** for keepalive and user-specified flags.
-3. **Broaden integration coverage** around TUI live reconnect and SSH connector
+1. **Add SSH invocation options** for keepalive and user-specified flags.
+2. **Broaden integration coverage** around TUI live reconnect and SSH connector
    construction.
+
+Remote startup stays explicit. A failed connection must not implicitly execute a
+state-changing command on another host; `start_command` is used only by explicit
+daemon lifecycle commands.
 
 ### 2.4 TOML Configuration Schema
 
@@ -421,7 +424,7 @@ No changes needed. The existing schema already captures everything:
 transport = "ssh"
 destination = "devbox"                       # ssh(1) destination
 gateway_command = "cued gateway --stdio"     # executed on remote
-start_command = "cued start"                 # run once if daemon not found
+start_command = "cued start"                 # used by explicit lifecycle commands
 # Extra SSH options (passed via -o or prepended to command):
 # ssh_options = ["-A", "-o", "ServerAliveInterval=10"]
 ```
@@ -434,7 +437,6 @@ Proposed new optional field:
 ```toml
 [transport.profiles.devbox]
 # ...existing fields...
-auto_start = true       # attempt start_command on first ping failure (default: true)
 ssh_options = ["-A"]    # additional ssh(1) flags prepended to the invocation
 ```
 
@@ -455,12 +457,9 @@ Remaining follow-ups:
 1. **Add `ssh_options` to `SshProfile`** in
    `cue-client/src/transport_config.rs` and carry it through
    `ResolvedTransport`.
-2. **Add remote auto-start logic**: before the first `Ping`, try
-   `ssh <destination> <start_command>` once and retry the gateway connection.
-   Wrap in a timeout (e.g., 10 s) to avoid blocking reconnect loops.
-3. **Add `ServerAliveInterval` defaults or configurable keepalive options** so
+2. **Add `ServerAliveInterval` defaults or configurable keepalive options** so
    dead SSH connections are detected without waiting for TCP timeout.
-4. **Add SSH live-reconnect integration coverage** that avoids requiring a real
+3. **Add SSH live-reconnect integration coverage** that avoids requiring a real
    remote SSH server.
 
 ---
@@ -694,8 +693,8 @@ to detect* a dead connection.
 `cue-client`, and `cue-tui` can now reuse that connector for live target
 switching. The remaining high-value work is UX hardening:
 
-1. Add `ssh_options` + `auto_start` fields to cue-client transport config.
-2. Add remote auto-start and keepalive behavior.
+1. Add `ssh_options` to cue-client transport config.
+2. Add keepalive behavior without implicit remote startup.
 3. Add integration coverage for reconnecting through an SSH-shaped connector
    without requiring a real remote SSH server.
 

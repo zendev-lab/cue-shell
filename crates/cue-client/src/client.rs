@@ -130,6 +130,7 @@ impl CuedClient {
                         version,
                         protocol_version,
                         capabilities,
+                        ..
                     }),
             } if id == ping_id => {
                 if protocol_version < IPC_PROTOCOL_VERSION {
@@ -405,6 +406,13 @@ impl MultiplexedClient {
         self.call(RequestPayload::KillJob { id: id.into() }).await
     }
 
+    /// Idempotently cancel a job, chain, or script and wait for its running
+    /// child processes to stop.
+    pub async fn cancel_execution(&self, id: impl Into<String>) -> Result<ResponsePayload> {
+        self.call(RequestPayload::CancelExecution { id: id.into() })
+            .await
+    }
+
     /// Remove a cron ID only; job IDs are rejected by the daemon.
     pub async fn remove_cron(&self, id: impl Into<String>) -> Result<ResponsePayload> {
         self.call(RequestPayload::RemoveCron { id: id.into() })
@@ -524,7 +532,11 @@ async fn send_request_with_id<W>(stream: &mut W, id: u32, payload: RequestPayloa
 where
     W: AsyncWrite + Unpin,
 {
-    let msg = Message::Request { id, payload };
+    let msg = Message::Request {
+        id,
+        operation_id: None,
+        payload,
+    };
     let buf = encode_message(&msg).context("encode request")?;
     stream.write_all(&buf).await.context("write to socket")?;
     Ok(())
@@ -684,6 +696,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::Subscribe { channels },
+                ..
             } => {
                 assert_eq!(id, 1);
                 assert_eq!(channels, vec!["jobs", "output:J7"]);
@@ -707,6 +720,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::Unsubscribe { channels },
+                ..
             } => {
                 assert_eq!(id, 1);
                 assert_eq!(channels, vec!["system"]);
@@ -760,6 +774,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::Ping {},
+                ..
             } => assert_eq!(id, request_id),
             other => panic!("unexpected request: {other:?}"),
         }
@@ -796,6 +811,7 @@ mod tests {
                 Message::Request {
                     id,
                     payload: RequestPayload::Eval { input, mode },
+                    ..
                 } => {
                     assert_eq!(mode, Mode::Job);
                     request_inputs.push((id, input));
@@ -857,6 +873,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::Subscribe { channels },
+                ..
             } => {
                 assert_eq!(channels, vec!["crons", "system"]);
                 id
@@ -894,6 +911,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::Unsubscribe { channels },
+                ..
             } => {
                 assert_eq!(channels, vec!["output:J3"]);
                 id
@@ -974,6 +992,7 @@ mod tests {
             Message::Request {
                 id,
                 payload: RequestPayload::Ping {},
+                ..
             } => id,
             other => panic!("unexpected request: {other:?}"),
         };
@@ -993,6 +1012,7 @@ mod tests {
                 id: request_id,
                 payload: ResponsePayload::Ok(OkPayload::Pong {
                     version: "0.1.0".into(),
+                    instance_id: "00000000-0000-4000-8000-000000000000".into(),
                     protocol_version: IPC_PROTOCOL_VERSION,
                     capabilities: vec![IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED.into()],
                 }),

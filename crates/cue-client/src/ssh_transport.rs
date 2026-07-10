@@ -85,20 +85,24 @@ pub(crate) fn ssh_invocation(destination: &str, remote_command: &str) -> String 
 #[derive(Clone, Default)]
 struct SharedStderr(Arc<Mutex<Vec<u8>>>);
 
+const SSH_STDERR_TAIL_BYTES: usize = 64 * 1024;
+
 impl SharedStderr {
     fn push(&self, chunk: &[u8]) {
-        self.0
-            .lock()
-            .expect("ssh stderr buffer lock poisoned")
-            .extend_from_slice(chunk);
+        let mut buffer = self.0.lock().expect("ssh stderr buffer lock poisoned");
+        append_bounded_tail(&mut buffer, chunk, SSH_STDERR_TAIL_BYTES);
     }
 
     fn push_read_error(&self, error: &io::Error) {
         let mut buffer = self.0.lock().expect("ssh stderr buffer lock poisoned");
         if !buffer.is_empty() {
-            buffer.push(b'\n');
+            append_bounded_tail(&mut buffer, b"\n", SSH_STDERR_TAIL_BYTES);
         }
-        buffer.extend_from_slice(format!("failed to read ssh stderr: {error}").as_bytes());
+        append_bounded_tail(
+            &mut buffer,
+            format!("failed to read ssh stderr: {error}").as_bytes(),
+            SSH_STDERR_TAIL_BYTES,
+        );
     }
 
     fn snapshot(&self) -> String {
@@ -106,6 +110,26 @@ impl SharedStderr {
             .trim()
             .to_string()
     }
+}
+
+fn append_bounded_tail(buffer: &mut Vec<u8>, chunk: &[u8], capacity: usize) {
+    if capacity == 0 {
+        buffer.clear();
+        return;
+    }
+    if chunk.len() >= capacity {
+        buffer.clear();
+        buffer.extend_from_slice(&chunk[chunk.len() - capacity..]);
+        return;
+    }
+    let overflow = buffer
+        .len()
+        .saturating_add(chunk.len())
+        .saturating_sub(capacity);
+    if overflow > 0 {
+        buffer.drain(..overflow);
+    }
+    buffer.extend_from_slice(chunk);
 }
 
 struct SpawnedSshTransport {
@@ -347,5 +371,16 @@ mod tests {
         let detail = stderr.snapshot();
         assert!(detail.contains("partial remote stderr"));
         assert!(detail.contains("failed to read ssh stderr: stderr pipe failed"));
+    }
+
+    #[test]
+    fn stderr_capture_keeps_only_a_bounded_tail() {
+        let stderr = SharedStderr::default();
+        stderr.push(&vec![b'a'; SSH_STDERR_TAIL_BYTES + 1024]);
+        stderr.push(b"tail-marker");
+
+        let buffer = stderr.0.lock().expect("ssh stderr buffer lock poisoned");
+        assert_eq!(buffer.len(), SSH_STDERR_TAIL_BYTES);
+        assert!(buffer.ends_with(b"tail-marker"));
     }
 }

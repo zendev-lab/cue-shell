@@ -2,6 +2,7 @@
 //!
 //! Uses WAL mode for concurrent reads.  The schema is migrated on open.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,7 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use cue_core::cron::CronStatus;
 use cue_core::job::JobStatus;
-use cue_core::scope::Scope;
+use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{CronId, JobId, ScopeHash, ScriptId};
 use rusqlite::Connection;
 
@@ -38,7 +39,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -135,6 +136,10 @@ const CRON_CREATED_AT_MS_EXPR: &str = "CAST((julianday('now') - 2440587.5) * 864
 
 /// Open (or create) the database at `path`, apply WAL mode and run migrations.
 pub fn open_db(path: &Path) -> Result<Connection> {
+    if path != Path::new(":memory:") {
+        crate::dirs::ensure_private_file(path)
+            .with_context(|| format!("secure database file {}", path.display()))?;
+    }
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open database at {}", path.display()))?;
 
@@ -143,6 +148,8 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
 
     migrate(&conn)?;
+    crate::dirs::secure_database_files(path)
+        .with_context(|| format!("secure database files for {}", path.display()))?;
     Ok(conn)
 }
 
@@ -267,6 +274,20 @@ fn migrate(conn: &Connection) -> Result<()> {
         .context("failed to initialize crons.created_at_ms")?;
         set_schema_version(conn, &mut current, 14)?;
     }
+    if current < 15 {
+        let report = purge_sensitive_scope_history(conn)
+            .context("failed to purge persisted sensitive environment scopes")?;
+        if report.removed_scopes > 0 {
+            tracing::warn!(
+                removed_scopes = report.removed_scopes,
+                cleared_job_rows = report.cleared_job_rows,
+                cleared_crons = report.cleared_crons,
+                disabled_scope_crons = report.disabled_scope_crons,
+                "storage: removed persisted scopes containing sensitive environment data"
+            );
+        }
+        set_schema_version(conn, &mut current, 15)?;
+    }
     Ok(())
 }
 
@@ -276,10 +297,292 @@ fn set_schema_version(conn: &Connection, current: &mut u32, version: u32) -> Res
     Ok(())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SensitiveScopePurgeReport {
+    removed_scopes: usize,
+    cleared_job_rows: usize,
+    cleared_crons: usize,
+    disabled_scope_crons: usize,
+}
+
+#[derive(Debug)]
+struct PersistedScopeMetadata {
+    hash: Vec<u8>,
+    parent: Option<Vec<u8>>,
+    contains_sensitive_environment: bool,
+}
+
+/// Remove legacy scopes that persisted credential-like environment values.
+///
+/// Purging includes every descendant because retaining a child whose parent is
+/// absent would break the immutable scope chain. The migration deliberately
+/// inspects environment names only; values are neither classified nor logged.
+fn purge_sensitive_scope_history(conn: &Connection) -> Result<SensitiveScopePurgeReport> {
+    let scopes = {
+        let mut stmt = conn.prepare("SELECT hash, parent, delta_json, snap_json FROM scopes")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut scopes = Vec::new();
+        for row in rows {
+            let (hash, parent, delta_json, snap_json) = row?;
+            let contains_sensitive_environment = persisted_scope_has_sensitive_environment(
+                delta_json.as_deref(),
+                snap_json.as_deref(),
+            );
+            scopes.push(PersistedScopeMetadata {
+                hash,
+                parent,
+                contains_sensitive_environment,
+            });
+        }
+        scopes
+    };
+
+    let mut purged_hashes = scopes
+        .iter()
+        .filter(|scope| scope.contains_sensitive_environment)
+        .map(|scope| scope.hash.clone())
+        .collect::<HashSet<_>>();
+    loop {
+        let previous_len = purged_hashes.len();
+        for scope in &scopes {
+            if scope
+                .parent
+                .as_ref()
+                .is_some_and(|parent| purged_hashes.contains(parent))
+            {
+                purged_hashes.insert(scope.hash.clone());
+            }
+        }
+        if purged_hashes.len() == previous_len {
+            break;
+        }
+    }
+
+    if purged_hashes.is_empty() {
+        return Ok(SensitiveScopePurgeReport::default());
+    }
+
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin sensitive scope purge transaction")?;
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS sensitive_scope_purge (
+             hash BLOB PRIMARY KEY
+         ) WITHOUT ROWID;
+         DELETE FROM sensitive_scope_purge;",
+    )?;
+    for hash in &purged_hashes {
+        tx.execute(
+            "INSERT OR IGNORE INTO sensitive_scope_purge (hash) VALUES (?1)",
+            rusqlite::params![hash],
+        )?;
+    }
+
+    let cleared_job_rows = tx.execute(
+        "UPDATE jobs_history
+         SET scope_hash = CASE
+                 WHEN scope_hash IN (SELECT hash FROM sensitive_scope_purge) THEN NULL
+                 ELSE scope_hash
+             END,
+             start_scope = CASE
+                 WHEN start_scope IN (SELECT hash FROM sensitive_scope_purge) THEN NULL
+                 ELSE start_scope
+             END,
+             end_scope = CASE
+                 WHEN end_scope IN (SELECT hash FROM sensitive_scope_purge) THEN NULL
+                 ELSE end_scope
+             END
+         WHERE scope_hash IN (SELECT hash FROM sensitive_scope_purge)
+            OR start_scope IN (SELECT hash FROM sensitive_scope_purge)
+            OR end_scope IN (SELECT hash FROM sensitive_scope_purge)",
+        [],
+    )?;
+    let cleared_crons = tx.query_row(
+        "SELECT COUNT(*) FROM crons
+         WHERE scope_hash IN (SELECT hash FROM sensitive_scope_purge)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let cleared_crons = usize::try_from(cleared_crons).context("invalid cleared cron count")?;
+    let disabled_scope_crons = tx.query_row(
+        "SELECT COUNT(*) FROM crons
+         WHERE enabled != 0
+           AND scope_hash IN (SELECT hash FROM sensitive_scope_purge)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let disabled_scope_crons =
+        usize::try_from(disabled_scope_crons).context("invalid disabled cron count")?;
+    tx.execute(
+        r#"UPDATE crons
+            SET scope_hash = NULL,
+                enabled = 0,
+                status = '"paused"'
+            WHERE scope_hash IN (SELECT hash FROM sensitive_scope_purge)"#,
+        [],
+    )?;
+    tx.execute(
+        "DELETE FROM scope_head
+         WHERE hash IN (SELECT hash FROM sensitive_scope_purge)",
+        [],
+    )?;
+    let removed_scopes = tx.execute(
+        "DELETE FROM scopes
+         WHERE hash IN (SELECT hash FROM sensitive_scope_purge)",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE sensitive_scope_purge;")?;
+    tx.commit().context("commit sensitive scope purge")?;
+
+    Ok(SensitiveScopePurgeReport {
+        removed_scopes,
+        cleared_job_rows,
+        cleared_crons,
+        disabled_scope_crons,
+    })
+}
+
+fn persisted_scope_has_sensitive_environment(
+    delta_json: Option<&str>,
+    snapshot_json: Option<&str>,
+) -> bool {
+    let delta_is_sensitive = delta_json.is_some_and(|json| {
+        serde_json::from_str::<EnvDelta>(json)
+            .map(|delta| delta.set.keys().any(|name| is_sensitive_env_name(name)))
+            // Corrupt scope JSON cannot be proven safe and was unusable anyway.
+            .unwrap_or(true)
+    });
+    let snapshot_is_sensitive = snapshot_json.is_some_and(|json| {
+        serde_json::from_str::<EnvSnapshot>(json)
+            .map(|snapshot| snapshot.env.keys().any(|name| is_sensitive_env_name(name)))
+            .unwrap_or(true)
+    });
+    delta_is_sensitive || snapshot_is_sensitive
+}
+
+fn scope_contains_sensitive_environment(scope: &Scope) -> bool {
+    scope
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.env.keys().any(|name| is_sensitive_env_name(name)))
+        || scope
+            .delta
+            .as_ref()
+            .is_some_and(|delta| delta.set.keys().any(|name| is_sensitive_env_name(name)))
+}
+
+fn is_sensitive_env_name(name: &str) -> bool {
+    let words = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>();
+    let compact = words.concat();
+    let has_word = |candidate: &str| words.iter().any(|word| word == candidate);
+
+    if [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PASS",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "AUTH",
+        "AUTHORIZATION",
+        "OAUTH",
+        "COOKIE",
+        "DSN",
+        "PASSPHRASE",
+    ]
+    .into_iter()
+    .any(has_word)
+    {
+        return true;
+    }
+
+    if compact.ends_with("TOKEN")
+        || compact.ends_with("SECRET")
+        || compact.contains("PASSWORD")
+        || compact.ends_with("CREDENTIAL")
+        || compact.ends_with("CREDENTIALS")
+        || compact.ends_with("COOKIE")
+        || compact.contains("APIKEY")
+        || compact.contains("ACCESSKEY")
+        || compact.contains("PRIVATEKEY")
+    {
+        return true;
+    }
+
+    let names_database = [
+        "DATABASE",
+        "REDIS",
+        "MONGO",
+        "MONGODB",
+        "POSTGRES",
+        "POSTGRESQL",
+    ]
+    .into_iter()
+    .any(|backend| compact.contains(backend));
+    let names_connection_locator = words
+        .iter()
+        .any(|word| matches!(word.as_str(), "URL" | "URI" | "CONNECTIONSTRING"))
+        || compact.contains("CONNECTIONSTRING");
+    names_database && names_connection_locator
+}
+
 // ── Scope CRUD ──
 
+/// Whether a scope was durable or intentionally retained in memory only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopePersistence {
+    Persisted,
+    VolatileSensitiveEnvironment,
+    VolatileParent,
+}
+
+impl ScopePersistence {
+    pub fn is_volatile(self) -> bool {
+        !matches!(self, Self::Persisted)
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Persisted => "persisted",
+            Self::VolatileSensitiveEnvironment => "sensitive_environment",
+            Self::VolatileParent => "unpersisted_parent",
+        }
+    }
+}
+
 /// Insert a scope (cache + persistence).
-pub fn insert_scope(conn: &Connection, scope: &Scope) -> Result<()> {
+///
+/// Scopes containing credential-like environment keys are deliberately not
+/// persisted. Their descendants also stay volatile so a durable child never
+/// points at a missing parent. The caller remains responsible for retaining
+/// volatile scopes in its process-local cache.
+pub fn insert_scope(conn: &Connection, scope: &Scope) -> Result<ScopePersistence> {
+    if scope_contains_sensitive_environment(scope) {
+        return Ok(ScopePersistence::VolatileSensitiveEnvironment);
+    }
+    if let Some(parent) = scope.parent {
+        let parent_exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scopes WHERE hash = ?1)",
+            rusqlite::params![parent.0.as_slice()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !parent_exists {
+            return Ok(ScopePersistence::VolatileParent);
+        }
+    }
+
     let hash_bytes = scope.hash.0.as_slice();
     let parent_bytes = scope.parent.map(|p| p.0.to_vec());
     let delta_json = scope
@@ -297,7 +600,100 @@ pub fn insert_scope(conn: &Connection, scope: &Scope) -> Result<()> {
         "INSERT OR IGNORE INTO scopes (hash, parent, delta_json, snap_json) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![hash_bytes, parent_bytes, delta_json, snap_json],
     )?;
-    Ok(())
+    Ok(ScopePersistence::Persisted)
+}
+
+fn is_persisted_scope(conn: &Connection, hash: ScopeHash) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM scopes WHERE hash = ?1)",
+        rusqlite::params![hash.0.as_slice()],
+        |row| row.get(0),
+    )
+    .context("query persisted scope")
+}
+
+fn durable_scope_reference(conn: &Connection, scope: Option<ScopeHash>) -> Result<Option<Vec<u8>>> {
+    match scope {
+        Some(hash) if is_persisted_scope(conn, hash)? => Ok(Some(hash.0.to_vec())),
+        Some(_) => Ok(None),
+        None => Ok(None),
+    }
+}
+
+/// Delete every persisted scope outside the scheduler-supplied reachable set.
+///
+/// The caller must already have expanded roots to their complete ancestor
+/// closure. Durable job and cron references are checked inside the transaction;
+/// a missing root therefore fails the sweep instead of creating dangling data.
+pub fn sweep_scopes(conn: &Connection, reachable: &HashSet<ScopeHash>) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin scope garbage-collection transaction")?;
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS scope_gc_reachable (
+             hash BLOB PRIMARY KEY
+         ) WITHOUT ROWID;
+         DELETE FROM scope_gc_reachable;",
+    )?;
+    for hash in reachable {
+        tx.execute(
+            "INSERT OR IGNORE INTO scope_gc_reachable (hash) VALUES (?1)",
+            rusqlite::params![hash.0.as_slice()],
+        )?;
+    }
+
+    let unmarked_reference = tx
+        .query_row(
+            "SELECT hex(scopes.hash)
+             FROM scopes
+             WHERE NOT EXISTS (
+                       SELECT 1 FROM scope_gc_reachable
+                       WHERE scope_gc_reachable.hash = scopes.hash
+                   )
+               AND (
+                   scopes.hash IN (
+                       SELECT scope_hash FROM jobs_history WHERE scope_hash IS NOT NULL
+                   )
+                   OR scopes.hash IN (
+                       SELECT start_scope FROM jobs_history WHERE start_scope IS NOT NULL
+                   )
+                   OR scopes.hash IN (
+                       SELECT end_scope FROM jobs_history WHERE end_scope IS NOT NULL
+                   )
+                   OR scopes.hash IN (
+                       SELECT scope_hash FROM crons WHERE scope_hash IS NOT NULL
+                   )
+               )
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(hash) = unmarked_reference {
+        return Err(anyhow!(
+            "refusing scope sweep: persisted job or cron still references unmarked scope {hash}"
+        ));
+    }
+
+    tx.execute(
+        "DELETE FROM scope_head
+         WHERE NOT EXISTS (
+             SELECT 1 FROM scope_gc_reachable
+             WHERE scope_gc_reachable.hash = scope_head.hash
+         )",
+        [],
+    )?;
+    let removed = tx.execute(
+        "DELETE FROM scopes
+         WHERE NOT EXISTS (
+             SELECT 1 FROM scope_gc_reachable
+             WHERE scope_gc_reachable.hash = scopes.hash
+         )",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE scope_gc_reachable;")?;
+    tx.commit().context("commit scope garbage collection")?;
+    Ok(removed)
 }
 
 /// Retrieve a scope by hash.
@@ -455,8 +851,8 @@ pub struct StoredScriptItem {
 
 pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
     let status_json = serde_json::to_string(&job.status).context("serialize job status")?;
-    let start_scope = job.start_scope.map(|hash| hash.0.to_vec());
-    let end_scope = job.end_scope.map(|hash| hash.0.to_vec());
+    let start_scope = durable_scope_reference(conn, job.start_scope)?;
+    let end_scope = durable_scope_reference(conn, job.end_scope)?;
     let finished = if job.status.is_terminal() { 1 } else { 0 };
 
     conn.execute(
@@ -559,9 +955,23 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
 }
 
 pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
-    let scope_hash = cron.scope_hash.map(|hash| hash.0.to_vec());
-    let status = serde_json::to_string(&cron.status).context("serialize cron status")?;
-    let enabled = i64::from(cron.status.is_runnable());
+    let volatile_scope = cron
+        .scope_hash
+        .map(|hash| is_persisted_scope(conn, hash).map(|persisted| !persisted))
+        .transpose()?
+        .unwrap_or(false);
+    let scope_hash = if volatile_scope {
+        None
+    } else {
+        cron.scope_hash.map(|hash| hash.0.to_vec())
+    };
+    let persisted_status = if volatile_scope {
+        CronStatus::Paused
+    } else {
+        cron.status
+    };
+    let status = serde_json::to_string(&persisted_status).context("serialize cron status")?;
+    let enabled = i64::from(persisted_status.is_runnable());
     let cwd_override = cron
         .cwd_override
         .as_ref()
@@ -902,10 +1312,11 @@ impl<T> OptionalExt<T> for rusqlite::Result<T> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::PathBuf;
 
     use cue_core::job::CancelReason;
-    use cue_core::scope::EnvSnapshot;
+    use cue_core::scope::{EnvDelta, EnvSnapshot};
 
     use super::*;
 
@@ -913,11 +1324,92 @@ mod tests {
         open_db(Path::new(":memory:")).expect("open in-memory db")
     }
 
+    fn raw_insert_scope(conn: &Connection, scope: &Scope) {
+        let delta_json = scope
+            .delta
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .expect("serialize fixture delta");
+        let snapshot_json = scope
+            .snapshot
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .expect("serialize fixture snapshot");
+        conn.execute(
+            "INSERT INTO scopes (hash, parent, delta_json, snap_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                scope.hash.0.as_slice(),
+                scope.parent.map(|parent| parent.0.to_vec()),
+                delta_json,
+                snapshot_json,
+            ],
+        )
+        .expect("insert raw scope fixture");
+    }
+
+    fn insert_safe_scope(conn: &Connection, cwd: &str) -> ScopeHash {
+        let scope = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from(cwd),
+        });
+        assert_eq!(
+            insert_scope(conn, &scope).expect("insert safe scope fixture"),
+            ScopePersistence::Persisted
+        );
+        scope.hash
+    }
+
     #[test]
     fn migration_is_idempotent() {
         let conn = in_memory_db();
         // Running migrate again should be a no-op.
         migrate(&conn).expect("second migration");
+    }
+
+    #[test]
+    fn file_database_and_sidecars_use_private_permissions() {
+        let root = std::env::temp_dir().join(format!(
+            "cue-storage-permissions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp directory");
+        let path = root.join("cued.db");
+        rusqlite::Connection::open(&path)
+            .expect("create database")
+            .close()
+            .expect("close database");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("set wide database mode");
+
+        let conn = open_db(&path).expect("open private database");
+
+        for file in [
+            path.clone(),
+            crate::dirs::database_sidecar_path(&path, "-wal"),
+            crate::dirs::database_sidecar_path(&path, "-shm"),
+        ] {
+            if file.exists() {
+                assert_eq!(
+                    std::fs::metadata(&file)
+                        .expect("stat database file")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600,
+                    "{}",
+                    file.display()
+                );
+            }
+        }
+        drop(conn);
+        std::fs::remove_dir_all(root).expect("remove temp directory");
     }
 
     #[test]
@@ -976,6 +1468,297 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_environment_names_are_classified_without_reading_values() {
+        for name in [
+            "TOKEN",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "PRIVATE_KEY",
+            "CLIENT_SECRET",
+            "PGPASSWORD",
+            "DB_PASS",
+            "SHARED_CREDENTIALS_FILE",
+            "HTTP_AUTH",
+            "AUTHORIZATION",
+            "SESSION_COOKIE",
+            "SENTRY_DSN",
+            "DATABASE_URL",
+            "REDIS_URI",
+            "MONGODB_CONNECTION_STRING",
+            "POSTGRESQL_URL_READ_ONLY",
+        ] {
+            assert!(is_sensitive_env_name(name), "expected sensitive name");
+        }
+
+        for name in [
+            "PATH",
+            "HOME",
+            "PWD",
+            "OLDPWD",
+            "AUTHOR",
+            "AUTHORS",
+            "TOKENIZERS_PARALLELISM",
+            "DATABASE_HOST",
+            "REDIS_PORT",
+            "POSTGRES_USER",
+        ] {
+            assert!(!is_sensitive_env_name(name), "expected non-sensitive name");
+        }
+    }
+
+    #[test]
+    fn sensitive_scope_and_its_descendant_remain_volatile() {
+        let conn = in_memory_db();
+        let sensitive = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/bin".into()),
+                ("OPENAI_API_KEY".into(), "fixture-do-not-persist".into()),
+            ]),
+            cwd: PathBuf::from("/tmp/root"),
+        });
+        let sensitive_result = insert_scope(&conn, &sensitive).expect("insert sensitive scope");
+        assert_eq!(
+            sensitive_result,
+            ScopePersistence::VolatileSensitiveEnvironment
+        );
+        assert!(
+            get_scope(&conn, &sensitive.hash)
+                .expect("query sensitive scope")
+                .is_none()
+        );
+
+        let descendant = Scope::fork(
+            sensitive.hash,
+            sensitive.snapshot.as_ref().expect("sensitive snapshot"),
+            EnvDelta {
+                set: BTreeMap::new(),
+                unset: vec!["OPENAI_API_KEY".into()],
+                cwd: Some(PathBuf::from("/tmp/clean-child")),
+            },
+        );
+        assert_eq!(
+            descendant
+                .snapshot
+                .as_ref()
+                .expect("descendant snapshot")
+                .compute_hash(),
+            descendant.hash
+        );
+        assert!(
+            !scope_contains_sensitive_environment(&descendant),
+            "unset names do not contain persisted values"
+        );
+        assert_eq!(
+            insert_scope(&conn, &descendant).expect("insert descendant"),
+            ScopePersistence::VolatileParent
+        );
+        assert!(
+            get_scope(&conn, &descendant.hash)
+                .expect("query descendant")
+                .is_none()
+        );
+
+        upsert_job_history(
+            &conn,
+            &StoredJob {
+                id: "J1".into(),
+                pipeline: "volatile scopes".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(sensitive.hash),
+                end_scope: Some(descendant.hash),
+                chain_id: None,
+                stderr: String::new(),
+            },
+        )
+        .expect("persist job without volatile scope references");
+        let job = load_job_history(&conn)
+            .expect("load job")
+            .pop()
+            .expect("job exists");
+        assert_eq!(job.start_scope, None);
+        assert_eq!(job.end_scope, None);
+
+        for cron in [
+            StoredCron {
+                id: "C1".into(),
+                schedule: "every 5m".into(),
+                command: "echo scoped".into(),
+                status: CronStatus::Scheduled,
+                scope_hash: Some(sensitive.hash),
+                cwd_override: None,
+                scope_enabled: true,
+                wrapper_enabled: false,
+            },
+            StoredCron {
+                id: "C2".into(),
+                schedule: "every 5m".into(),
+                command: "echo unscoped".into(),
+                status: CronStatus::Scheduled,
+                scope_hash: Some(descendant.hash),
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+            },
+        ] {
+            upsert_cron(&conn, &cron).expect("persist cron without volatile scope reference");
+        }
+        let crons = load_crons(&conn).expect("load crons");
+        assert_eq!(crons[0].record.scope_hash, None);
+        assert_eq!(crons[0].record.status, CronStatus::Paused);
+        assert_eq!(crons[1].record.scope_hash, None);
+        assert_eq!(crons[1].record.status, CronStatus::Paused);
+    }
+
+    #[test]
+    fn migration_purges_sensitive_scopes_and_descendants_and_repairs_references() {
+        let conn = in_memory_db();
+        let safe = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from("/tmp/safe"),
+        });
+        let sensitive = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/bin".into()),
+                ("DATABASE_URL".into(), "fixture-do-not-log".into()),
+            ]),
+            cwd: PathBuf::from("/tmp/sensitive"),
+        });
+        let descendant = Scope::fork(
+            sensitive.hash,
+            sensitive.snapshot.as_ref().expect("sensitive snapshot"),
+            EnvDelta {
+                set: BTreeMap::new(),
+                unset: vec!["DATABASE_URL".into()],
+                cwd: Some(PathBuf::from("/tmp/descendant")),
+            },
+        );
+        assert!(!scope_contains_sensitive_environment(&descendant));
+        raw_insert_scope(&conn, &safe);
+        raw_insert_scope(&conn, &sensitive);
+        raw_insert_scope(&conn, &descendant);
+        conn.execute(
+            "INSERT INTO scope_head (id, hash) VALUES (0, ?1)",
+            rusqlite::params![sensitive.hash.0.as_slice()],
+        )
+        .expect("insert legacy scope head");
+
+        upsert_job_history(
+            &conn,
+            &StoredJob {
+                id: "J1".into(),
+                pipeline: "first".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(sensitive.hash),
+                end_scope: Some(safe.hash),
+                chain_id: None,
+                stderr: String::new(),
+            },
+        )
+        .expect("insert first job");
+        upsert_job_history(
+            &conn,
+            &StoredJob {
+                id: "J2".into(),
+                pipeline: "second".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(safe.hash),
+                end_scope: Some(descendant.hash),
+                chain_id: None,
+                stderr: String::new(),
+            },
+        )
+        .expect("insert second job");
+        for cron in [
+            StoredCron {
+                id: "C1".into(),
+                schedule: "every 5m".into(),
+                command: "echo scoped".into(),
+                status: CronStatus::Scheduled,
+                scope_hash: Some(sensitive.hash),
+                cwd_override: None,
+                scope_enabled: true,
+                wrapper_enabled: false,
+            },
+            StoredCron {
+                id: "C2".into(),
+                schedule: "every 5m".into(),
+                command: "echo unscoped".into(),
+                status: CronStatus::Scheduled,
+                scope_hash: Some(descendant.hash),
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+            },
+            StoredCron {
+                id: "C3".into(),
+                schedule: "every 5m".into(),
+                command: "echo safe".into(),
+                status: CronStatus::Scheduled,
+                scope_hash: Some(safe.hash),
+                cwd_override: None,
+                scope_enabled: true,
+                wrapper_enabled: false,
+            },
+        ] {
+            upsert_cron(&conn, &cron).expect("insert cron fixture");
+        }
+
+        conn.pragma_update(None, "user_version", 14)
+            .expect("mark legacy schema");
+        migrate(&conn).expect("migrate sensitive scope history");
+
+        assert!(get_scope(&conn, &safe.hash).expect("load safe").is_some());
+        assert!(
+            get_scope(&conn, &sensitive.hash)
+                .expect("load sensitive")
+                .is_none()
+        );
+        assert!(
+            get_scope(&conn, &descendant.hash)
+                .expect("load descendant")
+                .is_none()
+        );
+        let jobs = load_job_history(&conn).expect("load repaired jobs");
+        assert_eq!(jobs[0].start_scope, None);
+        assert_eq!(jobs[0].end_scope, Some(safe.hash));
+        assert_eq!(jobs[1].start_scope, Some(safe.hash));
+        assert_eq!(jobs[1].end_scope, None);
+
+        let crons = load_crons(&conn).expect("load repaired crons");
+        assert_eq!(crons[0].record.scope_hash, None);
+        assert_eq!(crons[0].record.status, CronStatus::Paused);
+        assert!(crons[0].record.scope_enabled);
+        assert_eq!(crons[1].record.scope_hash, None);
+        assert_eq!(crons[1].record.status, CronStatus::Paused);
+        assert!(!crons[1].record.scope_enabled);
+        assert_eq!(crons[2].record.scope_hash, Some(safe.hash));
+        assert_eq!(crons[2].record.status, CronStatus::Scheduled);
+
+        let scope_head_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scope_head", [], |row| row.get(0))
+            .expect("count scope heads");
+        assert_eq!(scope_head_count, 0);
+        let persisted_fixture_values: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scopes
+                 WHERE instr(COALESCE(delta_json, ''), 'fixture-do-not-log') != 0
+                    OR instr(COALESCE(snap_json, ''), 'fixture-do-not-log') != 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check fixture value removal");
+        assert_eq!(persisted_fixture_values, 0);
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn scope_roundtrip() {
         let conn = in_memory_db();
         let snap = EnvSnapshot {
@@ -1019,10 +1802,127 @@ mod tests {
     }
 
     #[test]
+    fn sweep_scopes_deletes_only_unmarked_scopes() {
+        let conn = in_memory_db();
+        let root = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from("/tmp/root"),
+        });
+        let child = Scope::fork(
+            root.hash,
+            root.snapshot.as_ref().expect("root snapshot"),
+            EnvDelta {
+                set: BTreeMap::from([("MODE".into(), "debug".into())]),
+                unset: vec![],
+                cwd: None,
+            },
+        );
+        let orphan = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/bin".into())]),
+            cwd: PathBuf::from("/tmp/orphan"),
+        });
+        for scope in [&root, &child, &orphan] {
+            insert_scope(&conn, scope).expect("insert scope fixture");
+        }
+
+        let removed =
+            sweep_scopes(&conn, &HashSet::from([root.hash, child.hash])).expect("sweep scopes");
+
+        assert_eq!(removed, 1);
+        assert!(get_scope(&conn, &root.hash).expect("load root").is_some());
+        assert!(get_scope(&conn, &child.hash).expect("load child").is_some());
+        assert!(
+            get_scope(&conn, &orphan.hash)
+                .expect("load orphan")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sweep_scopes_refuses_to_delete_durable_references() {
+        let conn = in_memory_db();
+        let root = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
+            cwd: PathBuf::from("/tmp/referenced"),
+        });
+        insert_scope(&conn, &root).expect("insert referenced scope");
+        upsert_job_history(
+            &conn,
+            &StoredJob {
+                id: "J1".into(),
+                pipeline: "echo retained".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(root.hash),
+                end_scope: Some(root.hash),
+                chain_id: None,
+                stderr: String::new(),
+            },
+        )
+        .expect("persist referenced job");
+
+        let error = sweep_scopes(&conn, &HashSet::new())
+            .expect_err("unmarked durable reference must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("still references unmarked scope")
+        );
+        assert!(get_scope(&conn, &root.hash).expect("load root").is_some());
+    }
+
+    #[test]
+    fn volatile_scope_references_stay_null_across_database_connections() {
+        let root = std::env::temp_dir().join(format!(
+            "cue-volatile-reference-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp directory");
+        let path = root.join("cued.db");
+        let scope_conn = open_db(&path).expect("open scope connection");
+        let scheduler_conn = open_db(&path).expect("open scheduler connection");
+        let sensitive = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([("API_TOKEN".into(), "memory-only".into())]),
+            cwd: PathBuf::from("/tmp/sensitive"),
+        });
+        assert_eq!(
+            insert_scope(&scope_conn, &sensitive).expect("insert volatile scope"),
+            ScopePersistence::VolatileSensitiveEnvironment
+        );
+
+        upsert_job_history(
+            &scheduler_conn,
+            &StoredJob {
+                id: "J1".into(),
+                pipeline: "echo volatile".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(sensitive.hash),
+                end_scope: Some(sensitive.hash),
+                chain_id: None,
+                stderr: String::new(),
+            },
+        )
+        .expect("persist job without volatile scope reference");
+
+        let jobs = load_job_history(&scheduler_conn).expect("load job history");
+        assert_eq!(jobs[0].start_scope, None);
+        assert_eq!(jobs[0].end_scope, None);
+        drop(scope_conn);
+        drop(scheduler_conn);
+        std::fs::remove_dir_all(root).expect("remove temp directory");
+    }
+
+    #[test]
     fn job_history_roundtrip() {
         let conn = in_memory_db();
-        let start_scope = ScopeHash([7; 32]);
-        let end_scope = ScopeHash([8; 32]);
+        let start_scope = insert_safe_scope(&conn, "/tmp/job-start");
+        let end_scope = insert_safe_scope(&conn, "/tmp/job-end");
         let job = StoredJob {
             id: "J12".into(),
             pipeline: "cargo test".into(),
@@ -1142,12 +2042,13 @@ mod tests {
     #[test]
     fn cron_roundtrip() {
         let conn = in_memory_db();
+        let scope_hash = insert_safe_scope(&conn, "/tmp/cron");
         let cron = StoredCron {
             id: "C3".into(),
             schedule: "every 5m".into(),
             command: "cargo test".into(),
             status: CronStatus::Scheduled,
-            scope_hash: Some(ScopeHash([9; 32])),
+            scope_hash: Some(scope_hash),
             cwd_override: Some(PathBuf::from("/tmp/cue-cron-cwd")),
             scope_enabled: true,
             wrapper_enabled: true,
@@ -1171,12 +2072,13 @@ mod tests {
     #[test]
     fn failed_cron_status_roundtrips() {
         let conn = in_memory_db();
+        let scope_hash = insert_safe_scope(&conn, "/tmp/failed-cron");
         let cron = StoredCron {
             id: "C4".into(),
             schedule: "in 1s".into(),
             command: "echo due".into(),
             status: CronStatus::Failed,
-            scope_hash: Some(ScopeHash([4; 32])),
+            scope_hash: Some(scope_hash),
             cwd_override: None,
             scope_enabled: false,
             wrapper_enabled: false,
@@ -1192,12 +2094,13 @@ mod tests {
     #[test]
     fn cron_load_preserves_millisecond_age() {
         let conn = in_memory_db();
+        let scope_hash = insert_safe_scope(&conn, "/tmp/elapsed-cron");
         let cron = StoredCron {
             id: "C7".into(),
             schedule: "in 1500ms".into(),
             command: "echo soon".into(),
             status: CronStatus::Scheduled,
-            scope_hash: Some(ScopeHash([7; 32])),
+            scope_hash: Some(scope_hash),
             cwd_override: None,
             scope_enabled: false,
             wrapper_enabled: false,

@@ -28,6 +28,7 @@ use tokio::time::timeout;
 
 use cue_core::ipc::{
     self, EventPayload, JobInfo, Message, OkPayload, RequestPayload, ResponsePayload,
+    ScriptItemResult, ScriptRunStatus,
 };
 use cue_core::job::JobStatus;
 use cue_core::mode::Mode;
@@ -277,6 +278,14 @@ fn write_daemon_config(env: &TestEnv, text: &str) {
     fs::write(config_dir.join("daemon.toml"), text).expect("write daemon.toml");
 }
 
+fn unix_mode(path: &Path) -> u32 {
+    fs::metadata(path)
+        .unwrap_or_else(|error| panic!("stat {}: {error}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
 fn job_id_from_created(resp: ResponsePayload) -> String {
     match resp {
         ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
@@ -318,7 +327,11 @@ where
 
 /// Build a `Request` envelope.
 fn request(id: u32, payload: RequestPayload) -> Message {
-    Message::Request { id, payload }
+    Message::Request {
+        id,
+        operation_id: None,
+        payload,
+    }
 }
 
 async fn handshake<S>(stream: &mut S, session_id: &str, cwd: &Path)
@@ -659,6 +672,71 @@ async fn test_daemon_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_foreground_starts_have_one_socket_owner() {
+    run_daemon_test(async {
+        let env = TestEnv::new("single-instance-race");
+        let mut first = env.spawn_daemon();
+        let mut second = env.spawn_daemon();
+        let mut stream = None;
+        let mut first_status = None;
+        let mut second_status = None;
+
+        for _ in 0..80 {
+            if stream.is_none()
+                && env.socket.exists()
+                && let Ok(connected) = UnixStream::connect(&env.socket).await
+            {
+                stream = Some(connected);
+            }
+            if first_status.is_none() {
+                first_status = first.try_wait().expect("poll first daemon");
+            }
+            if second_status.is_none() {
+                second_status = second.try_wait().expect("poll second daemon");
+            }
+            if stream.is_some() && (first_status.is_some() ^ second_status.is_some()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let mut stream = stream.expect("one daemon should own a reachable socket");
+        assert!(
+            first_status.is_some() ^ second_status.is_some(),
+            "exactly one concurrent foreground start must exit"
+        );
+        handshake(
+            &mut stream,
+            &default_test_session_id(&env.socket),
+            &env.root,
+        )
+        .await;
+        let response = roundtrip(&mut stream, 1, RequestPayload::Ping {}).await;
+        assert!(matches!(
+            response,
+            ResponsePayload::Ok(OkPayload::Pong { .. })
+        ));
+
+        if let Some(status) = first_status {
+            assert!(
+                !status.success(),
+                "losing daemon must report startup failure"
+            );
+            assert!(second_status.is_none(), "winner must still be running");
+            shutdown_daemon(&mut stream, &mut second).await;
+        } else {
+            let status = second_status.expect("second daemon is the loser");
+            assert!(
+                !status.success(),
+                "losing daemon must report startup failure"
+            );
+            shutdown_daemon(&mut stream, &mut first).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_unhandshaken_client_can_recover_by_handshaking_on_same_connection() {
     run_daemon_test(async {
         let env = TestEnv::new("handshake-recover");
@@ -790,6 +868,198 @@ async fn test_simple_job_execution() {
             )
         });
         assert!(reached_done, "job never reached Done; events: {msgs:?}");
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_run_script_item_events_exclude_other_clients_jobs() {
+    run_daemon_test(async {
+        let env = TestEnv::new("script-item-authority");
+        let mut child = env.spawn_daemon();
+        let mut script_client =
+            wait_for_socket_with_session(&env.socket, &mut child, "script-client", &env.root).await;
+        let mut outsider_client =
+            wait_for_socket_with_session(&env.socket, &mut child, "outsider-client", &env.root)
+                .await;
+        subscribe(&mut script_client, 1, vec!["jobs"]).await;
+
+        let response = roundtrip(
+            &mut script_client,
+            2,
+            RequestPayload::RunScript {
+                path: "two-items.cue".into(),
+                input: "sleep 1\necho script-second".into(),
+            },
+        )
+        .await;
+        let (script_id, first_job_id) = match response {
+            ResponsePayload::Ok(OkPayload::ScriptCreated {
+                script_id, items, ..
+            }) => {
+                assert_eq!(items.len(), 1);
+                let first_job_id = match &items[0].result {
+                    ScriptItemResult::Job { job_id, .. } => job_id.clone(),
+                    other => panic!("expected first script item job, got {other:?}"),
+                };
+                (script_id, first_job_id)
+            }
+            other => panic!("expected ScriptCreated, got {other:?}"),
+        };
+
+        let outsider_job_id = job_id_from_created(
+            roundtrip(
+                &mut outsider_client,
+                1,
+                RequestPayload::Eval {
+                    input: "echo outsider".into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+
+        let messages = collect_until(&mut script_client, Duration::from_secs(10), |message| {
+            matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::ScriptFinished { script_id: finished, .. },
+                } if finished == &script_id
+            )
+        })
+        .await;
+
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::JobCreated { job_id, .. },
+                } if job_id == &outsider_job_id
+            )),
+            "script observer should still see the outsider's global JobCreated event"
+        );
+        let second_item_job_id = messages
+            .iter()
+            .find_map(|message| match message {
+                Message::Event {
+                    payload:
+                        EventPayload::ScriptItemCreated {
+                            script_id: event_script_id,
+                            item,
+                        },
+                } if event_script_id == &script_id && item.index == 1 => match &item.result {
+                    ScriptItemResult::Job { job_id, .. } => Some(job_id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("missing authoritative event for the second script item");
+
+        assert_ne!(first_job_id, outsider_job_id);
+        assert_ne!(second_item_job_id, outsider_job_id);
+        assert!(messages.iter().all(|message| !matches!(
+            message,
+            Message::Event {
+                payload: EventPayload::ScriptItemCreated { item, .. },
+            } if matches!(
+                &item.result,
+                ScriptItemResult::Job { job_id, .. } if job_id == &outsider_job_id
+            )
+        )));
+
+        shutdown_daemon(&mut script_client, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_daemon_creates_and_migrates_private_runtime_files() {
+    run_daemon_test(async {
+        let env = TestEnv::new("private-files");
+        let runtime_dir = env.root.join("cue-shell");
+        let sandbox_dir = runtime_dir.join("sandbox");
+        let data_dir = env.root.join("data/cue-shell");
+        let output_dir = data_dir.join("output");
+        let state_dir = env.root.join("state/cue-shell");
+        let config_dir = env.root.join("config/cue-shell");
+        let directories = [
+            runtime_dir.clone(),
+            sandbox_dir,
+            data_dir.clone(),
+            output_dir.clone(),
+            state_dir.clone(),
+            config_dir.clone(),
+        ];
+        for dir in &directories {
+            fs::create_dir_all(dir).expect("create wide app directory");
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o755))
+                .expect("set wide app directory mode");
+        }
+        let migrated_files = [
+            data_dir.join("input-history.json"),
+            state_dir.join("cued.log"),
+            config_dir.join("daemon.toml"),
+            output_dir.join("J999.log"),
+            output_dir.join("J999.stderr"),
+        ];
+        for file in &migrated_files {
+            let contents = if file.ends_with("input-history.json") {
+                "[]"
+            } else {
+                ""
+            };
+            fs::write(file, contents).expect("create wide app file");
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644))
+                .expect("set wide app file mode");
+        }
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+
+        for dir in &directories {
+            assert_eq!(unix_mode(dir), 0o700, "{}", dir.display());
+        }
+        for file in [
+            env.socket.clone(),
+            env.root.join("cued.sock.cued.pid"),
+            env.root.join("cued.sock.cued.lock"),
+            data_dir.join("cued.db"),
+        ]
+        .iter()
+        .chain(migrated_files.iter())
+        {
+            assert_eq!(unix_mode(file), 0o600, "{}", file.display());
+        }
+        assert!(
+            !runtime_dir.join("cued.pid").exists(),
+            "custom socket must not write the default runtime PID marker"
+        );
+        for sidecar in [data_dir.join("cued.db-wal"), data_dir.join("cued.db-shm")] {
+            if sidecar.exists() {
+                assert_eq!(unix_mode(&sidecar), 0o600, "{}", sidecar.display());
+            }
+        }
+
+        let response = roundtrip(
+            &mut stream,
+            1,
+            RequestPayload::Eval {
+                input: ":run(pty=false) echo private-output".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = job_id_from_created(response);
+        assert_eq!(
+            wait_for_job_terminal(&mut stream, 2, &job_id).await,
+            JobStatus::Done
+        );
+        for suffix in [".log", ".stderr"] {
+            let path = output_dir.join(format!("{job_id}{suffix}"));
+            assert_eq!(unix_mode(&path), 0o600, "{}", path.display());
+        }
 
         shutdown_daemon(&mut stream, &mut child).await;
     })
@@ -1924,6 +2194,170 @@ async fn test_job_kill() {
             ),
             "expected terminal state after kill, got {status:?}"
         );
+
+        shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cancel_execution_stops_job_chain_and_script_idempotently() {
+    run_daemon_test(async {
+        let env = TestEnv::new("cancel-execution");
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+        subscribe(&mut stream, 1, vec!["jobs"]).await;
+
+        let job_id = job_id_from_created(
+            roundtrip(
+                &mut stream,
+                2,
+                RequestPayload::Eval {
+                    input: ":run(pty=false) sleep 30".into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        let cancelled = roundtrip(
+            &mut stream,
+            3,
+            RequestPayload::CancelExecution { id: job_id.clone() },
+        )
+        .await;
+        assert!(matches!(cancelled, ResponsePayload::Ok(OkPayload::Ack {})));
+        assert!(matches!(
+            wait_for_job_terminal(&mut stream, 4, &job_id).await,
+            JobStatus::Cancelled(_)
+        ));
+        assert!(matches!(
+            roundtrip(
+                &mut stream,
+                5,
+                RequestPayload::CancelExecution { id: job_id },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+
+        let chain_marker = env.root.join("chain-second-ran");
+        let chain_response = roundtrip(
+            &mut stream,
+            6,
+            RequestPayload::Eval {
+                input: format!(
+                    ":run(pty=false) sleep 30 -> touch {}",
+                    chain_marker.display()
+                ),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let chain_id = match chain_response {
+            ResponsePayload::Ok(OkPayload::ChainCreated { chain_id, .. }) => chain_id,
+            other => panic!("expected ChainCreated, got {other:?}"),
+        };
+        assert!(matches!(
+            roundtrip(
+                &mut stream,
+                7,
+                RequestPayload::CancelExecution {
+                    id: chain_id.clone(),
+                },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        assert!(
+            !chain_marker.exists(),
+            "cancelled chain advanced to its second leaf"
+        );
+        assert!(matches!(
+            roundtrip(
+                &mut stream,
+                8,
+                RequestPayload::CancelExecution { id: chain_id },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+
+        let script_marker = env.root.join("script-second-ran");
+        let script_response = roundtrip(
+            &mut stream,
+            9,
+            RequestPayload::RunScript {
+                path: "cancel.cue".into(),
+                input: format!("sleep 30\ntouch {}", script_marker.display()),
+            },
+        )
+        .await;
+        let script_id = match script_response {
+            ResponsePayload::Ok(OkPayload::ScriptCreated { script_id, .. }) => script_id,
+            other => panic!("expected ScriptCreated, got {other:?}"),
+        };
+        let (script_cancelled, observed) = roundtrip_with_messages(
+            &mut stream,
+            10,
+            RequestPayload::CancelExecution {
+                id: script_id.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            script_cancelled,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        let saw_finished = observed.iter().any(|message| {
+            matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::ScriptFinished {
+                        script_id: finished,
+                        status: ScriptRunStatus::Failed,
+                        ..
+                    },
+                } if finished == &script_id
+            )
+        });
+        if !saw_finished {
+            let trailing = collect_until(&mut stream, Duration::from_secs(2), |message| {
+                matches!(
+                    message,
+                    Message::Event {
+                        payload: EventPayload::ScriptFinished {
+                            script_id: finished,
+                            status: ScriptRunStatus::Failed,
+                            ..
+                        },
+                    } if finished == &script_id
+                )
+            })
+            .await;
+            assert!(trailing.iter().any(|message| matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::ScriptFinished {
+                        script_id: finished,
+                        status: ScriptRunStatus::Failed,
+                        ..
+                    },
+                } if finished == &script_id
+            )));
+        }
+        assert!(
+            !script_marker.exists(),
+            "cancelled script advanced to its second item"
+        );
+        assert!(matches!(
+            roundtrip(
+                &mut stream,
+                11,
+                RequestPayload::CancelExecution { id: script_id },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
 
         shutdown_daemon(&mut stream, &mut child).await;
     })

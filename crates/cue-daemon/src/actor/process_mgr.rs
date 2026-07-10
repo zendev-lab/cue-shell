@@ -40,7 +40,7 @@ struct ProcessEntry {
     job_id: JobId,
     status: JobStatus,
     /// Handle for the background reader/waiter task.
-    _reader_handle: tokio::task::JoinHandle<()>,
+    reader_handle: tokio::task::JoinHandle<()>,
     /// Send on this channel to request a kill.
     kill_tx: mpsc::Sender<()>,
     /// Shared ring buffer holding the latest output bytes for live-tail queries.
@@ -63,6 +63,9 @@ enum JobInput {
 
 const DEFAULT_PTY_COLS: u16 = 80;
 const DEFAULT_PTY_ROWS: u16 = 24;
+/// At most 512 KiB of 8 KiB chunks may wait per pipeline before readers apply
+/// backpressure to the child process pipes.
+const PIPELINE_CHUNK_CAP: usize = 64;
 
 // ── Actor entry point ──
 
@@ -297,28 +300,39 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                 ProcessMgrMsg::KillJob { job_id, reply } => {
                     info!(%job_id, "process_mgr: kill requested");
-                    let result = match children.get(&job_id.0) {
-                        Some(entry) if entry.status.is_terminal() => {
-                            Err(format!("job {job_id} is already terminal"))
-                        }
-                        Some(entry) => {
-                            let kill_tx = entry.kill_tx.clone();
-                            match kill_tx.send(()).await {
-                                Ok(()) => {
-                                    if let Some(entry) = children.get_mut(&job_id.0) {
-                                        entry.status = JobStatus::Killed;
-                                    }
-                                    Ok(())
-                                }
-                                Err(_) => Err(format!("job {job_id} kill channel closed")),
-                            }
-                        }
-                        None => Err(format!("job {job_id} not found")),
+                    let Some(entry) = children.remove(&job_id.0) else {
+                        let _ = reply.send(Err(format!("job {job_id} not found")));
+                        continue;
                     };
-                    if let Err(error) = &result {
-                        warn!(%job_id, "process_mgr: kill rejected: {error}");
+                    let ProcessEntry {
+                        status,
+                        reader_handle,
+                        kill_tx,
+                        ..
+                    } = entry;
+                    if !status.is_terminal() && kill_tx.send(()).await.is_err() {
+                        debug!(%job_id, "process_mgr: kill channel already closed; waiting for reader exit");
                     }
-                    let _ = reply.send(result);
+                    // Do not block the process-manager actor while the child exits.
+                    // The scheduler receives the acknowledgement only after the
+                    // reader/waiter task has reaped every child in the job.
+                    tokio::spawn(async move {
+                        let result = match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            reader_handle,
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(error)) => Err(format!(
+                                "job {job_id} process waiter failed: {error}"
+                            )),
+                            Err(_) => Err(format!(
+                                "timed out waiting for job {job_id} to stop"
+                            )),
+                        };
+                        let _ = reply.send(result);
+                    });
                 }
 
                 // Expose ring-buffer contents for live-tail queries.
@@ -965,7 +979,7 @@ async fn spawn_single_pipe_job(
     Ok(ProcessEntry {
         job_id,
         status: JobStatus::Running,
-        _reader_handle: reader_handle,
+        reader_handle,
         kill_tx,
         ring_buffer,
         stderr_ring: Some(stderr_ring),
@@ -1113,7 +1127,7 @@ async fn spawn_single_pty_job(
     Ok(ProcessEntry {
         job_id,
         status: JobStatus::Running,
-        _reader_handle: reader_handle,
+        reader_handle,
         kill_tx,
         ring_buffer,
         stderr_ring: None,
@@ -1209,7 +1223,7 @@ async fn spawn_native_pipeline_job(
     Ok(ProcessEntry {
         job_id,
         status: JobStatus::Running,
-        _reader_handle: reader_handle,
+        reader_handle,
         kill_tx,
         ring_buffer,
         stderr_ring: Some(stderr_ring),
@@ -1259,7 +1273,7 @@ async fn spawn_logical_job(
     Ok(ProcessEntry {
         job_id,
         status: JobStatus::Running,
-        _reader_handle: reader_handle,
+        reader_handle,
         kill_tx,
         ring_buffer,
         stderr_ring: Some(stderr_ring),
@@ -1399,16 +1413,12 @@ async fn open_output_log(job_id: JobId) -> Option<std::fs::File> {
                 return None;
             }
         };
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        if let Err(e) = crate::dirs::ensure_private_dir(&dir) {
             error!(%job_id, err = %e, "process_mgr: cannot create output dir");
             return None;
         }
         let path = dir.join(format!("{job_id}.log"));
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        match crate::dirs::open_private_append(&path) {
             Ok(f) => Some(f),
             Err(e) => {
                 error!(%job_id, path = %path.display(), err = %e, "process_mgr: open log file");
@@ -1435,16 +1445,12 @@ async fn open_stderr_log(job_id: JobId) -> Option<std::fs::File> {
                 return None;
             }
         };
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        if let Err(e) = crate::dirs::ensure_private_dir(&dir) {
             error!(%job_id, err = %e, "process_mgr: cannot create output dir");
             return None;
         }
         let path = dir.join(format!("{job_id}.stderr"));
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        match crate::dirs::open_private_append(&path) {
             Ok(f) => Some(f),
             Err(e) => {
                 error!(%job_id, path = %path.display(), err = %e, "process_mgr: open stderr log");
@@ -1642,7 +1648,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
     let _sandbox = sandbox;
     let log_file = Arc::new(Mutex::new(log_file));
     let stderr_log = Arc::new(Mutex::new(stderr_log));
-    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let (chunk_tx, mut chunk_rx) = mpsc::channel(PIPELINE_CHUNK_CAP);
     let mut active_readers = 0usize;
 
     for stdout in stdout_sources {
@@ -1869,7 +1875,7 @@ async fn run_pipeline_streaming(
         Err(()) => return EXIT_CODE_UNAVAILABLE,
     };
 
-    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let (chunk_tx, mut chunk_rx) = mpsc::channel(PIPELINE_CHUNK_CAP);
     let mut active_readers = 0usize;
 
     for stdout in spawn.stdout_sources.drain(..) {
@@ -2056,7 +2062,7 @@ fn spawn_pipeline_stream_reader<R>(
     job_id: JobId,
     mut reader: R,
     kind: PipelineStreamKind,
-    tx: mpsc::UnboundedSender<PipelineReaderMsg>,
+    tx: mpsc::Sender<PipelineReaderMsg>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -2071,6 +2077,7 @@ fn spawn_pipeline_stream_reader<R>(
                             kind,
                             data: buf[..n].to_vec(),
                         })
+                        .await
                         .is_err()
                     {
                         debug!(
@@ -2087,7 +2094,7 @@ fn spawn_pipeline_stream_reader<R>(
                 }
             }
         }
-        if tx.send(PipelineReaderMsg::Closed).is_err() {
+        if tx.send(PipelineReaderMsg::Closed).await.is_err() {
             debug!(
                 %job_id,
                 stream = ?kind,
