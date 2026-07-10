@@ -292,6 +292,8 @@ pub enum OkPayload {
         /// Daemon `cued` build version reported by the running daemon.
         version: String,
         /// Stable UUID for this daemon process. Changes after every restart.
+        /// Empty when talking to a daemon that predates instance IDs.
+        #[serde(default)]
         instance_id: String,
         /// IPC protocol version implemented by the daemon.
         protocol_version: u32,
@@ -1115,6 +1117,34 @@ mod tests {
             error.to_string().contains("missing field `capabilities`"),
             "wrong error: {error}"
         );
+    }
+
+    #[test]
+    fn pong_decodes_legacy_payload_without_instance_id() {
+        let json = r#"{"type":"response","id":7,"payload":{"Ok":{"Pong":{"version":"0.1.0","protocol_version":2,"capabilities":["session-handshake-required"]}}}}"#;
+        let decoded: Message = serde_json::from_str(json).unwrap();
+
+        match decoded {
+            Message::Response {
+                id: 7,
+                payload:
+                    ResponsePayload::Ok(OkPayload::Pong {
+                        version,
+                        instance_id,
+                        protocol_version,
+                        capabilities,
+                    }),
+            } => {
+                assert_eq!(version, "0.1.0");
+                assert_eq!(instance_id, "");
+                assert_eq!(protocol_version, IPC_PROTOCOL_VERSION);
+                assert_eq!(
+                    capabilities,
+                    vec![IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED.to_string()]
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
