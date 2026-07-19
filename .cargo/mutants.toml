@@ -1,0 +1,32 @@
+# Pilot mutation testing for cue-daemon. Prefer `cargo mutants -p cue-daemon`
+# (see justfile). Large actor modules are excluded until their suites are
+# tightened enough to make full-crate mutants affordable in CI.
+#
+# Speed knobs:
+# - profile=mutants: skip debuginfo to cut rebuild cost per mutant
+# - --lib only: skip slow daemon_integration tests (baseline was ~30s with them)
+# - timeout_multiplier 1.4: enough headroom without waiting out full hangs
+timeout_multiplier = 1.4
+profile = "mutants"
+additional_cargo_test_args = ["--lib"]
+
+exclude_globs = [
+  "crates/cue-daemon/src/actor/scheduler.rs",
+  "crates/cue-daemon/src/actor/process_mgr.rs",
+  "crates/cue-daemon/src/actor/gateway.rs",
+]
+
+# Reachability / equivalence notes from the pilot run:
+# - OptionalText never produces empty Argument::Text (empty becomes Empty).
+# - :cd only feeds Text into extract_text; Chain/job/pipeline text helpers are
+#   currently unused on the public command surface.
+# - format_duration's zero-branch ==/!= is observationally equivalent for the
+#   only convert-failure path that displays durations (every/in 0s).
+exclude_re = [
+  "replace match guard !t\\.is_empty\\(\\) with .* in extract_optional_text",
+  "delete match arm Argument::Chain\\(chain\\) in extract_text",
+  "replace chain_to_text -> String with .*",
+  "replace job_expr_to_text -> String with .*",
+  "replace pipeline_to_text -> String with .*",
+  "replace == with != in format_duration",
+]

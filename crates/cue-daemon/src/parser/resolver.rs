@@ -816,7 +816,10 @@ fn mode_help_topic(mode: Mode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use cue_core::command_spec::{COMMAND_SPECS, CommandArgKind};
+    use cue_core::cron::{DayFilter, Weekday};
     use cue_core::pipeline::JobPlan;
 
     use super::super::parse::Parser as CueParser;
@@ -852,6 +855,55 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bare_empty_input_is_rejected() {
+        let ast = CueParser::parse("").unwrap();
+        let error = Resolver::resolve(ast, Mode::Job).expect_err("empty bare input must fail");
+        assert_eq!(error.kind, ParseErrorKind::MissingArgument);
+        assert!(error.message.contains("empty input"));
+    }
+
+    #[test]
+    fn resolve_output_commands() {
+        match resolve(":tail J1", Mode::Job) {
+            ResolvedCommand::Out {
+                id,
+                tail_bytes: Some(8192),
+            } => assert_eq!(id, "J1"),
+            other => panic!("expected :tail default bytes, got {other:?}"),
+        }
+        match resolve(":tail J2 1024", Mode::Job) {
+            ResolvedCommand::Out {
+                id,
+                tail_bytes: Some(1024),
+            } => assert_eq!(id, "J2"),
+            other => panic!("expected :tail with bytes, got {other:?}"),
+        }
+        match resolve(":out J3", Mode::Job) {
+            ResolvedCommand::Out {
+                id,
+                tail_bytes: None,
+            } => assert_eq!(id, "J3"),
+            other => panic!("expected :out, got {other:?}"),
+        }
+        match resolve(":err J4", Mode::Job) {
+            ResolvedCommand::Err { id } => assert_eq!(id, "J4"),
+            other => panic!("expected :err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_log_with_and_without_id() {
+        match resolve(":log J9", Mode::Job) {
+            ResolvedCommand::Log { id: Some(id) } => assert_eq!(id, "J9"),
+            other => panic!("expected :log with id, got {other:?}"),
+        }
+        match resolve(":log", Mode::Job) {
+            ResolvedCommand::Log { id: None } => {}
+            other => panic!("expected bare :log, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn resolve_file_script_bare_items_as_runs() {
         let cmd = resolve_file_script("cargo fmt --check\ncargo test -> cargo clippy");
         match cmd {
@@ -882,11 +934,11 @@ mod tests {
         let cmd = resolve("every 5m cargo test -> cargo clippy", Mode::Cron);
         match cmd {
             ResolvedCommand::Cron {
-                schedule: _,
+                schedule,
                 chain,
                 params,
             } => {
-                // schedule_text replaced by schedule: CronSchedule; display check removed
+                assert_eq!(schedule, CronSchedule::Interval(Duration::from_secs(300)));
                 assert!(params.is_empty());
                 match chain {
                     core_pipeline::ChainNode::Serial { left, right, .. } => {
@@ -918,9 +970,9 @@ mod tests {
         let cmd = resolve("daily do echo hello", Mode::Cron);
         match cmd {
             ResolvedCommand::Cron {
-                schedule: _, chain, ..
+                schedule, chain, ..
             } => {
-                // schedule_text replaced by schedule: CronSchedule; display check removed
+                assert_eq!(schedule, CronSchedule::Preset(CronPreset::Daily));
                 let pipeline = leaf_pipeline(chain);
                 assert_eq!(pipeline.segments[0].command, vec!["echo", "hello"]);
             }
@@ -932,8 +984,26 @@ mod tests {
     fn resolve_bare_cron_supports_days_and_time() {
         let cmd = resolve("on weekdays at 9am cargo test", Mode::Cron);
         match cmd {
-            ResolvedCommand::Cron { schedule: _, .. } => {
-                // schedule_text replaced by schedule: CronSchedule; display check removed
+            ResolvedCommand::Cron {
+                schedule, chain, ..
+            } => {
+                assert_eq!(
+                    schedule,
+                    CronSchedule::TimeOfDay {
+                        time_secs: 9 * 3600,
+                        days: Some(DayFilter {
+                            days: vec![
+                                Weekday::Mon,
+                                Weekday::Tue,
+                                Weekday::Wed,
+                                Weekday::Thu,
+                                Weekday::Fri,
+                            ],
+                        }),
+                    }
+                );
+                let pipeline = leaf_pipeline(chain);
+                assert_eq!(pipeline.segments[0].command, vec!["cargo", "test"]);
             }
             _ => panic!("expected Cron"),
         }
@@ -943,14 +1013,18 @@ mod tests {
     fn resolve_bare_cron_supports_hh_mm_time() {
         let cmd = resolve("at 14:30 cargo test", Mode::Cron);
         match cmd {
-            ResolvedCommand::Cron { schedule, .. } => {
-                assert!(matches!(
+            ResolvedCommand::Cron {
+                schedule, chain, ..
+            } => {
+                assert_eq!(
                     schedule,
                     CronSchedule::TimeOfDay {
                         time_secs: 52200,
-                        days: None
+                        days: None,
                     }
-                ));
+                );
+                let pipeline = leaf_pipeline(chain);
+                assert_eq!(pipeline.segments[0].command, vec!["cargo", "test"]);
             }
             _ => panic!("expected Cron"),
         }
@@ -1025,6 +1099,44 @@ mod tests {
                 Resolver::resolve(ast, Mode::Cron).expect_err("zero schedule must be rejected");
 
             assert_eq!(error.kind, ParseErrorKind::InvalidCronSchedule);
+            assert!(
+                error.message.contains("0s"),
+                "error should echo schedule text, got: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_bare_cron_presets() {
+        for (input, preset) in [
+            ("daily cargo test", CronPreset::Daily),
+            ("hourly cargo test", CronPreset::Hourly),
+            ("weekly cargo test", CronPreset::Weekly),
+            ("monthly cargo test", CronPreset::Monthly),
+        ] {
+            match resolve(input, Mode::Cron) {
+                ResolvedCommand::Cron {
+                    schedule, chain, ..
+                } => {
+                    assert_eq!(schedule, CronSchedule::Preset(preset));
+                    let pipeline = leaf_pipeline(chain);
+                    assert_eq!(pipeline.segments[0].command, vec!["cargo", "test"]);
+                }
+                other => panic!("expected {input} cron preset, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_cd_path() {
+        match resolve(":cd /tmp/project", Mode::Job) {
+            ResolvedCommand::Cd { path } => assert_eq!(path, "/tmp/project"),
+            other => panic!("expected :cd, got {other:?}"),
+        }
+        match resolve(":cd", Mode::Job) {
+            ResolvedCommand::Cd { path } => assert!(path.is_empty()),
+            other => panic!("expected bare :cd, got {other:?}"),
         }
     }
 
@@ -1097,11 +1209,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cron_keeps_scheduler_text() {
+    fn resolve_cron_interval_schedule() {
         let cmd = resolve(":cron every 1h echo hello", Mode::Job);
         match cmd {
-            ResolvedCommand::Cron { schedule: _, .. } => {
-                // schedule_text replaced by schedule: CronSchedule; display check removed
+            ResolvedCommand::Cron {
+                schedule, chain, ..
+            } => {
+                assert_eq!(schedule, CronSchedule::Interval(Duration::from_secs(3600)));
+                let pipeline = leaf_pipeline(chain);
+                assert_eq!(pipeline.segments[0].command, vec!["echo", "hello"]);
             }
             _ => panic!("expected Cron"),
         }
@@ -1111,10 +1227,14 @@ mod tests {
     fn resolve_cron_keeps_five_field_scheduler_text() {
         let cmd = resolve(":cron cron */5 * * * * echo hello", Mode::Job);
         match cmd {
-            ResolvedCommand::Cron { schedule, .. } => {
+            ResolvedCommand::Cron {
+                schedule, chain, ..
+            } => {
                 assert!(
                     matches!(schedule, CronSchedule::Crontab(e) if e.as_str() == "*/5 * * * *")
                 );
+                let pipeline = leaf_pipeline(chain);
+                assert_eq!(pipeline.segments[0].command, vec!["echo", "hello"]);
             }
             _ => panic!("expected Cron"),
         }

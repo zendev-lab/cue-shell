@@ -473,7 +473,10 @@ mod tests {
             panic!("gateway initialization failure should stop daemon startup");
         };
 
-        assert!(error.to_string().contains("remove stale socket"));
+        assert!(
+            error.to_string().contains("bind socket"),
+            "unexpected gateway init error: {error}"
+        );
         std::fs::remove_dir_all(socket_path).expect("remove socket-blocking directory");
     }
 

@@ -11,27 +11,28 @@ license.workspace = true
 name = "cue"
 path = "src/main.rs"
 
-# First-party companion binaries are sourced from their owning crates. The
-# feature gates let package builders select exactly which command surfaces the
-# aggregate `cue-cli` package should expose.
+# Companion command names must live inside this package. Maturin rewrites the
+# sdist Cargo.toml and drops [[bin]] targets whose paths leave the crate root,
+# which previously left only `cue` installable from source distributions.
+# Owning crates still keep their own bins for direct cargo run / workspace use.
 [[bin]]
 name = "cue-client"
-path = "../cue-client/src/bin/cue-client.rs"
+path = "src/bin/cue-client.rs"
 required-features = ["cue-client"]
 
 [[bin]]
 name = "cue-tui"
-path = "../cue-tui/src/bin/cue-tui.rs"
+path = "src/bin/cue-tui.rs"
 required-features = ["cue-tui"]
 
 [[bin]]
 name = "cue-daemon"
-path = "../cue-daemon/src/bin/cue-daemon.rs"
+path = "src/bin/cue-daemon.rs"
 required-features = ["cue-daemon"]
 
 [[bin]]
 name = "cued"
-path = "../cue-daemon/src/bin/cued.rs"
+path = "src/bin/cued.rs"
 required-features = ["cue-daemon"]
 
 [dependencies]

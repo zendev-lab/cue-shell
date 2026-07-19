@@ -365,38 +365,46 @@ mod tests {
     }
 
     #[test]
-    fn pid_path_sibling_of_socket() {
-        let sock = socket_path();
-        let pid = pid_path_for_socket(&sock);
-        assert_eq!(sock.parent(), pid.parent());
-        assert_eq!(pid.file_name().unwrap(), "cued.sock.cued.pid");
-    }
+    fn socket_sidecar_naming() {
+        let cases = [
+            (
+                Path::new("/tmp/cue-tests/custom-worker.sock"),
+                "/tmp/cue-tests/custom-worker.sock.cued.pid",
+                "/tmp/cue-tests/custom-worker.sock.cued.lock",
+            ),
+            (
+                Path::new("/tmp/cue-tests/foo.sock"),
+                "/tmp/cue-tests/foo.sock.cued.pid",
+                "/tmp/cue-tests/foo.sock.cued.lock",
+            ),
+            (
+                Path::new("/tmp/cue-tests/foo.other"),
+                "/tmp/cue-tests/foo.other.cued.pid",
+                "/tmp/cue-tests/foo.other.cued.lock",
+            ),
+        ];
 
-    #[test]
-    fn custom_socket_gets_isolated_pid_and_lock_paths() {
-        let socket = Path::new("/tmp/cue-tests/custom-worker.sock");
+        for (socket, expected_pid, expected_lock) in cases {
+            assert_eq!(pid_path_for_socket(socket), PathBuf::from(expected_pid));
+            assert_eq!(lock_path_for_socket(socket), PathBuf::from(expected_lock));
+        }
 
-        assert_eq!(
-            pid_path_for_socket(socket),
-            PathBuf::from("/tmp/cue-tests/custom-worker.sock.cued.pid")
-        );
-        assert_eq!(
-            lock_path_for_socket(socket),
-            PathBuf::from("/tmp/cue-tests/custom-worker.sock.cued.lock")
+        let default_sock = socket_path();
+        let default_pid = pid_path_for_socket(&default_sock);
+        assert_eq!(default_sock.parent(), default_pid.parent());
+        assert_eq!(default_pid.file_name().unwrap(), "cued.sock.cued.pid");
+        assert_ne!(
+            pid_path_for_socket(Path::new("/tmp/cue-tests/custom-worker.sock")),
+            default_pid
         );
         assert_ne!(
-            pid_path_for_socket(socket),
-            pid_path_for_socket(&socket_path())
+            pid_path_for_socket(Path::new("/tmp/cue-tests/foo.sock")),
+            pid_path_for_socket(Path::new("/tmp/cue-tests/foo.other"))
         );
-    }
-
-    #[test]
-    fn marker_paths_preserve_the_full_socket_filename() {
-        let first = Path::new("/tmp/cue-tests/foo.sock");
-        let second = Path::new("/tmp/cue-tests/foo.other");
-
-        assert_ne!(pid_path_for_socket(first), pid_path_for_socket(second));
-        assert_ne!(lock_path_for_socket(first), lock_path_for_socket(second));
+        assert_ne!(
+            lock_path_for_socket(Path::new("/tmp/cue-tests/foo.sock")),
+            lock_path_for_socket(Path::new("/tmp/cue-tests/foo.other"))
+        );
     }
 
     #[test]
@@ -488,8 +496,10 @@ mod tests {
                 .expect("set wide directory mode");
         }
         let db = layout.data.join("cued.db");
+        let socket = layout.runtime.join("cued.sock");
         let files = [
-            layout.runtime.join("cued.pid"),
+            pid_path_for_socket(&socket),
+            lock_path_for_socket(&socket),
             db.clone(),
             database_sidecar_path(&db, "-wal"),
             database_sidecar_path(&db, "-shm"),
@@ -527,18 +537,78 @@ mod tests {
     fn private_file_helpers_secure_new_and_existing_files() {
         let root = temp_dir("files");
         let created = root.join("created");
+        let ensured = root.join("ensured");
         let existing = root.join("existing");
+        let already = root.join("already");
         std::fs::write(&existing, b"old").expect("create existing file");
         std::fs::set_permissions(&existing, Permissions::from_mode(0o644))
             .expect("set wide file mode");
+        std::fs::write(&already, b"keep").expect("create already-existing file");
+        std::fs::set_permissions(&already, Permissions::from_mode(0o644))
+            .expect("set wide already-existing mode");
 
         write_private_file(&created, b"new").expect("write private file");
+        ensure_private_file(&ensured).expect("ensure private file");
+        let created_again = create_private_file(&already).expect("open existing private file");
+        assert!(created_again.is_none());
         let mut appended = open_private_append(&existing).expect("open private append");
         appended.write_all(b" data").expect("append data");
 
         assert_eq!(mode(&created), PRIVATE_FILE_MODE);
+        assert_eq!(mode(&ensured), PRIVATE_FILE_MODE);
+        assert_eq!(mode(&already), PRIVATE_FILE_MODE);
         assert_eq!(mode(&existing), PRIVATE_FILE_MODE);
+        assert!(ensured.is_file());
         std::fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn create_private_file_rejects_missing_parents() {
+        let root = temp_dir("create-missing-parent");
+        let path = root.join("missing-dir").join("file");
+
+        let error = create_private_file(&path).expect_err("missing parent must fail");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        std::fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn secure_database_files_skips_memory_and_hardens_on_disk_sidecars() {
+        secure_database_files(Path::new(":memory:")).expect("memory db is a no-op");
+
+        let root = temp_dir("db-files");
+        let db = root.join("cued.db");
+        let wal = database_sidecar_path(&db, "-wal");
+        let shm = database_sidecar_path(&db, "-shm");
+        for path in [&db, &wal, &shm] {
+            std::fs::write(path, b"sqlite").expect("create db file");
+            std::fs::set_permissions(path, Permissions::from_mode(0o644))
+                .expect("set wide db mode");
+        }
+
+        secure_database_files(&db).expect("secure on-disk db files");
+        assert_eq!(mode(&db), PRIVATE_FILE_MODE);
+        assert_eq!(mode(&wal), PRIVATE_FILE_MODE);
+        assert_eq!(mode(&shm), PRIVATE_FILE_MODE);
+        std::fs::remove_dir_all(root).expect("remove temp root");
+    }
+
+    #[test]
+    fn log_path_and_home_dir_resolve_under_real_env() {
+        let home = home_dir().expect("HOME should be set in tests");
+        assert!(!home.as_os_str().is_empty());
+        assert_eq!(
+            home,
+            PathBuf::from(std::env::var_os("HOME").expect("HOME env"))
+        );
+
+        let log = log_path().expect("log path");
+        assert!(log.ends_with("cued.log"), "got: {}", log.display());
+        assert!(
+            log.components().any(|c| c.as_os_str() == APP_DIR),
+            "log path should include app dir: {}",
+            log.display()
+        );
     }
 
     #[test]
@@ -577,6 +647,10 @@ mod tests {
             0o644,
             "target mode must remain unchanged"
         );
+
+        let error = secure_private_file(&linked_file)
+            .expect_err("symlinked path must not be treated as missing");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
         std::fs::remove_dir_all(root).expect("remove temp root");
     }

@@ -35,6 +35,7 @@ build-backend = "maturin"
 
 [tool.maturin]
 bindings = "bin"
+features = ["cue-client", "cue-daemon", "cue-tui"]
 include = [{ path = "LICENSE", format = "sdist" }]
 manifest-path = "crates/cue-cli/Cargo.toml"
 strip = true

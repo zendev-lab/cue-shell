@@ -662,6 +662,7 @@ fn terminate_verified_unreachable_daemon(
 
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = lock_path;
         anyhow::bail!(
             "refusing --force: PID marker {} names live pid {pid}, but socket {} cannot be confirmed as cued",
             pid_path.display(),
