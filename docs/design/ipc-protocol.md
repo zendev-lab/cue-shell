@@ -161,15 +161,40 @@ enum RequestPayload {
     // === Protocol commands (structured, not user-typed) ===
 
     // Connection / subscription
-    Handshake { session_id: String, cwd: String, env: BTreeMap<String, String> },
+    Handshake {
+        session_id: String,
+        cwd: String,
+        env: BTreeMap<String, String>,
+        refresh: bool,
+    },
     Subscribe { channels: Vec<String> },
     Unsubscribe { channels: Vec<String> },
 
-    // :fg mode (job pty attach)
-    FgAttach { id: String },  // J1
+    // Foreground PTY attachment. FgAttach is the legacy-compatible exclusive
+    // controller entry point; the other three operations require the
+    // `foreground-observers` capability.
+    FgAttach { id: String },  // attach as controller, J1
+    FgWatch { id: String },   // attach as a read-only observer
+    FgClaimControl {},        // claim only when the controller lease is free
+    FgReleaseControl {},      // remain attached, but release the lease
     FgDetach {},
-    FgInput { data: Vec<u8> },  // raw bytes from TUI keyboard
-    FgResize { cols: u16, rows: u16 },  // terminal resize
+    FgInput { data: Vec<u8> },           // controller only
+    FgResize { cols: u16, rows: u16 },   // controller only
+
+    // Durable shared process sessions (`named-sessions` capability)
+    CreateSession { name: String },
+    ListSessions {},          // active only
+    AttachSession {
+        selector: String,  // session name or opaque SS-... id
+        refresh: bool,     // explicit recovery for a lost volatile scope only
+    },
+    SessionInfo { selector: Option<String> },  // None = current session
+
+    // Reversible lifecycle (`session-archive` capability)
+    ListArchivedSessions {},
+    ListAllSessions {},
+    ArchiveSession { selector: String },
+    RestoreSession { selector: String },
 
     // Editor services (completion & highlighting)
     Complete { input: String, cursor: usize },
@@ -255,11 +280,25 @@ enum OkPayload {
     CompletionList { items: Vec<CompletionItem> },
     HighlightResult { spans: Vec<HighlightSpan> },
 
-    FgAttached { id: String },  // J<n> = live PTY attach
+    SessionInfo(SessionInfo),
+    SessionList(Vec<SessionInfo>),
+
+    FgAttached(ForegroundAttachmentInfo),
+    FgRoleChanged {
+        id: String,
+        attachment_id: u64,
+        role: ForegroundRole,
+        control_available: bool,
+    },
     Pong {
-        version: String,           // reports cued's build version
-        protocol_version: u32,     // current sessionized IPC protocol version
-        capabilities: Vec<String>, // session-handshake-required, script-item-created, cancel-execution
+        version: String,          // reports cued's build version
+        instance_id: String,      // changes for every daemon process
+        generation_id: String,    // restart-fence generation
+        ready: bool,              // false while restart handoff is incomplete
+        protocol_version: u32,    // current sessionized IPC protocol version
+        capabilities: Vec<String>,
+        // includes session-handshake-required, named-sessions,
+        // foreground-observers, and other independently gated features
     }
 }
 
@@ -277,6 +316,33 @@ struct StreamText {
     base64: Option<String>,   // exact bytes for Base64 payloads
 }
 
+enum ForegroundRole {
+    Controller,
+    Observer,
+}
+
+struct ForegroundAttachmentInfo {
+    id: String,
+    attachment_id: u64,       // opaque attachment generation; 0 is legacy
+    role: ForegroundRole,
+    control_available: bool,
+    snapshot: Vec<u8>,        // base64 in JSON; precedes live FgOutput events
+    snapshot_truncated: bool,
+}
+
+struct SessionInfo {
+    id: String,
+    name: String,
+    scope_state: SessionScopeState,  // ReadyDurable, ReadyVolatile, NeedsRefresh
+    scope_hash: Option<String>,
+    connected_clients: usize,
+    restart_safe: bool,
+    current: bool,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    archived_at_ms: Option<i64>,  // None = active; defaults to None for legacy peers
+}
+
 // Completion item (for Complete request)
 struct CompletionItem {
     label: String,
@@ -292,10 +358,45 @@ struct HighlightSpan {
 }
 ```
 
-`Ping`/`Pong` is also the feature gate for typed clients. Current Spark clients
-require `protocol_version >= 2` plus `session-handshake-required`,
-`script-item-created`, and `cancel-execution`; a daemon missing any required
-capability must be upgraded/restarted before jobs are submitted.
+`Ping`/`Pong` is also the feature gate for typed clients. Clients retain the
+advertised capabilities on the connection and propagate them when splitting a
+reader from a cloneable writer. Current cue-shell clients require
+`protocol_version >= 2` plus `session-handshake-required`; newer typed requests
+are gated independently by their feature capability.
+
+`FgWatch`, `FgClaimControl`, `FgReleaseControl`, and the `:watch` Eval command
+require `foreground-observers`. A client must reject these locally with an
+upgrade/restart error when the capability is absent; sending an unknown request
+to an older daemon can terminate the transport. `FgAttach` remains available as
+the legacy-compatible exclusive attach operation. After its response, a current
+daemon may also emit the retained snapshot once as an epoch-0 `FgOutput` for
+pre-shared-mode clients; a current non-zero attachment must ignore that event.
+
+`CreateSession`, `ListSessions`, `AttachSession`, and `SessionInfo` similarly
+require `named-sessions`. Standard connections Ping before splitting into
+reader/writer halves, so the same capability decision survives initial attach
+and automatic reconnect. A custom unprobed byte stream must complete Ping (or
+supply its already authenticated capability set) before it can make the same
+mixed-version guarantee.
+
+`ListArchivedSessions`, `ListAllSessions`, `ArchiveSession`, and
+`RestoreSession` require `session-archive`. Clients must gate all four before
+writing them, including after splitting or multiplexing a connection. This
+keeps an older daemon from closing the transport on an unknown enum variant.
+
+### Named-session archive lifecycle
+
+`ListSessions` is the normal active view; archived sessions appear only in
+`ListArchivedSessions` or `ListAllSessions`. Archiving is reversible metadata,
+not deletion: it preserves the session identity, scope cursor, and retained
+job/terminal history. An archived session cannot be attached or own new work
+until `RestoreSession` clears `archived_at_ms`.
+
+The daemon refuses archive while the session has connected clients,
+non-terminal jobs, pending script or chain work, or an owned cron. Clients must
+resolve those blockers explicitly; the protocol has no force-archive and no
+hard-delete operation. Repeating archive or restore is idempotent and returns
+the current `SessionInfo`.
 
 ## 8. Event Types (cued → Client, pushed)
 
@@ -346,9 +447,22 @@ enum EventPayload {
 
     // Scope cursor changes are per-session responses (`ScopeCreated`), not global events.
 
-    // :fg events (no channel — only sent to fg-attached client)
-    FgOutput { data: Vec<u8> },  // raw pty output
-    FgExited { id: String, reason: String },  // process exited while in :fg
+    // Foreground events (no channel — sent to every observer of this attachment)
+    FgOutput {
+        id: String,
+        attachment_id: u64,
+        data: Vec<u8>,
+    },
+    FgControlChanged {
+        id: String,
+        attachment_id: u64,
+        control_available: bool,
+    },
+    FgExited {
+        id: String,
+        attachment_id: u64,
+        reason: String,
+    },
 
     // System events (channel: "system")
     ShuttingDown { reason: String },
@@ -444,19 +558,43 @@ Job scope fields are intentionally split:
 - `chain_id` / `chain_index` / `chain_total` let clients correlate per-job events with a serial/parallel chain without waiting for a `:jobs` refresh.
 - `ChainCreated` and `ChainProgress` carry the authoritative leaf-by-leaf chain snapshot, including pending leaves that do not have job IDs yet and serial scope handoffs via `start_scope` / `end_scope`.
 
-## 9. :fg Full-Duplex Proxy Mode
+## 9. Shared Foreground PTY Mode
 
-When client sends `FgAttach { id: "J1" }`:
+Each connection may observe at most one PTY job at a time. A job may have many
+observers but exactly one controller lease:
 
-1. cued responds `FgAttached { id: "J1" }`
-2. Connection enters **fg proxy mode** for this job:
-   - Client → cued: `FgInput { data }` messages (raw keystrokes)
-   - cued → client: `FgOutput { data }` events (raw pty output)
-   - Client → cued: `FgResize { cols, rows }` on terminal resize
-3. Client sends `FgDetach {}` to exit (triggered by Ctrl+Z)
-4. cued responds `Ack {}`, connection returns to normal mode
+1. `FgAttach { id: "J1" }` atomically registers the connection as controller,
+   or returns an error when another controller owns the lease.
+2. `FgWatch { id: "J1" }` atomically registers a read-only observer without
+   taking or stealing the controller lease.
+3. cued returns `FgAttached(ForegroundAttachmentInfo)`. `snapshot` is the byte
+   history captured at the registration cut; matching live `FgOutput` events
+   are held until that response is written, so clients append snapshot then
+   live bytes without a gap or duplicate interval.
+4. Every subsequent foreground response/event carries both job `id` and opaque
+   `attachment_id`. Clients must mutate a foreground view only when both match
+   the active attachment. Legacy payloads decode with `attachment_id = 0`, and
+   a legacy attachment accepts only legacy events whose attachment ID is also
+   zero.
+5. Only the controller may send `FgInput` or `FgResize`. An observer may call
+   `FgClaimControl` only while `control_available` is true. The current
+   controller calls `FgReleaseControl` to remain attached as an observer; there
+   is no implicit steal or force-takeover path.
+6. A successful claim/release returns `FgRoleChanged`; all observers receive
+   `FgControlChanged` when lease availability changes. A TUI uses Ctrl+] for
+   claim/release and shows failures in the foreground footer.
+7. `FgDetach {}` (Ctrl+Z), connection close, or named-session switch removes
+   the observer and releases its controller lease. `FgExited` closes only the
+   matching attachment generation.
 
-During fg mode, other Request/Response and Event messages continue normally on the same connection.
+Other Request/Response and Event messages continue normally on the same
+connection while foreground mode is active.
+
+Foreground attach is intentionally connection-local. An `Eval` resolving to
+`:fg` or `:watch` must not carry `operation_id`, because a replayed attachment
+response cannot recreate registration on a different transport. `RunScript`
+rejects any item resolving to either command with `NOT_SUPPORTED`; clients
+reattach the named session and issue a fresh interactive foreground request.
 
 ## 10. Error Codes
 
@@ -478,7 +616,11 @@ Standard error codes returned in `Err { code, message }`:
 ```
 Client                              cued
   |                                   |
-   |--- connect (Unix socket) -------->|
+  |--- connect (Unix socket) -------->|
+  |--- Handshake {session...} ------->|
+  |<-- Response {Ok: Ack} ------------|
+  |--- Ping {} ---------------------->|
+  |<-- Pong {capabilities...} --------|
   |                                   |
   |--- Subscribe {channels} --------->|
   |<-- Response {Ok: Ack} ------------|
@@ -489,8 +631,8 @@ Client                              cued
   |<-- Event {OutputChunk} -----------|  (if subscribed)
   |                                   |
   |--- FgAttach {id: "J1"} ---------->|
-  |<-- Response {Ok: FgAttached} -----|
-  |<-- FgOutput {data} ---------------|  (streaming)
+  |<-- FgAttached {snapshot, role...} -|
+  |<-- FgOutput {id, attachment_id...}-|  (streaming)
   |--- FgInput {data} --------------->|  (keystrokes)
   |--- FgDetach {} ------------------->|
   |<-- Response {Ok: Ack} ------------|

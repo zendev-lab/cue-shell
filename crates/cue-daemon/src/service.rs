@@ -17,11 +17,85 @@ use crate::command_util::CommandSpec;
 #[cfg(target_os = "macos")]
 const SERVICE_LABEL: &str = "com.cue-shell.cued";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceProcessState {
+    Active(u32),
+    Inactive,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentProcessOwnership {
+    Managed,
+    NotManaged,
+    Unknown,
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Returns `true` if the service unit/plist file is present on disk.
 pub fn is_installed() -> Result<bool> {
     Ok(service_file_path()?.exists())
+}
+
+pub(crate) fn process_state() -> ServiceProcessState {
+    service_process_state().unwrap_or(ServiceProcessState::Unknown)
+}
+
+pub(crate) fn current_process_ownership() -> CurrentProcessOwnership {
+    current_process_ownership_from_state(process_state(), std::process::id())
+}
+
+fn current_process_ownership_from_state(
+    state: ServiceProcessState,
+    current_pid: u32,
+) -> CurrentProcessOwnership {
+    match state {
+        ServiceProcessState::Active(pid) if pid == current_pid => CurrentProcessOwnership::Managed,
+        ServiceProcessState::Active(_) | ServiceProcessState::Inactive => {
+            CurrentProcessOwnership::NotManaged
+        }
+        ServiceProcessState::Unknown => CurrentProcessOwnership::Unknown,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_process_state_from_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> ServiceProcessState {
+    if success {
+        return match String::from_utf8_lossy(stdout).trim().parse::<u32>() {
+            Ok(0) => ServiceProcessState::Inactive,
+            Ok(pid) => ServiceProcessState::Active(pid),
+            Err(_) => ServiceProcessState::Unknown,
+        };
+    }
+
+    let failure = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    )
+    .to_ascii_lowercase();
+    let names_cued_unit = failure.contains("cued.service") || failure.contains("unit cued");
+    if names_cued_unit
+        && (failure.contains("not found")
+            || failure.contains("not loaded")
+            || failure.contains("no such unit")
+            || failure.contains("could not be found"))
+    {
+        ServiceProcessState::Inactive
+    } else {
+        ServiceProcessState::Unknown
+    }
+}
+
+/// Ask the service manager to start the installed job without replacing a
+/// process that may already be the exact restart successor.
+pub(crate) fn start_if_needed() -> Result<()> {
+    start_service_if_needed()
 }
 
 /// Write the service file and activate it so cued starts at login.
@@ -110,6 +184,7 @@ fn service_file_content(exe_path: &Path, log_path: &Path) -> Result<String> {
         <string>{exe}</string>
         <string>start</string>
         <string>--fg</string>
+        <string>--preserve-restart-fence</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -178,6 +253,45 @@ fn restart_service() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn start_service_command() -> CommandSpec {
+    let uid = unsafe { libc::getuid() };
+    let service = format!("gui/{uid}/{SERVICE_LABEL}");
+    CommandSpec::new("launchctl").args(["kickstart", service.as_str()])
+}
+
+#[cfg(target_os = "macos")]
+fn start_service_if_needed() -> Result<()> {
+    let command = start_service_command();
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!("{}", command.failure_summary(&output));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn service_process_state() -> Result<ServiceProcessState> {
+    let uid = unsafe { libc::getuid() };
+    let service = format!("gui/{uid}/{SERVICE_LABEL}");
+    let command = CommandSpec::new("launchctl").args(["print", service.as_str()]);
+    let output = command.output()?;
+    if !output.status.success() {
+        let summary = command.failure_summary(&output).to_ascii_lowercase();
+        if summary.contains("could not find service") || summary.contains("not found") {
+            return Ok(ServiceProcessState::Inactive);
+        }
+        return Ok(ServiceProcessState::Unknown);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = "))
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .map_or(ServiceProcessState::Inactive, ServiceProcessState::Active))
+}
+
 // ── Linux (systemd --user) ───────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
@@ -193,11 +307,13 @@ fn service_file_content(exe_path: &Path, _log_path: &Path) -> Result<String> {
         "[Unit]\n\
          Description=cued — background daemon for cue-shell\n\
          After=default.target\n\
+         StartLimitIntervalSec=30\n\
+         StartLimitBurst=5\n\
          \n\
          [Service]\n\
-         ExecStart={exe} start --fg\n\
+         ExecStart={exe} start --fg --preserve-restart-fence\n\
          Restart=on-failure\n\
-         RestartSec=3\n\
+         RestartSec=250ms\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
@@ -258,6 +374,38 @@ fn restart_service() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn start_service_command() -> CommandSpec {
+    CommandSpec::new("systemctl").args(["--user", "start", "cued"])
+}
+
+#[cfg(target_os = "linux")]
+fn start_service_if_needed() -> Result<()> {
+    let command = start_service_command();
+    let output = command.output()?;
+    if !output.status.success() {
+        bail!("{}", command.failure_summary(&output));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn service_process_state() -> Result<ServiceProcessState> {
+    let command = CommandSpec::new("systemctl").args([
+        "--user",
+        "show",
+        "--property=MainPID",
+        "--value",
+        "cued",
+    ]);
+    let output = command.output()?;
+    Ok(systemd_process_state_from_output(
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+    ))
+}
+
 // ── Unsupported platforms ────────────────────────────────────────────────────
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -283,6 +431,16 @@ fn deactivate(_: &Path) -> Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn restart_service() -> Result<()> {
     bail!("service management is not supported on this platform")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn start_service_if_needed() -> Result<()> {
+    bail!("service management is not supported on this platform")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn service_process_state() -> Result<ServiceProcessState> {
+    Ok(ServiceProcessState::Unknown)
 }
 
 #[cfg(test)]
@@ -334,5 +492,68 @@ mod tests {
         assert!(content.contains(&format!("{}", exe.display())));
         assert!(!content.contains(&format!("{}", symlink.display())));
         std::fs::remove_dir_all(dir).expect("remove temp service test dir");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn start_if_needed_command_is_non_destructive() {
+        let command = start_service_command().display();
+        assert!(!command.contains(" restart "), "{command}");
+        assert!(!command.contains(" -k "), "{command}");
+        #[cfg(target_os = "macos")]
+        assert!(command.contains("launchctl kickstart"), "{command}");
+        #[cfg(target_os = "linux")]
+        assert!(command.contains("systemctl --user start cued"), "{command}");
+    }
+
+    #[test]
+    fn current_process_ownership_requires_exact_manager_main_pid() {
+        assert_eq!(
+            current_process_ownership_from_state(ServiceProcessState::Active(7), 7),
+            CurrentProcessOwnership::Managed
+        );
+        assert_eq!(
+            current_process_ownership_from_state(ServiceProcessState::Active(8), 7),
+            CurrentProcessOwnership::NotManaged
+        );
+        assert_eq!(
+            current_process_ownership_from_state(ServiceProcessState::Inactive, 7),
+            CurrentProcessOwnership::NotManaged
+        );
+        assert_eq!(
+            current_process_ownership_from_state(ServiceProcessState::Unknown, 7),
+            CurrentProcessOwnership::Unknown
+        );
+    }
+
+    #[test]
+    fn systemd_state_parser_distinguishes_inactive_from_unknown_failures() {
+        assert_eq!(
+            systemd_process_state_from_output(true, b"42\n", b""),
+            ServiceProcessState::Active(42)
+        );
+        assert_eq!(
+            systemd_process_state_from_output(true, b"0\n", b""),
+            ServiceProcessState::Inactive
+        );
+        for message in [
+            "Unit cued.service not found.",
+            "Unit cued.service is not loaded.",
+            "No such unit: cued.service",
+        ] {
+            assert_eq!(
+                systemd_process_state_from_output(false, b"", message.as_bytes()),
+                ServiceProcessState::Inactive,
+                "{message}"
+            );
+        }
+        assert_eq!(
+            systemd_process_state_from_output(false, b"", b"Failed to connect to bus: denied"),
+            ServiceProcessState::Unknown
+        );
+        assert_eq!(
+            systemd_process_state_from_output(true, b"not-a-pid", b""),
+            ServiceProcessState::Unknown
+        );
     }
 }

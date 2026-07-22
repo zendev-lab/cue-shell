@@ -13,7 +13,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ JOB  J:3 (1 running) C:2  cued:ok  mouse:ui  14:30 ... │ ← Split header
+│ JOB  session:dev  J:3 (1 running) C:2  cued:ok ...     │ ← Split header
 ├────────────┬────────────────────────────────────────────────┤
 │ Sidebar    │ ┌ stdout J1 × ───────────────────────────────┐ │
 │ (mode list)│ │ Compiling cue-core                         │ │
@@ -34,14 +34,19 @@
 ### :fg 全屏模式
 
 ```
-┌─────────────────────────────────────┐
-│                                     │
-│   (Job pty)                          │
-│                                     │
-├─────────────────────────────────────┤
-│  Job: Ctrl+Z detach                │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│                                              │
+│   (Job pty)                                  │
+│                                              │
+├──────────────────────────────────────────────┤
+│ [control] Ctrl+] release · Ctrl+Y copy       │
+│ Ctrl+Z detach                                │
+└──────────────────────────────────────────────┘
 ```
+
+只读 attach 时 footer 显示 `[watch · control busy]` 或
+`[watch · control available] Ctrl+] take control`。领取或释放失败会直接显示在
+同一 footer；历史 snapshot 被截断时也会标记 `history truncated`。
 
 ### 布局规则
 
@@ -50,7 +55,9 @@
 | 侧边栏显示 | 终端 ≥100 列时自动显示，<100 隐藏 |
 | 侧边栏切换 | Ctrl+B 手动覆盖 |
 | 侧边栏宽度 | 比例 20%~30%，min 20 列 max 40 列 |
-| Job :fg 退出键 | Ctrl+Z |
+| Job :fg 控制权 | Ctrl+] 在 controller / 可领取 observer 间显式 release / claim |
+| Job :fg 复制 | Ctrl+Y |
+| Job :fg detach | Ctrl+Z |
 ## 三、侧边栏
 
 ### 内容跟随模式
@@ -61,6 +68,8 @@
 | CRON ⏰ | Crons 列表 |
 
 全局计数不再放在侧边栏底部，而是提升到顶部 header。
+通过 `--session` / `CUE_SESSION` 进入命名 session 时，header 始终显示
+`session:<selector>`；`:fg` 全屏标题也保留同一标识，窄窗口优先保留该 badge。
 
 ### 列表项格式（单行）
 

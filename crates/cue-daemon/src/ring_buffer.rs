@@ -84,11 +84,6 @@ impl RingBuffer {
         out
     }
 
-    /// Return the last `n` bytes (or fewer if fewer are stored).
-    pub fn tail(&self, n: usize) -> Vec<u8> {
-        self.tail_with_truncation(n).0
-    }
-
     /// Return the last `n` bytes and whether older output was omitted.
     pub fn tail_with_truncation(&self, n: usize) -> (Vec<u8>, bool) {
         let n = n.min(self.len);
@@ -126,9 +121,9 @@ mod tests {
     fn tail_returns_last_n() {
         let mut rb = RingBuffer::new(16);
         rb.push(b"hello world");
-        assert_eq!(rb.tail(5), b"world");
+        assert_eq!(rb.tail_with_truncation(5).0, b"world");
         // Requesting more than stored returns everything.
-        assert_eq!(rb.tail(100), b"hello world");
+        assert_eq!(rb.tail_with_truncation(100).0, b"hello world");
     }
 
     #[test]
@@ -167,7 +162,7 @@ mod tests {
         let rb = RingBuffer::new(8);
         assert_eq!(rb.len(), 0);
         assert_eq!(rb.as_bytes(), b"");
-        assert_eq!(rb.tail(5), b"");
+        assert_eq!(rb.tail_with_truncation(5).0, b"");
     }
 
     #[test]
@@ -178,7 +173,7 @@ mod tests {
         assert_eq!(rb.as_bytes(), b"ABCDEF");
         rb.push(b"GH");
         assert_eq!(rb.as_bytes(), b"CDEFGH");
-        assert_eq!(rb.tail(3), b"FGH");
+        assert_eq!(rb.tail_with_truncation(3).0, b"FGH");
     }
 
     #[test]

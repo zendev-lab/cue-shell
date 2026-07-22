@@ -21,7 +21,7 @@ use crate::transport_schema::{
     validate_profile_name,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TransportProfileSummary {
     pub name: String,
     pub transport: TransportProfileKind,
@@ -35,7 +35,7 @@ impl TransportProfileSummary {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum TransportProfileKind {
     Unix,
     Ssh,
@@ -66,7 +66,7 @@ impl fmt::Display for TransportProfileKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum TransportProfileSource {
     Local,
     Configured,
@@ -74,7 +74,7 @@ pub enum TransportProfileSource {
     Missing,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TransportSettingsSnapshot {
     pub source_path: PathBuf,
     pub auto_detect_ssh: bool,

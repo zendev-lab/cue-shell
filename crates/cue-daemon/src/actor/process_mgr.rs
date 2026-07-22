@@ -4,7 +4,7 @@
 //! stdout/stderr into a [`RingBuffer`], writes a persistent log file, and
 //! publishes output chunks + state-change events.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
-use cue_core::ipc::{EventPayload, Stream as OutputStream};
+use cue_core::ipc::{
+    EventPayload, ForegroundAttachmentInfo, ForegroundRole, Stream as OutputStream,
+};
 use cue_core::job::{EXIT_CODE_UNAVAILABLE, JobStatus};
 use cue_core::pipeline::{JobPlan, command_prefers_foreground};
 use cue_core::process_status::exit_code_from_status;
@@ -25,9 +27,10 @@ use cue_core::scope::EnvSnapshot;
 use cue_core::{EventChannel, JobId};
 
 use super::{
-    ActorSystem, OutputSnapshot, ProcessJobOptions, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg,
-    StderrSnapshot, publish_event as publish_actor_event,
-    publish_event_except as publish_actor_event_except,
+    ActorSystem, ForegroundRoleUpdate, OutputSnapshot, ProcessJobOptions, ProcessMgrMsg,
+    SchedulerMsg, ScopeStoreMsg, StderrSnapshot,
+    publish_session_event as publish_actor_session_event,
+    publish_session_event_except as publish_actor_session_event_except,
     send_gateway_event as send_actor_gateway_event,
 };
 use crate::ring_buffer::RingBuffer;
@@ -38,6 +41,8 @@ use crate::word_expansion::expand_command_line;
 
 struct ProcessEntry {
     job_id: JobId,
+    /// Named session that owns this process, or `None` for legacy anonymous jobs.
+    session_id: Option<String>,
     status: JobStatus,
     /// Handle for the background reader/waiter task.
     reader_handle: tokio::task::JoinHandle<()>,
@@ -51,8 +56,143 @@ struct ProcessEntry {
     input: Option<JobInput>,
     /// PTY master fd used for resize ioctls.
     resize: Option<Arc<std::fs::File>>,
-    /// Which client, if any, owns the foreground stream.
-    fg_owner: Arc<Mutex<Option<u64>>>,
+    /// Shared foreground observer set and exclusive controller lease.
+    foreground: Arc<Mutex<ForegroundState>>,
+}
+
+/// Runtime-only attachment state for one job's foreground stream.
+///
+/// The controller is always also present in `observers`. `closed` fences late
+/// attach attempts while the reader task is publishing terminal events.
+#[derive(Debug, Default)]
+struct ForegroundState {
+    /// Client id to the epoch of its current attachment.
+    observers: BTreeMap<u64, u64>,
+    controller: Option<u64>,
+    /// Last epoch allocated for this job. Zero is reserved for legacy IPC.
+    last_attachment_id: u64,
+    closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ForegroundRecipient {
+    client_id: u64,
+    attachment_id: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ForegroundAttachOutcome {
+    role: ForegroundRole,
+    attachment_id: u64,
+    /// Present only when this attach acquired the free controller lease. The
+    /// new caller is deliberately absent; legacy `FgAttach` clients do not know
+    /// the `FgControlChanged` variant.
+    control_recipients: Option<Vec<ForegroundRecipient>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForegroundAttachError {
+    Closed,
+    AlreadyAttached,
+    ControlHeld,
+    AttachmentIdExhausted,
+}
+
+impl ForegroundState {
+    fn role(&self, client_id: u64) -> Option<ForegroundRole> {
+        self.observers
+            .contains_key(&client_id)
+            .then_some(if self.controller == Some(client_id) {
+                ForegroundRole::Controller
+            } else {
+                ForegroundRole::Observer
+            })
+    }
+
+    fn control_available(&self) -> bool {
+        !self.closed && self.controller.is_none()
+    }
+
+    fn recipients(&self) -> Vec<ForegroundRecipient> {
+        self.observers
+            .iter()
+            .map(|(&client_id, &attachment_id)| ForegroundRecipient {
+                client_id,
+                attachment_id,
+            })
+            .collect()
+    }
+
+    fn attach(
+        &mut self,
+        client_id: u64,
+        requested_role: ForegroundRole,
+    ) -> Result<ForegroundAttachOutcome, ForegroundAttachError> {
+        if self.closed {
+            return Err(ForegroundAttachError::Closed);
+        }
+        if self.observers.contains_key(&client_id) {
+            return Err(ForegroundAttachError::AlreadyAttached);
+        }
+        if requested_role == ForegroundRole::Controller && self.controller.is_some() {
+            return Err(ForegroundAttachError::ControlHeld);
+        }
+
+        let attachment_id = self
+            .last_attachment_id
+            .checked_add(1)
+            .ok_or(ForegroundAttachError::AttachmentIdExhausted)?;
+        let control_recipients =
+            (requested_role == ForegroundRole::Controller).then(|| self.recipients());
+
+        self.last_attachment_id = attachment_id;
+        self.observers.insert(client_id, attachment_id);
+        if requested_role == ForegroundRole::Controller {
+            self.controller = Some(client_id);
+        }
+
+        Ok(ForegroundAttachOutcome {
+            role: self
+                .role(client_id)
+                .expect("new foreground attachment must be observable"),
+            attachment_id,
+            control_recipients,
+        })
+    }
+
+    fn claim_control(&mut self, client_id: u64) -> Result<bool, ()> {
+        if self.closed || !self.observers.contains_key(&client_id) {
+            return Err(());
+        }
+        match self.controller {
+            Some(controller) if controller != client_id => Err(()),
+            Some(_) => Ok(false),
+            None => {
+                self.controller = Some(client_id);
+                Ok(true)
+            }
+        }
+    }
+
+    fn release_control(&mut self, client_id: u64) -> Result<bool, ()> {
+        if self.closed || !self.observers.contains_key(&client_id) {
+            return Err(());
+        }
+        let released = self.controller == Some(client_id);
+        if released {
+            self.controller = None;
+        }
+        Ok(released)
+    }
+
+    fn detach(&mut self, client_id: u64) -> Option<(u64, Option<Vec<ForegroundRecipient>>)> {
+        let attachment_id = self.observers.remove(&client_id)?;
+        let released_control = self.controller == Some(client_id);
+        if released_control {
+            self.controller = None;
+        }
+        Some((attachment_id, released_control.then(|| self.recipients())))
+    }
 }
 
 #[derive(Clone)]
@@ -121,8 +261,9 @@ enum JobLocalBuiltin {
 #[derive(Clone)]
 struct ProcessTaskRuntime {
     sys: ActorSystem,
-    fg_owner: Arc<Mutex<Option<u64>>>,
+    foreground: Arc<Mutex<ForegroundState>>,
     direct_output_client: Option<u64>,
+    session_id: Option<String>,
     cleanup_tx: mpsc::Sender<JobId>,
 }
 
@@ -186,6 +327,194 @@ struct StreamingContext<'a> {
     log_file: &'a Arc<Mutex<Option<std::fs::File>>>,
     stderr_log: &'a Arc<Mutex<Option<std::fs::File>>>,
     direct_output_client: Option<u64>,
+    session_id: Option<&'a str>,
+}
+
+fn foreground_job_for_client(
+    children: &HashMap<u32, ProcessEntry>,
+    client_id: u64,
+) -> Option<JobId> {
+    children.values().find_map(|entry| {
+        entry
+            .foreground
+            .lock()
+            .unwrap()
+            .observers
+            .contains_key(&client_id)
+            .then_some(entry.job_id)
+    })
+}
+
+/// Register an observer and capture the retained PTY output under the same
+/// foreground→ring lock order used by the PTY reader. That lock order is the
+/// cut between snapshot bytes and later live `FgOutput` events.
+fn attach_foreground(
+    entry: &ProcessEntry,
+    client_id: u64,
+    requested_role: ForegroundRole,
+) -> Result<(ForegroundAttachmentInfo, Option<Vec<ForegroundRecipient>>), String> {
+    if entry.status != JobStatus::Running {
+        return Err(format!("job {} is not running", entry.job_id));
+    }
+    if entry.resize.is_none() {
+        return Err(format!(
+            "job {} does not support foreground attach",
+            entry.job_id
+        ));
+    }
+
+    let mut foreground = entry.foreground.lock().unwrap();
+    let outcome = foreground
+        .attach(client_id, requested_role)
+        .map_err(|error| match error {
+            ForegroundAttachError::Closed => {
+                format!("job {} foreground is closed", entry.job_id)
+            }
+            ForegroundAttachError::AlreadyAttached => {
+                format!("client is already foreground-attached to {}", entry.job_id)
+            }
+            ForegroundAttachError::ControlHeld => {
+                format!("job {} foreground control is already held", entry.job_id)
+            }
+            ForegroundAttachError::AttachmentIdExhausted => format!(
+                "job {} foreground attachment id space is exhausted",
+                entry.job_id
+            ),
+        })?;
+    let control_available = foreground.control_available();
+    let (snapshot, snapshot_truncated) = entry
+        .ring_buffer
+        .lock()
+        .unwrap()
+        .tail_with_truncation(crate::ring_buffer::DEFAULT_CAPACITY);
+
+    Ok((
+        ForegroundAttachmentInfo {
+            id: entry.job_id.to_string(),
+            attachment_id: outcome.attachment_id,
+            role: outcome.role,
+            control_available,
+            snapshot,
+            snapshot_truncated,
+        },
+        outcome.control_recipients,
+    ))
+}
+
+fn claim_foreground_control(
+    entry: &ProcessEntry,
+    client_id: u64,
+) -> (
+    Result<ForegroundRoleUpdate, String>,
+    Option<Vec<ForegroundRecipient>>,
+) {
+    let mut foreground = entry.foreground.lock().unwrap();
+    let Some(&attachment_id) = foreground.observers.get(&client_id) else {
+        return (Err("no foreground job observed".to_string()), None);
+    };
+    if foreground.closed {
+        return (Err("no foreground job observed".to_string()), None);
+    }
+    if foreground
+        .controller
+        .is_some_and(|controller| controller != client_id)
+    {
+        return (
+            Err(format!(
+                "job {} foreground control is already held",
+                entry.job_id
+            )),
+            None,
+        );
+    }
+    match foreground.claim_control(client_id) {
+        Ok(false) => (
+            Ok(ForegroundRoleUpdate {
+                id: entry.job_id.to_string(),
+                attachment_id,
+                role: ForegroundRole::Controller,
+                control_available: false,
+            }),
+            None,
+        ),
+        Ok(true) => {
+            let recipients = foreground.recipients();
+            (
+                Ok(ForegroundRoleUpdate {
+                    id: entry.job_id.to_string(),
+                    attachment_id,
+                    role: ForegroundRole::Controller,
+                    control_available: false,
+                }),
+                Some(recipients),
+            )
+        }
+        Err(()) => (Err("no foreground job observed".to_string()), None),
+    }
+}
+
+fn release_foreground_control(
+    entry: &ProcessEntry,
+    client_id: u64,
+) -> (
+    Result<ForegroundRoleUpdate, String>,
+    Option<Vec<ForegroundRecipient>>,
+) {
+    let mut foreground = entry.foreground.lock().unwrap();
+    let Some(&attachment_id) = foreground.observers.get(&client_id) else {
+        return (Err("no foreground job observed".to_string()), None);
+    };
+    if foreground.closed {
+        return (Err("no foreground job observed".to_string()), None);
+    }
+    let released = foreground
+        .release_control(client_id)
+        .expect("observer presence checked above");
+    let control_available = foreground.control_available();
+    let recipients = released.then(|| foreground.recipients());
+    (
+        Ok(ForegroundRoleUpdate {
+            id: entry.job_id.to_string(),
+            attachment_id,
+            role: ForegroundRole::Observer,
+            control_available,
+        }),
+        recipients,
+    )
+}
+
+fn record_pty_output(
+    ring: &Arc<Mutex<RingBuffer>>,
+    foreground: &Arc<Mutex<ForegroundState>>,
+    data: &[u8],
+) -> Vec<ForegroundRecipient> {
+    let foreground = foreground.lock().unwrap();
+    ring.lock().unwrap().push(data);
+    if foreground.closed {
+        Vec::new()
+    } else {
+        foreground.recipients()
+    }
+}
+
+fn client_may_write_job_input(
+    input: &JobInput,
+    foreground: &Arc<Mutex<ForegroundState>>,
+    client_id: u64,
+) -> bool {
+    job_input_kind_allows_client(
+        matches!(input, JobInput::Pty(_)),
+        foreground.lock().unwrap().controller,
+        client_id,
+    )
+}
+
+fn job_input_kind_allows_client(
+    requires_controller: bool,
+    controller: Option<u64>,
+    client_id: u64,
+) -> bool {
+    !requires_controller || controller == Some(client_id)
 }
 
 /// Spawn the ProcessManager actor task.
@@ -225,7 +554,7 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                         {
                             error!(%job_id, "process_mgr: scope_store channel closed");
                             // Fail the job instead of continuing with the daemon environment.
-                            fail_pending_spawn(&sys, job_id).await;
+                            fail_pending_spawn(&sys, job_id, options.session_id.as_deref()).await;
                             continue;
                         }
                         match rx.await {
@@ -233,25 +562,29 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                                 Some(snapshot) => snapshot,
                                 None => {
                                     error!(%job_id, %scope_hash, "process_mgr: scope has no snapshot");
-                                    fail_pending_spawn(&sys, job_id).await;
+                                    fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                        .await;
                                     continue;
                                 }
                             },
                             Ok(Ok(None)) => {
                                 // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, %scope_hash, "process_mgr: scope not found");
-                                fail_pending_spawn(&sys, job_id).await;
+                                fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                    .await;
                                 continue;
                             }
                             Ok(Err(error)) => {
                                 error!(%job_id, %scope_hash, "process_mgr: scope lookup failed: {error}");
-                                fail_pending_spawn(&sys, job_id).await;
+                                fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                    .await;
                                 continue;
                             }
                             Err(_) => {
                                 // Scope resolution failed, so the job cannot safely inherit env.
                                 error!(%job_id, "process_mgr: scope_store reply dropped");
-                                fail_pending_spawn(&sys, job_id).await;
+                                fail_pending_spawn(&sys, job_id, options.session_id.as_deref())
+                                    .await;
                                 continue;
                             }
                         }
@@ -266,8 +599,14 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                             cwd = %cwd.display(),
                             "process_mgr: invalid cwd for job spawn"
                         );
-                        emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                            .await;
+                        emit_state_change(
+                            &sys,
+                            job_id,
+                            JobStatus::Pending,
+                            JobStatus::Failed,
+                            effective_options.session_id.as_deref(),
+                        )
+                        .await;
                         emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
                         continue;
                     }
@@ -286,13 +625,25 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
 
                     match entry {
                         Ok(entry) => {
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Running)
-                                .await;
+                            emit_state_change(
+                                &sys,
+                                job_id,
+                                JobStatus::Pending,
+                                JobStatus::Running,
+                                effective_options.session_id.as_deref(),
+                            )
+                            .await;
                             children.insert(job_id.0, entry);
                         }
                         Err(()) => {
-                            emit_state_change(&sys, job_id, JobStatus::Pending, JobStatus::Failed)
-                                .await;
+                            emit_state_change(
+                                &sys,
+                                job_id,
+                                JobStatus::Pending,
+                                JobStatus::Failed,
+                                effective_options.session_id.as_deref(),
+                            )
+                            .await;
                             emit_job_finished(&sys, job_id, EXIT_CODE_UNAVAILABLE).await;
                         }
                     }
@@ -368,87 +719,185 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                     let _ = reply.send(result);
                 }
 
-                ProcessMgrMsg::SendJobInput { job_id, data, reply } => {
-                    let input = children.get(&job_id.0).and_then(|entry| entry.input.clone());
-                    let handled = if let Some(input) = input {
-                        match write_job_input(&input, &data).await {
-                            Ok(()) => Ok(()),
-                            Err(error) => Err(format!("failed to write job input: {error}")),
+                ProcessMgrMsg::SendJobInput { client_id, job_id, data, reply } => {
+                    let input = children.get(&job_id.0).and_then(|entry| {
+                        let input = entry.input.clone()?;
+                        if client_may_write_job_input(&input, &entry.foreground, client_id) {
+                            Some(input)
+                        } else {
+                            None
                         }
-                    } else {
-                        Err(format!("job {job_id} does not accept stdin"))
+                    });
+                    let handled = match input {
+                        Some(input) => write_job_input(&input, &data)
+                            .await
+                            .map_err(|error| format!("failed to write job input: {error}")),
+                        None if children.get(&job_id.0).is_some_and(|entry| {
+                            matches!(&entry.input, Some(JobInput::Pty(_)))
+                        }) => Err(format!(
+                            "client does not control foreground job {job_id}"
+                        )),
+                        None => Err(format!("job {job_id} does not accept stdin")),
                     };
                     let _ = reply.send(handled);
                 }
 
-                ProcessMgrMsg::AttachFg { client_id, job_id, reply } => {
-                    let (result, snapshot) = if let Some(entry) = children.get_mut(&job_id.0) {
-                        if entry.status != JobStatus::Running {
-                            (Err(format!("job {job_id} is not running")), None)
-                        } else if let Some(owner) = *entry.fg_owner.lock().unwrap()
-                            && owner != client_id
-                        {
-                            (Err(format!("job {job_id} is already foreground-attached")), None)
-                        } else if entry.resize.is_none() {
-                            (Err(format!("job {job_id} does not support foreground attach")), None)
-                        } else {
-                            *entry.fg_owner.lock().unwrap() = Some(client_id);
+                ProcessMgrMsg::AttachFg { client_id, job_id, role, reply } => {
+                    let current_job = foreground_job_for_client(&children, client_id);
+                    let (result, control_recipients, session_id) =
+                        if current_job.is_some_and(|current| current != job_id) {
                             (
-                                Ok(()),
-                                Some(
-                                    entry
-                                        .ring_buffer
-                                        .lock()
-                                        .unwrap()
-                                        .tail(crate::ring_buffer::DEFAULT_CAPACITY),
-                                ),
+                                Err(format!(
+                                    "client is already foreground-attached to {}",
+                                    current_job.expect("checked above")
+                                )),
+                                None,
+                                None,
                             )
-                        }
+                        } else if let Some(entry) = children.get(&job_id.0) {
+                            let session_id = entry.session_id.clone();
+                            match attach_foreground(entry, client_id, role) {
+                                Ok((info, recipients)) => (Ok(info), recipients, session_id),
+                                Err(error) => (Err(error), None, session_id),
+                            }
+                        } else {
+                            (Err(format!("job {job_id} not found")), None, None)
+                        };
+                    // Daemons predating shared foreground mode delivered the
+                    // retained snapshot as an FgOutput event after the
+                    // FgAttached response. Keep that one legacy event for the
+                    // controller entry point: current clients reject epoch 0
+                    // for a non-zero attachment, while old clients recover
+                    // their history instead of starting from an empty screen.
+                    let legacy_snapshot = if role == ForegroundRole::Controller {
+                        result.as_ref().ok().map(|info| info.snapshot.clone())
                     } else {
-                        (Err(format!("job {job_id} not found")), None)
-                    };
-                    let attached = result.is_ok();
+                        None
+                    }
+                    .filter(|snapshot| !snapshot.is_empty());
                     let _ = reply.send(result);
-                    if attached
-                        && let Some(snapshot) = snapshot
-                        && !snapshot.is_empty()
-                    {
+                    if let Some(snapshot) = legacy_snapshot {
                         send_actor_gateway_event(
                             "process_mgr",
                             &sys,
                             client_id,
-                            EventPayload::FgOutput { data: snapshot },
+                            EventPayload::FgOutput {
+                                id: job_id.to_string(),
+                                attachment_id: 0,
+                                data: snapshot,
+                            },
+                            session_id.clone(),
+                        )
+                        .await;
+                    }
+                    if let Some(recipients) = control_recipients {
+                        emit_fg_control_changed(
+                            &sys,
+                            recipients,
+                            job_id,
+                            false,
+                            session_id.as_deref(),
                         )
                         .await;
                     }
                 }
 
-                ProcessMgrMsg::DetachFg { client_id, reason } => {
+                ProcessMgrMsg::ClaimFgControl { client_id, reply } => {
+                    let Some(job_id) = foreground_job_for_client(&children, client_id) else {
+                        let _ = reply.send(Err("no foreground job observed".to_string()));
+                        continue;
+                    };
+                    let entry = children
+                        .get(&job_id.0)
+                        .expect("foreground lookup returned a live job");
+                    let session_id = entry.session_id.clone();
+                    let (result, recipients) = claim_foreground_control(entry, client_id);
+                    let _ = reply.send(result);
+                    if let Some(recipients) = recipients {
+                        emit_fg_control_changed(
+                            &sys,
+                            recipients,
+                            job_id,
+                            false,
+                            session_id.as_deref(),
+                        )
+                        .await;
+                    }
+                }
+
+                ProcessMgrMsg::ReleaseFgControl { client_id, reply } => {
+                    let Some(job_id) = foreground_job_for_client(&children, client_id) else {
+                        let _ = reply.send(Err("no foreground job observed".to_string()));
+                        continue;
+                    };
+                    let entry = children
+                        .get(&job_id.0)
+                        .expect("foreground lookup returned a live job");
+                    let session_id = entry.session_id.clone();
+                    let (result, recipients) = release_foreground_control(entry, client_id);
+                    let _ = reply.send(result);
+                    if let Some(recipients) = recipients {
+                        emit_fg_control_changed(
+                            &sys,
+                            recipients,
+                            job_id,
+                            true,
+                            session_id.as_deref(),
+                        )
+                        .await;
+                    }
+                }
+
+                ProcessMgrMsg::DetachFg { client_id, reason, reply } => {
                     let mut detached_jobs = Vec::new();
-                    for entry in children.values_mut() {
-                        if *entry.fg_owner.lock().unwrap() == Some(client_id) {
-                            *entry.fg_owner.lock().unwrap() = None;
-                            detached_jobs.push(entry.job_id.to_string());
+                    for entry in children.values() {
+                        let mut foreground = entry.foreground.lock().unwrap();
+                        if let Some((attachment_id, control_recipients)) =
+                            foreground.detach(client_id)
+                        {
+                            detached_jobs.push((
+                                entry.job_id,
+                                attachment_id,
+                                entry.session_id.clone(),
+                                control_recipients,
+                            ));
                         }
                     }
-                    for job_id in detached_jobs {
+                    for (job_id, attachment_id, session_id, control_recipients) in detached_jobs {
                         send_actor_gateway_event(
                             "process_mgr",
                             &sys,
                             client_id,
                             EventPayload::FgExited {
-                                id: job_id,
+                                id: job_id.to_string(),
+                                attachment_id,
                                 reason: reason.clone(),
                             },
+                            session_id.clone(),
                         )
                         .await;
+                        if let Some(recipients) = control_recipients {
+                            emit_fg_control_changed(
+                                &sys,
+                                recipients,
+                                job_id,
+                                true,
+                                session_id.as_deref(),
+                            )
+                            .await;
+                        }
+                    }
+                    if let Some(reply) = reply {
+                        let _ = reply.send(());
                     }
                 }
 
                 ProcessMgrMsg::FgInput { client_id, data, reply } => {
                     let input = children
                         .values()
-                        .find(|entry| *entry.fg_owner.lock().unwrap() == Some(client_id))
+                        .find(|entry| {
+                            entry.foreground.lock().unwrap().controller == Some(client_id)
+                        })
                         .and_then(|entry| entry.input.clone());
                     let handled = if let Some(input) = input {
                         match write_job_input(&input, &data).await {
@@ -464,7 +913,9 @@ pub(super) fn spawn(mut rx: mpsc::Receiver<ProcessMgrMsg>, sys: ActorSystem) {
                 ProcessMgrMsg::FgResize { client_id, cols, rows, reply } => {
                     let resize = children
                         .values()
-                        .find(|entry| *entry.fg_owner.lock().unwrap() == Some(client_id))
+                        .find(|entry| {
+                            entry.foreground.lock().unwrap().controller == Some(client_id)
+                        })
                         .map(|entry| entry.resize.clone());
                     let _ = reply.send(if let Some(Some(resize)) = resize {
                         set_winsize(resize.as_raw_fd(), cols, rows)
@@ -775,7 +1226,14 @@ async fn prepare_job_sandbox_or_emit(
     match prepare_job_sandbox(job_id, snapshot, options, sys) {
         Ok(sandbox) => Ok(sandbox),
         Err(message) => {
-            emit_spawn_setup_stderr(sys, job_id, &message, options.direct_output_client).await;
+            emit_spawn_setup_stderr(
+                sys,
+                job_id,
+                &message,
+                options.direct_output_client,
+                options.session_id.as_deref(),
+            )
+            .await;
             Err(())
         }
     }
@@ -786,6 +1244,7 @@ async fn emit_spawn_setup_stderr(
     job_id: JobId,
     message: &str,
     direct_output_client: Option<u64>,
+    session_id: Option<&str>,
 ) {
     let line = format!("{message}\n");
     let stderr_log = Arc::new(Mutex::new(open_stderr_log(job_id).await));
@@ -796,9 +1255,10 @@ async fn emit_spawn_setup_stderr(
         OutputStream::Stderr,
         line.as_bytes(),
         direct_output_client,
+        session_id,
     )
     .await;
-    emit_output_eof(sys, job_id, direct_output_client).await;
+    emit_output_eof(sys, job_id, direct_output_client, session_id).await;
 }
 
 /// Spawn a single-segment job with pipes (stdout/stderr piped, no PTY).
@@ -859,13 +1319,15 @@ async fn spawn_single_pipe_job(
 
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
     let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
-    let fg_owner = Arc::new(Mutex::new(None));
+    let foreground = Arc::new(Mutex::new(ForegroundState::default()));
     let sys_clone = sys.clone();
     let ring_clone = ring_buffer.clone();
     let stderr_clone = stderr_ring.clone();
-    let fg_clone = fg_owner.clone();
+    let foreground_clone = foreground.clone();
     let cleanup_tx_clone = cleanup_tx.clone();
     let direct_output_client = options.direct_output_client;
+    let session_id = options.session_id.clone();
+    let entry_session_id = session_id.clone();
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
 
     // Read stdout and stderr concurrently, wait for exit.
@@ -876,6 +1338,8 @@ async fn spawn_single_pipe_job(
         let log_clone = log.clone();
         let sys_emit = sys_clone.clone();
         let sys_stderr_emit = sys_clone.clone();
+        let stdout_session_id = session_id.clone();
+        let stderr_session_id = session_id.clone();
 
         let stdout_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];
@@ -892,6 +1356,7 @@ async fn spawn_single_pipe_job(
                             OutputStream::Stdout,
                             &chunk,
                             direct_output_client,
+                            stdout_session_id.as_deref(),
                         )
                         .await;
                     }
@@ -920,6 +1385,7 @@ async fn spawn_single_pipe_job(
                             OutputStream::Stderr,
                             &chunk,
                             direct_output_client,
+                            stderr_session_id.as_deref(),
                         )
                         .await;
                     }
@@ -957,7 +1423,13 @@ async fn spawn_single_pipe_job(
         }
         info!(%job_id, exit_code, "process_mgr: pipe child exited");
 
-        emit_output_eof(&sys_clone, job_id, direct_output_client).await;
+        emit_output_eof(
+            &sys_clone,
+            job_id,
+            direct_output_client,
+            session_id.as_deref(),
+        )
+        .await;
 
         let (new_state, reported_exit_code, fg_reason) = if was_killed {
             (
@@ -970,14 +1442,29 @@ async fn spawn_single_pipe_job(
         } else {
             (JobStatus::Failed, exit_code, format!("exit {exit_code}"))
         };
-        emit_state_change(&sys_clone, job_id, JobStatus::Running, new_state).await;
-        emit_fg_exit(&sys_clone, &fg_clone, job_id, &fg_reason).await;
+        emit_state_change(
+            &sys_clone,
+            job_id,
+            JobStatus::Running,
+            new_state,
+            session_id.as_deref(),
+        )
+        .await;
+        emit_fg_exit(
+            &sys_clone,
+            &foreground_clone,
+            job_id,
+            &fg_reason,
+            session_id.as_deref(),
+        )
+        .await;
         emit_job_finished(&sys_clone, job_id, reported_exit_code).await;
         notify_cleanup(&cleanup_tx_clone, job_id).await;
     });
 
     Ok(ProcessEntry {
         job_id,
+        session_id: entry_session_id,
         status: JobStatus::Running,
         reader_handle,
         kill_tx,
@@ -985,7 +1472,7 @@ async fn spawn_single_pipe_job(
         stderr_ring: Some(stderr_ring),
         input: None,
         resize: None,
-        fg_owner,
+        foreground,
     })
 }
 
@@ -1106,7 +1593,7 @@ async fn spawn_single_pty_job(
 
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
-    let fg_owner = Arc::new(Mutex::new(None));
+    let foreground = Arc::new(Mutex::new(ForegroundState::default()));
     let direct_output_client = options.direct_output_client;
     let reader_handle = tokio::spawn(reader_task(PtyReaderTask {
         job_id,
@@ -1118,14 +1605,16 @@ async fn spawn_single_pty_job(
         ring: ring_buffer.clone(),
         runtime: ProcessTaskRuntime {
             sys: sys.clone(),
-            fg_owner: fg_owner.clone(),
+            foreground: foreground.clone(),
             direct_output_client,
+            session_id: options.session_id.clone(),
             cleanup_tx: cleanup_tx.clone(),
         },
     }));
 
     Ok(ProcessEntry {
         job_id,
+        session_id: options.session_id.clone(),
         status: JobStatus::Running,
         reader_handle,
         kill_tx,
@@ -1133,7 +1622,7 @@ async fn spawn_single_pty_job(
         stderr_ring: None,
         input: Some(JobInput::Pty(input)),
         resize: Some(resize_file),
-        fg_owner,
+        foreground,
     })
 }
 
@@ -1199,7 +1688,7 @@ async fn spawn_native_pipeline_job(
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
     let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
-    let fg_owner = Arc::new(Mutex::new(None));
+    let foreground = Arc::new(Mutex::new(ForegroundState::default()));
     let direct_output_client = options.direct_output_client;
     let reader_handle = tokio::spawn(pipeline_reader_task(PipelineReaderTask {
         job_id,
@@ -1214,14 +1703,16 @@ async fn spawn_native_pipeline_job(
         stderr_ring: stderr_ring.clone(),
         runtime: ProcessTaskRuntime {
             sys: sys.clone(),
-            fg_owner: fg_owner.clone(),
+            foreground: foreground.clone(),
             direct_output_client,
+            session_id: options.session_id.clone(),
             cleanup_tx: cleanup_tx.clone(),
         },
     }));
 
     Ok(ProcessEntry {
         job_id,
+        session_id: options.session_id.clone(),
         status: JobStatus::Running,
         reader_handle,
         kill_tx,
@@ -1229,7 +1720,7 @@ async fn spawn_native_pipeline_job(
         stderr_ring: Some(stderr_ring),
         input,
         resize: None,
-        fg_owner,
+        foreground,
     })
 }
 
@@ -1247,7 +1738,7 @@ async fn spawn_logical_job(
     let (kill_tx, kill_rx) = mpsc::channel::<()>(1);
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
     let stderr_ring = Arc::new(Mutex::new(RingBuffer::default()));
-    let fg_owner = Arc::new(Mutex::new(None));
+    let foreground = Arc::new(Mutex::new(ForegroundState::default()));
     let direct_output_client = options.direct_output_client;
     let reader_handle = tokio::spawn(logical_job_task(LogicalJobTask {
         job_id,
@@ -1264,14 +1755,16 @@ async fn spawn_logical_job(
         stderr_ring: stderr_ring.clone(),
         runtime: ProcessTaskRuntime {
             sys: sys.clone(),
-            fg_owner: fg_owner.clone(),
+            foreground: foreground.clone(),
             direct_output_client,
+            session_id: options.session_id.clone(),
             cleanup_tx: cleanup_tx.clone(),
         },
     }));
 
     Ok(ProcessEntry {
         job_id,
+        session_id: options.session_id.clone(),
         status: JobStatus::Running,
         reader_handle,
         kill_tx,
@@ -1279,7 +1772,7 @@ async fn spawn_logical_job(
         stderr_ring: Some(stderr_ring),
         input: None,
         resize: None,
-        fg_owner,
+        foreground,
     })
 }
 
@@ -1544,8 +2037,22 @@ async fn reader_task(task: PtyReaderTask) {
                     }
                 }
 
-                emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-                emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+                emit_state_change(
+                    &runtime.sys,
+                    job_id,
+                    JobStatus::Running,
+                    JobStatus::Killed,
+                    runtime.session_id.as_deref(),
+                )
+                .await;
+                emit_fg_exit(
+                    &runtime.sys,
+                    &runtime.foreground,
+                    job_id,
+                    "killed",
+                    runtime.session_id.as_deref(),
+                )
+                .await;
                 emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
                 // Tell the main loop to remove our entry.
                 notify_cleanup(&runtime.cleanup_tx, job_id).await;
@@ -1557,10 +2064,26 @@ async fn reader_task(task: PtyReaderTask) {
                     Ok(0) => { pty_done = true; }
                     Ok(n) => {
                         let chunk = &pty_buf[..n];
-                        ring.lock().unwrap().push(chunk);
+                        let foreground_recipients =
+                            record_pty_output(&ring, &runtime.foreground, chunk);
                         write_log(job_id, LogStream::Stdout, &log_file, chunk).await;
-                        emit_output(&runtime.sys, job_id, OutputStream::Stdout, chunk, runtime.direct_output_client).await;
-                        emit_fg_output(&runtime.sys, &runtime.fg_owner, chunk).await;
+                        emit_output(
+                            &runtime.sys,
+                            job_id,
+                            OutputStream::Stdout,
+                            chunk,
+                            runtime.direct_output_client,
+                            runtime.session_id.as_deref(),
+                        )
+                        .await;
+                        emit_fg_output(
+                            &runtime.sys,
+                            foreground_recipients,
+                            job_id,
+                            chunk,
+                            runtime.session_id.as_deref(),
+                        )
+                        .await;
                     }
                     Err(e) => {
                         if e.raw_os_error() == Some(libc::EIO) {
@@ -1601,11 +2124,31 @@ async fn reader_task(task: PtyReaderTask) {
     let ring_len = ring.lock().unwrap().len();
     info!(%job_id, exit_code, bytes = ring_len, "process_mgr: child exited");
 
-    emit_output_eof(&runtime.sys, job_id, runtime.direct_output_client).await;
+    emit_output_eof(
+        &runtime.sys,
+        job_id,
+        runtime.direct_output_client,
+        runtime.session_id.as_deref(),
+    )
+    .await;
 
     if was_killed {
-        emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+        emit_state_change(
+            &runtime.sys,
+            job_id,
+            JobStatus::Running,
+            JobStatus::Killed,
+            runtime.session_id.as_deref(),
+        )
+        .await;
+        emit_fg_exit(
+            &runtime.sys,
+            &runtime.foreground,
+            job_id,
+            "killed",
+            runtime.session_id.as_deref(),
+        )
+        .await;
         emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
     } else {
         // Determine final state.
@@ -1615,13 +2158,27 @@ async fn reader_task(task: PtyReaderTask) {
             JobStatus::Failed
         };
 
-        emit_state_change(&runtime.sys, job_id, JobStatus::Running, new_state).await;
+        emit_state_change(
+            &runtime.sys,
+            job_id,
+            JobStatus::Running,
+            new_state,
+            runtime.session_id.as_deref(),
+        )
+        .await;
         let reason = if exit_code == 0 {
             "done".to_string()
         } else {
             format!("exit {exit_code}")
         };
-        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, &reason).await;
+        emit_fg_exit(
+            &runtime.sys,
+            &runtime.foreground,
+            job_id,
+            &reason,
+            runtime.session_id.as_deref(),
+        )
+        .await;
 
         emit_job_finished(&runtime.sys, job_id, exit_code).await;
     }
@@ -1680,6 +2237,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
                             OutputStream::Stdout,
                             &data,
                             runtime.direct_output_client,
+                            runtime.session_id.as_deref(),
                         )
                         .await;
                     }
@@ -1692,6 +2250,7 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
                             OutputStream::Stderr,
                             &data,
                             runtime.direct_output_client,
+                            runtime.session_id.as_deref(),
                         )
                         .await;
                     }
@@ -1721,11 +2280,31 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
     let stderr_len = stderr_ring.lock().unwrap().len();
     info!(%job_id, exit_code, stdout_bytes = stdout_len, stderr_bytes = stderr_len, "process_mgr: native pipeline exited");
 
-    emit_output_eof(&runtime.sys, job_id, runtime.direct_output_client).await;
+    emit_output_eof(
+        &runtime.sys,
+        job_id,
+        runtime.direct_output_client,
+        runtime.session_id.as_deref(),
+    )
+    .await;
 
     if was_killed {
-        emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+        emit_state_change(
+            &runtime.sys,
+            job_id,
+            JobStatus::Running,
+            JobStatus::Killed,
+            runtime.session_id.as_deref(),
+        )
+        .await;
+        emit_fg_exit(
+            &runtime.sys,
+            &runtime.foreground,
+            job_id,
+            "killed",
+            runtime.session_id.as_deref(),
+        )
+        .await;
         emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
     } else {
         let new_state = if exit_code == 0 {
@@ -1733,13 +2312,27 @@ async fn pipeline_reader_task(task: PipelineReaderTask) {
         } else {
             JobStatus::Failed
         };
-        emit_state_change(&runtime.sys, job_id, JobStatus::Running, new_state).await;
+        emit_state_change(
+            &runtime.sys,
+            job_id,
+            JobStatus::Running,
+            new_state,
+            runtime.session_id.as_deref(),
+        )
+        .await;
         let reason = if exit_code == 0 {
             "done".to_string()
         } else {
             format!("exit {exit_code}")
         };
-        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, &reason).await;
+        emit_fg_exit(
+            &runtime.sys,
+            &runtime.foreground,
+            job_id,
+            &reason,
+            runtime.session_id.as_deref(),
+        )
+        .await;
         emit_job_finished(&runtime.sys, job_id, exit_code).await;
     }
 
@@ -1786,14 +2379,35 @@ async fn logical_job_task(task: LogicalJobTask) {
         log_file: &log_file,
         stderr_log: &stderr_log,
         direct_output_client: runtime.direct_output_client,
+        session_id: runtime.session_id.as_deref(),
     };
     let exit_code = run_job_plan_streaming(&plan, &mut streaming).await;
 
-    emit_output_eof(&runtime.sys, job_id, runtime.direct_output_client).await;
+    emit_output_eof(
+        &runtime.sys,
+        job_id,
+        runtime.direct_output_client,
+        runtime.session_id.as_deref(),
+    )
+    .await;
 
     if was_killed {
-        emit_state_change(&runtime.sys, job_id, JobStatus::Running, JobStatus::Killed).await;
-        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, "killed").await;
+        emit_state_change(
+            &runtime.sys,
+            job_id,
+            JobStatus::Running,
+            JobStatus::Killed,
+            runtime.session_id.as_deref(),
+        )
+        .await;
+        emit_fg_exit(
+            &runtime.sys,
+            &runtime.foreground,
+            job_id,
+            "killed",
+            runtime.session_id.as_deref(),
+        )
+        .await;
         emit_job_finished(&runtime.sys, job_id, EXIT_CODE_UNAVAILABLE).await;
     } else {
         let new_state = if exit_code == 0 {
@@ -1801,13 +2415,27 @@ async fn logical_job_task(task: LogicalJobTask) {
         } else {
             JobStatus::Failed
         };
-        emit_state_change(&runtime.sys, job_id, JobStatus::Running, new_state).await;
+        emit_state_change(
+            &runtime.sys,
+            job_id,
+            JobStatus::Running,
+            new_state,
+            runtime.session_id.as_deref(),
+        )
+        .await;
         let reason = if exit_code == 0 {
             "done".to_string()
         } else {
             format!("exit {exit_code}")
         };
-        emit_fg_exit(&runtime.sys, &runtime.fg_owner, job_id, &reason).await;
+        emit_fg_exit(
+            &runtime.sys,
+            &runtime.foreground,
+            job_id,
+            &reason,
+            runtime.session_id.as_deref(),
+        )
+        .await;
         emit_job_finished(&runtime.sys, job_id, exit_code).await;
     }
 
@@ -1915,6 +2543,7 @@ async fn run_pipeline_streaming(
                             OutputStream::Stdout,
                             &data,
                             context.direct_output_client,
+                            context.session_id,
                         )
                         .await;
                     }
@@ -1927,6 +2556,7 @@ async fn run_pipeline_streaming(
                             OutputStream::Stderr,
                             &data,
                             context.direct_output_client,
+                            context.session_id,
                         )
                         .await;
                     }
@@ -2164,8 +2794,15 @@ async fn wait_for_children(children: &mut [tokio::process::Child]) -> i32 {
     exit_code
 }
 
-async fn fail_pending_spawn(sys: &ActorSystem, job_id: JobId) {
-    emit_state_change(sys, job_id, JobStatus::Pending, JobStatus::Failed).await;
+async fn fail_pending_spawn(sys: &ActorSystem, job_id: JobId, session_id: Option<&str>) {
+    emit_state_change(
+        sys,
+        job_id,
+        JobStatus::Pending,
+        JobStatus::Failed,
+        session_id,
+    )
+    .await;
     emit_job_finished(sys, job_id, EXIT_CODE_UNAVAILABLE).await;
 }
 
@@ -2186,8 +2823,9 @@ async fn emit_state_change(
     job_id: JobId,
     old_state: JobStatus,
     new_state: JobStatus,
+    session_id: Option<&str>,
 ) {
-    publish_actor_event(
+    publish_actor_session_event(
         "process_mgr",
         &sys.event_bus,
         EventChannel::Jobs,
@@ -2199,6 +2837,7 @@ async fn emit_state_change(
             chain_id: None,
             chain_index: None,
         },
+        session_id.map(str::to_owned),
     )
     .await;
 }
@@ -2210,6 +2849,7 @@ async fn emit_output(
     stream: OutputStream,
     data: &[u8],
     direct_output_client: Option<u64>,
+    session_id: Option<&str>,
 ) {
     let payload = match std::str::from_utf8(data) {
         Ok(text) => EventPayload::OutputChunk {
@@ -2224,19 +2864,38 @@ async fn emit_output(
         },
     };
     if let Some(client_id) = direct_output_client {
-        send_actor_gateway_event("process_mgr", sys, client_id, payload.clone()).await;
+        send_actor_gateway_event(
+            "process_mgr",
+            sys,
+            client_id,
+            payload.clone(),
+            session_id.map(str::to_owned),
+        )
+        .await;
     }
-    publish_output_event(sys, job_id, payload, direct_output_client).await;
+    publish_output_event(sys, job_id, payload, direct_output_client, session_id).await;
 }
 
-async fn emit_output_eof(sys: &ActorSystem, job_id: JobId, direct_output_client: Option<u64>) {
+async fn emit_output_eof(
+    sys: &ActorSystem,
+    job_id: JobId,
+    direct_output_client: Option<u64>,
+    session_id: Option<&str>,
+) {
     let payload = EventPayload::OutputEof {
         id: job_id.to_string(),
     };
     if let Some(client_id) = direct_output_client {
-        send_actor_gateway_event("process_mgr", sys, client_id, payload.clone()).await;
+        send_actor_gateway_event(
+            "process_mgr",
+            sys,
+            client_id,
+            payload.clone(),
+            session_id.map(str::to_owned),
+        )
+        .await;
     }
-    publish_output_event(sys, job_id, payload, direct_output_client).await;
+    publish_output_event(sys, job_id, payload, direct_output_client, session_id).await;
 }
 
 async fn publish_output_event(
@@ -2244,37 +2903,71 @@ async fn publish_output_event(
     job_id: JobId,
     payload: EventPayload,
     excluded_client_id: Option<u64>,
+    session_id: Option<&str>,
 ) {
     if let Some(excluded_client_id) = excluded_client_id {
-        publish_actor_event_except(
+        publish_actor_session_event_except(
             "process_mgr",
             &sys.event_bus,
             EventChannel::Output(job_id),
             payload,
+            session_id.map(str::to_owned),
             excluded_client_id,
         )
         .await;
     } else {
-        publish_actor_event(
+        publish_actor_session_event(
             "process_mgr",
             &sys.event_bus,
             EventChannel::Output(job_id),
             payload,
+            session_id.map(str::to_owned),
         )
         .await;
     }
 }
 
-async fn emit_fg_output(sys: &ActorSystem, fg_owner: &Arc<Mutex<Option<u64>>>, data: &[u8]) {
-    let client_id = *fg_owner.lock().unwrap();
-    if let Some(client_id) = client_id {
+async fn emit_fg_output(
+    sys: &ActorSystem,
+    recipients: Vec<ForegroundRecipient>,
+    job_id: JobId,
+    data: &[u8],
+    session_id: Option<&str>,
+) {
+    for recipient in recipients {
         send_actor_gateway_event(
             "process_mgr",
             sys,
-            client_id,
+            recipient.client_id,
             EventPayload::FgOutput {
+                id: job_id.to_string(),
+                attachment_id: recipient.attachment_id,
                 data: data.to_vec(),
             },
+            session_id.map(str::to_owned),
+        )
+        .await;
+    }
+}
+
+async fn emit_fg_control_changed(
+    sys: &ActorSystem,
+    recipients: Vec<ForegroundRecipient>,
+    job_id: JobId,
+    control_available: bool,
+    session_id: Option<&str>,
+) {
+    for recipient in recipients {
+        send_actor_gateway_event(
+            "process_mgr",
+            sys,
+            recipient.client_id,
+            EventPayload::FgControlChanged {
+                id: job_id.to_string(),
+                attachment_id: recipient.attachment_id,
+                control_available,
+            },
+            session_id.map(str::to_owned),
         )
         .await;
     }
@@ -2282,20 +2975,31 @@ async fn emit_fg_output(sys: &ActorSystem, fg_owner: &Arc<Mutex<Option<u64>>>, d
 
 async fn emit_fg_exit(
     sys: &ActorSystem,
-    fg_owner: &Arc<Mutex<Option<u64>>>,
+    foreground: &Arc<Mutex<ForegroundState>>,
     job_id: JobId,
     reason: &str,
+    session_id: Option<&str>,
 ) {
-    let client_id = fg_owner.lock().unwrap().take();
-    if let Some(client_id) = client_id {
+    let recipients = {
+        let mut foreground = foreground.lock().unwrap();
+        if foreground.closed {
+            return;
+        }
+        foreground.closed = true;
+        foreground.controller = None;
+        std::mem::take(&mut foreground.observers)
+    };
+    for (client_id, attachment_id) in recipients {
         send_actor_gateway_event(
             "process_mgr",
             sys,
             client_id,
             EventPayload::FgExited {
                 id: job_id.to_string(),
+                attachment_id,
                 reason: reason.to_string(),
             },
+            session_id.map(str::to_owned),
         )
         .await;
     }
@@ -2387,6 +3091,7 @@ mod tests {
             wrapper_enabled: false,
             pty_enabled: true,
             direct_output_client: None,
+            session_id: None,
         }
     }
 
@@ -2394,6 +3099,7 @@ mod tests {
     fn effective_process_options_fall_back_to_submitted_options() {
         let mut options = process_options();
         options.pty_enabled = false;
+        options.session_id = Some("SS-options".into());
         options.sandbox = Some(crate::sandbox::SandboxConfig {
             mode: crate::sandbox::SandboxMode::Overlay,
             upper: Some(crate::sandbox::SandboxUpper::Directory(PathBuf::from(
@@ -2405,6 +3111,7 @@ mod tests {
 
         assert!(!effective.pty_enabled);
         assert_eq!(effective.sandbox, options.sandbox);
+        assert_eq!(effective.session_id, options.session_id);
     }
 
     #[test]
@@ -2445,6 +3152,7 @@ mod tests {
         let mut snapshot = snapshot();
         snapshot.cwd = cwd.clone();
         let mut options = process_options();
+        options.session_id = Some("SS-sandbox".into());
         options.sandbox = Some(crate::sandbox::SandboxConfig {
             mode: crate::sandbox::SandboxMode::Overlay,
             upper: Some(crate::sandbox::SandboxUpper::Directory(PathBuf::from(
@@ -2473,10 +3181,12 @@ mod tests {
             .expect("stderr event timeout")
             .expect("stderr event");
         match event {
-            super::super::EventBusMsg::Publish {
+            super::super::EventBusMsg::PublishSession {
                 payload: EventPayload::OutputChunk { id, stream, data },
+                session_id,
                 ..
             } => {
+                assert_eq!(session_id.as_deref(), Some("SS-sandbox"));
                 assert_eq!(id, "J404");
                 assert_eq!(stream, OutputStream::Stderr);
                 assert!(data.contains("sandbox setup failed"));
@@ -2509,14 +3219,24 @@ mod tests {
             resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
-        emit_output(&sys, JobId(7), OutputStream::Stdout, b"\xffbin\n", None).await;
+        emit_output(
+            &sys,
+            JobId(7),
+            OutputStream::Stdout,
+            b"\xffbin\n",
+            None,
+            Some("SS-output"),
+        )
+        .await;
 
         match event_rx.recv().await.expect("output event") {
-            super::super::EventBusMsg::Publish {
+            super::super::EventBusMsg::PublishSession {
                 channel,
+                session_id,
                 payload: EventPayload::OutputChunkBinary { id, stream, base64 },
             } => {
                 assert_eq!(channel, EventChannel::Output(JobId(7)));
+                assert_eq!(session_id.as_deref(), Some("SS-output"));
                 assert_eq!(id, "J7");
                 assert_eq!(stream, OutputStream::Stdout);
                 assert_eq!(
@@ -2525,6 +3245,50 @@ mod tests {
                 );
             }
             _ => panic!("expected binary output event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_state_change_preserves_named_session_owner() {
+        let (gateway_tx, _gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, mut event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+
+        emit_state_change(
+            &sys,
+            JobId(9),
+            JobStatus::Pending,
+            JobStatus::Running,
+            Some("SS-owner"),
+        )
+        .await;
+
+        match event_rx.recv().await.expect("state event") {
+            super::super::EventBusMsg::PublishSession {
+                channel,
+                session_id,
+                payload:
+                    EventPayload::JobStateChanged {
+                        job_id, new_state, ..
+                    },
+            } => {
+                assert_eq!(channel, EventChannel::Jobs);
+                assert_eq!(session_id.as_deref(), Some("SS-owner"));
+                assert_eq!(job_id, "J9");
+                assert_eq!(new_state, JobStatus::Running);
+            }
+            _ => panic!("expected session-scoped job state event"),
         }
     }
 
@@ -2545,14 +3309,24 @@ mod tests {
             resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
-        emit_output(&sys, JobId(7), OutputStream::Stdout, b"script\n", Some(42)).await;
+        emit_output(
+            &sys,
+            JobId(7),
+            OutputStream::Stdout,
+            b"script\n",
+            Some(42),
+            Some("SS-script"),
+        )
+        .await;
 
         match gateway_rx.recv().await.expect("direct output") {
             GatewayMsg::SendEvent {
                 client_id,
+                session_id,
                 payload: EventPayload::OutputChunk { id, stream, data },
             } => {
                 assert_eq!(client_id, 42);
+                assert_eq!(session_id.as_deref(), Some("SS-script"));
                 assert_eq!(id, "J7");
                 assert_eq!(stream, OutputStream::Stdout);
                 assert_eq!(data, "script\n");
@@ -2561,12 +3335,14 @@ mod tests {
         }
 
         match event_rx.recv().await.expect("published output") {
-            super::super::EventBusMsg::PublishExcept {
+            super::super::EventBusMsg::PublishSessionExcept {
                 channel,
+                session_id,
                 excluded_client_id,
                 payload: EventPayload::OutputChunk { id, data, .. },
             } => {
                 assert_eq!(channel, EventChannel::Output(JobId(7)));
+                assert_eq!(session_id.as_deref(), Some("SS-script"));
                 assert_eq!(excluded_client_id, 42);
                 assert_eq!(id, "J7");
                 assert_eq!(data, "script\n");
@@ -2592,31 +3368,254 @@ mod tests {
             resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
         };
 
-        emit_output_eof(&sys, JobId(7), Some(42)).await;
+        emit_output_eof(&sys, JobId(7), Some(42), Some("SS-script")).await;
 
         match gateway_rx.recv().await.expect("direct eof") {
             GatewayMsg::SendEvent {
                 client_id,
+                session_id,
                 payload: EventPayload::OutputEof { id },
             } => {
                 assert_eq!(client_id, 42);
+                assert_eq!(session_id.as_deref(), Some("SS-script"));
                 assert_eq!(id, "J7");
             }
             _ => panic!("expected direct output eof"),
         }
 
         match event_rx.recv().await.expect("published eof") {
-            super::super::EventBusMsg::PublishExcept {
+            super::super::EventBusMsg::PublishSessionExcept {
                 channel,
+                session_id,
                 excluded_client_id,
                 payload: EventPayload::OutputEof { id },
             } => {
                 assert_eq!(channel, EventChannel::Output(JobId(7)));
+                assert_eq!(session_id.as_deref(), Some("SS-script"));
                 assert_eq!(excluded_client_id, 42);
                 assert_eq!(id, "J7");
             }
             _ => panic!("expected output eof published to other subscribers"),
         }
+    }
+
+    #[tokio::test]
+    async fn foreground_events_reach_all_observers_and_exit_closes_state() {
+        let (gateway_tx, mut gateway_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scheduler_tx, _scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_tx, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_tx, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (event_tx, _event_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr: process_tx,
+            scope_store: scope_tx,
+            event_bus: event_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+        let foreground = Arc::new(Mutex::new(ForegroundState {
+            observers: BTreeMap::from([(42, 7), (43, 9)]),
+            controller: Some(42),
+            last_attachment_id: 9,
+            closed: false,
+        }));
+        let ring = Arc::new(Mutex::new(RingBuffer::default()));
+
+        let recipients = record_pty_output(&ring, &foreground, b"prompt");
+        emit_fg_output(&sys, recipients, JobId(8), b"prompt", Some("SS-fg")).await;
+        let recipients = foreground.lock().unwrap().recipients();
+        emit_fg_control_changed(&sys, recipients, JobId(8), false, Some("SS-fg")).await;
+        emit_fg_exit(&sys, &foreground, JobId(8), "done", Some("SS-fg")).await;
+
+        for (expected_client, expected_attachment) in [(42, 7), (43, 9)] {
+            match gateway_rx.recv().await.expect("foreground output") {
+                GatewayMsg::SendEvent {
+                    client_id,
+                    session_id,
+                    payload:
+                        EventPayload::FgOutput {
+                            id,
+                            attachment_id,
+                            data,
+                        },
+                } => {
+                    assert_eq!(client_id, expected_client);
+                    assert_eq!(session_id.as_deref(), Some("SS-fg"));
+                    assert_eq!(id, "J8");
+                    assert_eq!(attachment_id, expected_attachment);
+                    assert_eq!(data, b"prompt");
+                }
+                _ => panic!("expected foreground output"),
+            }
+        }
+        for (expected_client, expected_attachment) in [(42, 7), (43, 9)] {
+            match gateway_rx.recv().await.expect("foreground control state") {
+                GatewayMsg::SendEvent {
+                    client_id,
+                    session_id,
+                    payload:
+                        EventPayload::FgControlChanged {
+                            id,
+                            attachment_id,
+                            control_available,
+                        },
+                } => {
+                    assert_eq!(client_id, expected_client);
+                    assert_eq!(session_id.as_deref(), Some("SS-fg"));
+                    assert_eq!(id, "J8");
+                    assert_eq!(attachment_id, expected_attachment);
+                    assert!(!control_available);
+                }
+                _ => panic!("expected foreground control state"),
+            }
+        }
+        for (expected_client, expected_attachment) in [(42, 7), (43, 9)] {
+            match gateway_rx.recv().await.expect("foreground exit") {
+                GatewayMsg::SendEvent {
+                    client_id,
+                    session_id,
+                    payload:
+                        EventPayload::FgExited {
+                            id,
+                            attachment_id,
+                            reason,
+                        },
+                } => {
+                    assert_eq!(client_id, expected_client);
+                    assert_eq!(session_id.as_deref(), Some("SS-fg"));
+                    assert_eq!(id, "J8");
+                    assert_eq!(attachment_id, expected_attachment);
+                    assert_eq!(reason, "done");
+                }
+                _ => panic!("expected foreground exit"),
+            }
+        }
+        assert_eq!(ring.lock().unwrap().as_bytes(), b"prompt");
+        let foreground = foreground.lock().unwrap();
+        assert!(foreground.closed);
+        assert!(foreground.observers.is_empty());
+        assert_eq!(foreground.controller, None);
+    }
+
+    #[tokio::test]
+    async fn foreground_registration_snapshot_and_controller_transitions_are_consistent() {
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::default()));
+        ring_buffer.lock().unwrap().push(b"before");
+        let foreground = Arc::new(Mutex::new(ForegroundState::default()));
+        let (kill_tx, _kill_rx) = mpsc::channel(1);
+        let entry = ProcessEntry {
+            job_id: JobId(9),
+            session_id: Some("SS-shared".into()),
+            status: JobStatus::Running,
+            reader_handle: tokio::spawn(async {}),
+            kill_tx,
+            ring_buffer: ring_buffer.clone(),
+            stderr_ring: None,
+            input: None,
+            resize: Some(Arc::new(std::fs::File::open("/dev/null").unwrap())),
+            foreground: foreground.clone(),
+        };
+
+        let (first, notice) =
+            attach_foreground(&entry, 42, ForegroundRole::Observer).expect("first watch");
+        assert_eq!(first.attachment_id, 1);
+        assert_eq!(first.role, ForegroundRole::Observer);
+        assert!(first.control_available);
+        assert_eq!(first.snapshot, b"before");
+        assert!(!first.snapshot_truncated);
+        assert!(notice.is_none());
+        assert!(
+            attach_foreground(&entry, 42, ForegroundRole::Observer)
+                .unwrap_err()
+                .contains("already foreground-attached")
+        );
+
+        let recipients = record_pty_output(&ring_buffer, &foreground, b"-after");
+        assert_eq!(
+            recipients,
+            vec![ForegroundRecipient {
+                client_id: 42,
+                attachment_id: 1,
+            }]
+        );
+
+        let (second, notice) =
+            attach_foreground(&entry, 43, ForegroundRole::Observer).expect("second watch");
+        assert_eq!(second.attachment_id, 2);
+        assert_eq!(second.snapshot, b"before-after");
+        assert!(notice.is_none());
+
+        let (controller, notice) =
+            attach_foreground(&entry, 44, ForegroundRole::Controller).expect("claim on attach");
+        assert_eq!(controller.attachment_id, 3);
+        assert_eq!(controller.role, ForegroundRole::Controller);
+        assert!(!controller.control_available);
+        assert_eq!(
+            notice,
+            Some(vec![
+                ForegroundRecipient {
+                    client_id: 42,
+                    attachment_id: 1,
+                },
+                ForegroundRecipient {
+                    client_id: 43,
+                    attachment_id: 2,
+                },
+            ])
+        );
+        assert!(
+            notice
+                .as_ref()
+                .is_none_or(|recipients| recipients.iter().all(|item| item.client_id != 44)),
+            "legacy controller attach must not notify its own client"
+        );
+        assert!(attach_foreground(&entry, 45, ForegroundRole::Controller).is_err());
+
+        let (released, notice) = release_foreground_control(&entry, 44);
+        let released = released.unwrap();
+        assert_eq!(released.attachment_id, 3);
+        assert_eq!(released.role, ForegroundRole::Observer);
+        assert_eq!(notice.as_ref().map(Vec::len), Some(3));
+        let (claimed, notice) = claim_foreground_control(&entry, 43);
+        let claimed = claimed.unwrap();
+        assert_eq!(claimed.attachment_id, 2);
+        assert_eq!(claimed.role, ForegroundRole::Controller);
+        assert_eq!(notice.as_ref().map(Vec::len), Some(3));
+        let (idempotent, notice) = claim_foreground_control(&entry, 43);
+        let idempotent = idempotent.unwrap();
+        assert_eq!(idempotent.attachment_id, 2);
+        assert_eq!(idempotent.role, ForegroundRole::Controller);
+        assert!(notice.is_none());
+
+        let detached = foreground
+            .lock()
+            .unwrap()
+            .detach(42)
+            .expect("detach first epoch");
+        assert_eq!(detached.0, 1);
+        assert!(detached.1.is_none());
+        let (reattached, notice) =
+            attach_foreground(&entry, 42, ForegroundRole::Observer).expect("reattach observer");
+        assert_eq!(reattached.attachment_id, 4);
+        assert!(notice.is_none());
+
+        let mut fresh = ForegroundState::default();
+        let first_controller = fresh
+            .attach(99, ForegroundRole::Controller)
+            .expect("first legacy controller attach");
+        assert_eq!(first_controller.attachment_id, 1);
+        assert_eq!(first_controller.control_recipients, Some(Vec::new()));
+    }
+
+    #[test]
+    fn pty_input_requires_controller_but_pipe_input_remains_compatible() {
+        assert!(job_input_kind_allows_client(false, None, 42));
+        assert!(job_input_kind_allows_client(false, Some(7), 42));
+        assert!(!job_input_kind_allows_client(true, None, 42));
+        assert!(!job_input_kind_allows_client(true, Some(7), 42));
+        assert!(job_input_kind_allows_client(true, Some(42), 42));
     }
 
     #[test]
@@ -2764,6 +3763,7 @@ mod tests {
                     wrapper_enabled: false,
                     pty_enabled: false,
                     direct_output_client: None,
+                    session_id: None,
                 },
             })
             .await
@@ -2847,6 +3847,7 @@ mod tests {
                     wrapper_enabled: false,
                     pty_enabled: false,
                     direct_output_client: None,
+                    session_id: None,
                 },
             })
             .await

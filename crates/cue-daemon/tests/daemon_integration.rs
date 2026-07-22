@@ -27,8 +27,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use cue_core::ipc::{
-    self, EventPayload, JobInfo, Message, OkPayload, RequestPayload, ResponsePayload,
-    ScriptItemResult, ScriptRunStatus,
+    self, EventPayload, ForegroundRole, JobInfo, Message, OkPayload, RequestPayload,
+    ResponsePayload, ScriptItemResult, ScriptRunStatus, SessionInfo, SessionScopeState,
 };
 use cue_core::job::JobStatus;
 use cue_core::mode::Mode;
@@ -325,6 +325,32 @@ where
     serde_json::from_slice(&buf).expect("deserialize")
 }
 
+/// Best-effort roundtrip for readiness polling across a socket handoff. A
+/// predecessor may close between connect and read; that is a retry, not a test
+/// failure.
+async fn try_roundtrip<S>(
+    stream: &mut S,
+    id: u32,
+    payload: RequestPayload,
+) -> Option<ResponsePayload>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let encoded = ipc::encode_message(&request(id, payload)).ok()?;
+    stream.write_all(&encoded).await.ok()?;
+    stream.flush().await.ok()?;
+    let len = stream.read_u32().await.ok()?;
+    let mut buf = vec![0u8; len as usize];
+    stream.read_exact(&mut buf).await.ok()?;
+    match serde_json::from_slice(&buf).ok()? {
+        Message::Response {
+            id: response_id,
+            payload,
+        } if response_id == id => Some(payload),
+        _ => None,
+    }
+}
+
 /// Build a `Request` envelope.
 fn request(id: u32, payload: RequestPayload) -> Message {
     Message::Request {
@@ -352,6 +378,66 @@ where
     assert!(matches!(resp, ResponsePayload::Ok(OkPayload::Ack {})));
 }
 
+async fn handshake_with_env<S>(
+    stream: &mut S,
+    session_id: &str,
+    cwd: &Path,
+    env: BTreeMap<String, String>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let resp = roundtrip(
+        stream,
+        0,
+        RequestPayload::Handshake {
+            session_id: session_id.to_string(),
+            cwd: cwd.display().to_string(),
+            env,
+            refresh: false,
+        },
+    )
+    .await;
+    assert!(matches!(resp, ResponsePayload::Ok(OkPayload::Ack {})));
+}
+
+async fn create_named_session<S>(stream: &mut S, request_id: u32, name: &str) -> SessionInfo
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match roundtrip(
+        stream,
+        request_id,
+        RequestPayload::CreateSession {
+            name: name.to_string(),
+        },
+    )
+    .await
+    {
+        ResponsePayload::Ok(OkPayload::SessionInfo(info)) => *info,
+        other => panic!("expected named SessionInfo after create, got {other:?}"),
+    }
+}
+
+async fn attach_named_session<S>(
+    stream: &mut S,
+    request_id: u32,
+    selector: &str,
+    refresh: bool,
+) -> ResponsePayload
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    roundtrip(
+        stream,
+        request_id,
+        RequestPayload::AttachSession {
+            selector: selector.to_string(),
+            refresh,
+        },
+    )
+    .await
+}
+
 fn assert_missing_session_error(response: ResponsePayload) {
     match response {
         ResponsePayload::Err { code, message } => {
@@ -375,6 +461,37 @@ where
             id: rid, payload, ..
         } = msg
             && rid == id
+        {
+            return payload;
+        }
+    }
+}
+
+async fn roundtrip_with_operation<S>(
+    stream: &mut S,
+    id: u32,
+    operation_id: &str,
+    payload: RequestPayload,
+) -> ResponsePayload
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send(
+        stream,
+        &Message::Request {
+            id,
+            operation_id: Some(operation_id.into()),
+            payload,
+        },
+    )
+    .await;
+    loop {
+        let msg = recv(stream).await;
+        if let Message::Response {
+            id: response_id,
+            payload,
+        } = msg
+            && response_id == id
         {
             return payload;
         }
@@ -612,6 +729,53 @@ where
     collected
 }
 
+fn append_foreground_output(message: &Message, job_id: &str, output: &mut Vec<u8>) {
+    if let Message::Event {
+        payload: EventPayload::FgOutput { id, data, .. },
+    } = message
+        && id == job_id
+    {
+        output.extend_from_slice(data);
+    }
+}
+
+async fn wait_for_foreground_output<S>(
+    stream: &mut S,
+    job_id: &str,
+    expected: &[u8],
+    mut observed: Vec<Message>,
+) -> Vec<Message>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    for message in &observed {
+        append_foreground_output(message, job_id, &mut output);
+    }
+    if !output
+        .windows(expected.len())
+        .any(|window| window == expected)
+    {
+        observed.extend(
+            collect_until(stream, Duration::from_secs(3), |message| {
+                append_foreground_output(message, job_id, &mut output);
+                output
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+            })
+            .await,
+        );
+    }
+    assert!(
+        output
+            .windows(expected.len())
+            .any(|window| window == expected),
+        "foreground output for {job_id} did not contain {:?}; messages: {observed:?}",
+        String::from_utf8_lossy(expected),
+    );
+    observed
+}
+
 /// Send `:shutdown` and wait for the child to exit.
 async fn shutdown_daemon<S>(stream: &mut S, child: &mut Child)
 where
@@ -751,6 +915,138 @@ async fn test_restart_recovers_live_daemon_after_socket_is_unlinked() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("restarted daemon pid {new_pid} did not exit");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_restart_drains_active_job_rejects_late_admission_and_fences_successor() {
+    run_daemon_test(async {
+        let env = TestEnv::new("graceful-restart");
+        let marker = env.root.join("restart-marker");
+        let script = env.root.join("finish-once.sh");
+        write_executable_script(
+            &script,
+            &format!("#!/bin/sh\nsleep 1\nprintf x >> '{}'\n", marker.display()),
+        );
+
+        let mut child = env.spawn_daemon();
+        let mut stream = wait_for_socket(&env.socket, &mut child).await;
+        let predecessor = match roundtrip(&mut stream, 1, RequestPayload::Ping {}).await {
+            ResponsePayload::Ok(OkPayload::Pong {
+                instance_id,
+                protocol_version,
+                ..
+            }) => (instance_id, protocol_version),
+            other => panic!("expected predecessor Pong, got {other:?}"),
+        };
+
+        let job_id = job_id_from_created(
+            roundtrip(
+                &mut stream,
+                2,
+                RequestPayload::Eval {
+                    input: script.display().to_string(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        wait_for_job_status(&mut stream, 3, &job_id, |job| {
+            job.status == JobStatus::Running
+        })
+        .await;
+
+        let (restart_id, target_generation) =
+            match roundtrip(&mut stream, 20, RequestPayload::Restart {}).await {
+                ResponsePayload::Ok(OkPayload::RestartAccepted {
+                    restart_id,
+                    daemon_instance_id,
+                    target_generation,
+                }) => {
+                    assert_eq!(daemon_instance_id, predecessor.0);
+                    (restart_id, target_generation)
+                }
+                other => panic!("expected RestartAccepted, got {other:?}"),
+            };
+        match roundtrip(&mut stream, 21, RequestPayload::Restart {}).await {
+            ResponsePayload::Ok(OkPayload::RestartAccepted {
+                restart_id: repeated,
+                target_generation: repeated_generation,
+                ..
+            }) => {
+                assert_eq!(repeated, restart_id);
+                assert_eq!(repeated_generation, target_generation);
+            }
+            other => panic!("expected idempotent RestartAccepted, got {other:?}"),
+        }
+
+        match roundtrip(
+            &mut stream,
+            22,
+            RequestPayload::Eval {
+                input: "echo must-not-start".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await
+        {
+            ResponsePayload::Err { code, .. } => assert_eq!(code, "DAEMON_DRAINING"),
+            other => panic!("late execution must be rejected, got {other:?}"),
+        }
+
+        timeout(Duration::from_secs(8), child.wait())
+            .await
+            .expect("predecessor did not exit after active job completed")
+            .expect("wait for predecessor");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+
+        let mut successor = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(mut candidate) = UnixStream::connect(&env.socket).await {
+                    let ping = timeout(
+                        Duration::from_secs(1),
+                        try_roundtrip(&mut candidate, 30, RequestPayload::Ping {}),
+                    )
+                    .await;
+                    if let Ok(Some(ResponsePayload::Ok(OkPayload::Pong {
+                        instance_id,
+                        generation_id,
+                        protocol_version,
+                        ready,
+                        ..
+                    }))) = ping
+                        && instance_id != predecessor.0
+                        && generation_id == target_generation
+                        && protocol_version == predecessor.1
+                        && ready
+                    {
+                        break candidate;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("successor did not pass fenced readiness");
+        handshake(&mut successor, "restart-successor", &env.root).await;
+        let restored = job_info_from_jobs(&mut successor, 31, &job_id)
+            .await
+            .expect("completed job should remain in successor history");
+        assert_eq!(restored.status, JobStatus::Done);
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+
+        let response = roundtrip(&mut successor, 32, RequestPayload::Shutdown {}).await;
+        assert!(matches!(response, ResponsePayload::Ok(OkPayload::Ack {})));
+        let mut stopped = false;
+        for _ in 0..50 {
+            if UnixStream::connect(&env.socket).await.is_err() {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(stopped, "successor did not release its socket after stop");
     })
     .await;
 }
@@ -1748,6 +2044,1018 @@ async fn test_sessions_keep_cwd_isolated_and_reconnect_by_id() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_named_session_is_shared_and_restored_with_owned_jobs() {
+    run_daemon_test(async {
+        let env = TestEnv::new("named-session-shared");
+        let shared_cwd = env.root.join("shared-cwd");
+        std::fs::create_dir_all(&shared_cwd).expect("create shared cwd");
+
+        let mut child = env.spawn_daemon();
+        let default_cwd = default_test_session_cwd(&env.socket);
+        let mut human =
+            wait_for_socket_with_session(&env.socket, &mut child, "human-client", &default_cwd)
+                .await;
+        let mut agent =
+            wait_for_socket_with_session(&env.socket, &mut child, "agent-client", &default_cwd)
+                .await;
+
+        let created = roundtrip(
+            &mut human,
+            1,
+            RequestPayload::CreateSession {
+                name: "shared-dev".into(),
+            },
+        )
+        .await;
+        let session_id = match created {
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) => {
+                assert_eq!(info.name, "shared-dev");
+                assert!(info.current);
+                assert!(info.restart_safe);
+                info.id
+            }
+            other => panic!("expected SessionInfo after create, got {other:?}"),
+        };
+
+        let cd = roundtrip(
+            &mut human,
+            2,
+            RequestPayload::Eval {
+                input: format!(":cd {}", shared_cwd.display()),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        assert!(matches!(
+            cd,
+            ResponsePayload::Ok(OkPayload::ScopeCreated { .. })
+        ));
+
+        let attached = roundtrip(
+            &mut agent,
+            1,
+            RequestPayload::AttachSession {
+                selector: "shared-dev".into(),
+                refresh: false,
+            },
+        )
+        .await;
+        assert!(matches!(
+            attached,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info))
+                if info.id == session_id && info.connected_clients == 2 && info.current
+        ));
+
+        let mut agent_request = 2;
+        assert_eq!(
+            run_pwd_and_read(&mut agent, &mut agent_request).await,
+            std::fs::canonicalize(&shared_cwd).expect("canonicalize shared cwd")
+        );
+
+        let created_job = roundtrip(
+            &mut human,
+            3,
+            RequestPayload::Eval {
+                input: "echo shared-job".into(),
+                mode: Mode::Job,
+            },
+        )
+        .await;
+        let job_id = job_id_from_created(created_job);
+        assert_eq!(
+            wait_for_job_terminal(&mut agent, agent_request, &job_id).await,
+            JobStatus::Done
+        );
+        agent_request += 1;
+        let jobs = roundtrip(
+            &mut agent,
+            agent_request,
+            RequestPayload::ListJobs { limit: None },
+        )
+        .await;
+        match jobs {
+            ResponsePayload::Ok(OkPayload::JobListPage { jobs, .. }) => {
+                let owned = jobs
+                    .iter()
+                    .find(|job| job.id == job_id)
+                    .expect("shared job visible to attached agent");
+                assert_eq!(owned.session_id.as_deref(), Some(session_id.as_str()));
+            }
+            other => panic!("expected owned JobListPage, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut human, &mut child).await;
+
+        let mut child = env.spawn_daemon();
+        let mut restored = wait_for_socket_with_session(
+            &env.socket,
+            &mut child,
+            "restored-client",
+            &default_cwd,
+        )
+        .await;
+        let sessions = roundtrip(&mut restored, 1, RequestPayload::ListSessions {}).await;
+        assert!(matches!(
+            sessions,
+            ResponsePayload::Ok(OkPayload::SessionList(ref sessions))
+                if sessions.iter().any(|session| session.id == session_id && session.restart_safe)
+        ));
+        let attach = roundtrip(
+            &mut restored,
+            2,
+            RequestPayload::AttachSession {
+                selector: session_id.clone(),
+                refresh: false,
+            },
+        )
+        .await;
+        assert!(matches!(
+            attach,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info)) if info.id == session_id
+        ));
+        let mut restored_request = 3;
+        assert_eq!(
+            run_pwd_and_read(&mut restored, &mut restored_request).await,
+            std::fs::canonicalize(&shared_cwd).expect("canonicalize restored cwd")
+        );
+        let jobs = roundtrip(
+            &mut restored,
+            restored_request,
+            RequestPayload::ListJobs { limit: None },
+        )
+        .await;
+        assert!(matches!(
+            jobs,
+            ResponsePayload::Ok(OkPayload::JobListPage { ref jobs, .. })
+                if jobs.iter().any(|job| job.id == job_id && job.session_id.as_deref() == Some(session_id.as_str()))
+        ));
+
+        shutdown_daemon(&mut restored, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_named_session_archive_restore_roundtrips_over_ipc_and_restart() {
+    run_daemon_test(async {
+        let env = TestEnv::new("named-session-archive");
+        let cwd = default_test_session_cwd(&env.socket);
+        let mut child = env.spawn_daemon();
+        let mut owner =
+            wait_for_socket_with_session(&env.socket, &mut child, "archive-owner", &cwd).await;
+
+        let pong = roundtrip(&mut owner, 1, RequestPayload::Ping {}).await;
+        assert!(matches!(
+            pong,
+            ResponsePayload::Ok(OkPayload::Pong { ref capabilities, .. })
+                if capabilities.iter().any(|capability| capability == ipc::IPC_CAPABILITY_SESSION_ARCHIVE)
+        ));
+        let session = create_named_session(&mut owner, 2, "archive-daily").await;
+        assert_eq!(session.archived_at_ms, None);
+        let job_id = job_id_from_created(
+            roundtrip(
+                &mut owner,
+                3,
+                RequestPayload::Eval {
+                    input: "echo archive-history".into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            wait_for_job_terminal(&mut owner, 4, &job_id).await,
+            JobStatus::Done
+        );
+        drop(owner);
+
+        let mut cleaner =
+            wait_for_socket_with_session(&env.socket, &mut child, "archive-cleaner", &cwd).await;
+        let mut disconnected = false;
+        for request_id in 1..=40 {
+            match roundtrip(
+                &mut cleaner,
+                request_id,
+                RequestPayload::SessionInfo {
+                    selector: Some(session.id.clone()),
+                },
+            )
+            .await
+            {
+                ResponsePayload::Ok(OkPayload::SessionInfo(info))
+                    if info.connected_clients == 0 =>
+                {
+                    disconnected = true;
+                    break;
+                }
+                ResponsePayload::Ok(OkPayload::SessionInfo(_)) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                other => panic!("expected session info while waiting for disconnect: {other:?}"),
+            }
+        }
+        assert!(disconnected, "session owner did not disconnect");
+
+        let archived = roundtrip_with_operation(
+            &mut cleaner,
+            100,
+            "archive-daily-1",
+            RequestPayload::ArchiveSession {
+                selector: "archive-daily".into(),
+            },
+        )
+        .await;
+        let archived_at_ms = match archived {
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) => {
+                info.archived_at_ms.expect("archive timestamp")
+            }
+            other => panic!("expected archived SessionInfo, got {other:?}"),
+        };
+        let replayed = roundtrip_with_operation(
+            &mut cleaner,
+            101,
+            "archive-daily-1",
+            RequestPayload::ArchiveSession {
+                selector: "archive-daily".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            replayed,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info))
+                if info.archived_at_ms == Some(archived_at_ms)
+        ));
+
+        assert!(matches!(
+            roundtrip(&mut cleaner, 102, RequestPayload::ListSessions {}).await,
+            ResponsePayload::Ok(OkPayload::SessionList(ref sessions))
+                if sessions.iter().all(|candidate| candidate.id != session.id)
+        ));
+        assert!(matches!(
+            roundtrip(
+                &mut cleaner,
+                103,
+                RequestPayload::ListArchivedSessions {},
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::SessionList(ref sessions))
+                if sessions.len() == 1
+                    && sessions[0].id == session.id
+                    && sessions[0].archived_at_ms == Some(archived_at_ms)
+        ));
+        assert!(matches!(
+            roundtrip(&mut cleaner, 104, RequestPayload::ListAllSessions {}).await,
+            ResponsePayload::Ok(OkPayload::SessionList(ref sessions))
+                if sessions.len() == 1 && sessions[0].id == session.id
+        ));
+        assert!(matches!(
+            attach_named_session(&mut cleaner, 105, &session.id, false).await,
+            ResponsePayload::Err { ref code, .. } if code == ipc::error_code::INVALID_STATE
+        ));
+        assert!(matches!(
+            roundtrip(
+                &mut cleaner,
+                106,
+                RequestPayload::CreateSession {
+                    name: "archive-daily".into(),
+                },
+            )
+            .await,
+            ResponsePayload::Err { ref code, .. } if code == ipc::error_code::ALREADY_EXISTS
+        ));
+
+        shutdown_daemon(&mut cleaner, &mut child).await;
+
+        let mut child = env.spawn_daemon();
+        let mut restored =
+            wait_for_socket_with_session(&env.socket, &mut child, "archive-restorer", &cwd).await;
+        assert!(matches!(
+            roundtrip(&mut restored, 1, RequestPayload::ListSessions {}).await,
+            ResponsePayload::Ok(OkPayload::SessionList(ref sessions))
+                if sessions.iter().all(|candidate| candidate.id != session.id)
+        ));
+        assert!(matches!(
+            roundtrip(
+                &mut restored,
+                2,
+                RequestPayload::ListArchivedSessions {},
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::SessionList(ref sessions))
+                if sessions.len() == 1
+                    && sessions[0].id == session.id
+                    && sessions[0].archived_at_ms == Some(archived_at_ms)
+        ));
+
+        let restored_info = roundtrip_with_operation(
+            &mut restored,
+            3,
+            "restore-daily-1",
+            RequestPayload::RestoreSession {
+                selector: session.id.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            restored_info,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) if info.archived_at_ms.is_none()
+        ));
+        let restored_replay = roundtrip_with_operation(
+            &mut restored,
+            4,
+            "restore-daily-1",
+            RequestPayload::RestoreSession {
+                selector: session.id.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            restored_replay,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) if info.archived_at_ms.is_none()
+        ));
+        assert!(matches!(
+            attach_named_session(&mut restored, 5, &session.id, false).await,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info))
+                if info.id == session.id && info.current && info.archived_at_ms.is_none()
+        ));
+        assert!(matches!(
+            roundtrip(&mut restored, 6, RequestPayload::ListJobs { limit: None }).await,
+            ResponsePayload::Ok(OkPayload::JobListPage { ref jobs, .. })
+                if jobs.iter().any(|job| job.id == job_id && job.session_id.as_deref() == Some(session.id.as_str()))
+        ));
+
+        shutdown_daemon(&mut restored, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_named_sessions_isolate_events_output_and_id_controls() {
+    run_daemon_test(async {
+        let env = TestEnv::new("named-session-boundaries");
+        let alpha_script = env.root.join("alpha-output.sh");
+        let beta_script = env.root.join("beta-output.sh");
+        let alpha_long_script = env.root.join("alpha-long.sh");
+        let output_gate = env.root.join("release-output");
+        write_executable_script(
+            &alpha_script,
+            &format!(
+                "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nprintf 'alpha-session-output\\n'\n",
+                output_gate.display()
+            ),
+        );
+        write_executable_script(
+            &beta_script,
+            &format!(
+                "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nprintf 'beta-session-output\\n'\n",
+                output_gate.display()
+            ),
+        );
+        write_executable_script(&alpha_long_script, "#!/bin/sh\nsleep 30\n");
+
+        let mut child = env.spawn_daemon();
+        let cwd = default_test_session_cwd(&env.socket);
+
+        let mut alpha_control =
+            wait_for_socket_with_session(&env.socket, &mut child, "alpha-control", &cwd).await;
+        let alpha = create_named_session(&mut alpha_control, 1, "alpha").await;
+        let mut beta_control =
+            wait_for_socket_with_session(&env.socket, &mut child, "beta-control", &cwd).await;
+        let beta = create_named_session(&mut beta_control, 1, "beta").await;
+
+        let mut alpha_jobs =
+            wait_for_socket_with_session(&env.socket, &mut child, "alpha-jobs", &cwd).await;
+        assert!(matches!(
+            attach_named_session(&mut alpha_jobs, 1, &alpha.id, false).await,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info)) if info.id == alpha.id
+        ));
+        subscribe(&mut alpha_jobs, 2, ["jobs"]).await;
+
+        let mut beta_jobs =
+            wait_for_socket_with_session(&env.socket, &mut child, "beta-jobs", &cwd).await;
+        assert!(matches!(
+            attach_named_session(&mut beta_jobs, 1, &beta.id, false).await,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info)) if info.id == beta.id
+        ));
+        subscribe(&mut beta_jobs, 2, ["jobs"]).await;
+
+        // An unattached client preserves the legacy global event view.
+        let mut legacy_jobs =
+            wait_for_socket_with_session(&env.socket, &mut child, "legacy-jobs", &cwd).await;
+        subscribe(&mut legacy_jobs, 1, ["jobs"]).await;
+
+        let alpha_job = job_id_from_created(
+            roundtrip(
+                &mut alpha_control,
+                2,
+                RequestPayload::Eval {
+                    input: alpha_script.display().to_string(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        let beta_job = job_id_from_created(
+            roundtrip(
+                &mut beta_control,
+                2,
+                RequestPayload::Eval {
+                    input: beta_script.display().to_string(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+
+        let mut alpha_output =
+            wait_for_socket_with_session(&env.socket, &mut child, "alpha-output", &cwd).await;
+        assert!(matches!(
+            attach_named_session(&mut alpha_output, 1, &alpha.id, false).await,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info)) if info.id == alpha.id
+        ));
+        subscribe(&mut alpha_output, 2, [format!("output:{alpha_job}")]).await;
+
+        let mut beta_output =
+            wait_for_socket_with_session(&env.socket, &mut child, "beta-output", &cwd).await;
+        assert!(matches!(
+            attach_named_session(&mut beta_output, 1, &beta.id, false).await,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info)) if info.id == beta.id
+        ));
+        // Subscribing to a foreign ID is harmless: no foreign chunks may leak.
+        subscribe(
+            &mut beta_output,
+            2,
+            [format!("output:{beta_job}"), format!("output:{alpha_job}")],
+        )
+        .await;
+
+        let mut legacy_output =
+            wait_for_socket_with_session(&env.socket, &mut child, "legacy-output", &cwd).await;
+        subscribe(
+            &mut legacy_output,
+            1,
+            [format!("output:{alpha_job}"), format!("output:{beta_job}")],
+        )
+        .await;
+        fs::write(&output_gate, "release\n").expect("release output scripts after subscriptions");
+
+        let mut alpha_job_messages =
+            collect_until(&mut alpha_jobs, Duration::from_secs(5), |message| {
+                matches!(
+                    message,
+                    Message::Event {
+                        payload: EventPayload::JobStateChanged {
+                            job_id,
+                            new_state,
+                            ..
+                        },
+                    } if job_id == &alpha_job && new_state.is_terminal()
+                )
+            })
+            .await;
+        alpha_job_messages
+            .extend(collect_until(&mut alpha_jobs, Duration::from_millis(300), |_| false).await);
+        let alpha_event_ids = alpha_job_messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Event {
+                    payload:
+                        EventPayload::JobCreated { job_id, .. }
+                        | EventPayload::JobStateChanged { job_id, .. },
+                } => Some(job_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(alpha_event_ids.contains(&alpha_job.as_str()));
+        assert!(
+            alpha_event_ids.iter().all(|job_id| *job_id == alpha_job),
+            "alpha received foreign job events: {alpha_job_messages:?}"
+        );
+
+        let mut beta_job_messages =
+            collect_until(&mut beta_jobs, Duration::from_secs(5), |message| {
+                matches!(
+                    message,
+                    Message::Event {
+                        payload: EventPayload::JobStateChanged {
+                            job_id,
+                            new_state,
+                            ..
+                        },
+                    } if job_id == &beta_job && new_state.is_terminal()
+                )
+            })
+            .await;
+        beta_job_messages
+            .extend(collect_until(&mut beta_jobs, Duration::from_millis(300), |_| false).await);
+        let beta_event_ids = beta_job_messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Event {
+                    payload:
+                        EventPayload::JobCreated { job_id, .. }
+                        | EventPayload::JobStateChanged { job_id, .. },
+                } => Some(job_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(beta_event_ids.contains(&beta_job.as_str()));
+        assert!(
+            beta_event_ids.iter().all(|job_id| *job_id == beta_job),
+            "beta received foreign job events: {beta_job_messages:?}"
+        );
+
+        let mut legacy_alpha_done = false;
+        let mut legacy_beta_done = false;
+        let legacy_job_messages =
+            collect_until(&mut legacy_jobs, Duration::from_secs(5), |message| {
+                if let Message::Event {
+                    payload:
+                        EventPayload::JobStateChanged {
+                            job_id, new_state, ..
+                        },
+                } = message
+                    && new_state.is_terminal()
+                {
+                    legacy_alpha_done |= job_id == &alpha_job;
+                    legacy_beta_done |= job_id == &beta_job;
+                }
+                legacy_alpha_done && legacy_beta_done
+            })
+            .await;
+        for expected in [&alpha_job, &beta_job] {
+            assert!(
+                legacy_job_messages.iter().any(|message| matches!(
+                    message,
+                    Message::Event {
+                        payload:
+                            EventPayload::JobCreated { job_id, .. }
+                            | EventPayload::JobStateChanged { job_id, .. },
+                    } if job_id == expected
+                )),
+                "legacy subscriber missed {expected}: {legacy_job_messages:?}"
+            );
+        }
+
+        let alpha_output_messages =
+            collect_until(&mut alpha_output, Duration::from_secs(5), |message| {
+                matches!(
+                    message,
+                    Message::Event {
+                        payload: EventPayload::OutputEof { id },
+                    } if id == &alpha_job
+                )
+            })
+            .await;
+        assert!(alpha_output_messages.iter().any(|message| matches!(
+            message,
+            Message::Event {
+                payload: EventPayload::OutputChunk { id, data, .. },
+            } if id == &alpha_job && data.contains("alpha-session-output")
+        )));
+        assert!(alpha_output_messages.iter().all(|message| !matches!(
+            message,
+            Message::Event {
+                payload:
+                    EventPayload::OutputChunk { id, .. }
+                    | EventPayload::OutputChunkBinary { id, .. }
+                    | EventPayload::OutputEof { id },
+            } if id == &beta_job
+        )));
+
+        let beta_output_messages =
+            collect_until(&mut beta_output, Duration::from_secs(5), |message| {
+                matches!(
+                    message,
+                    Message::Event {
+                        payload: EventPayload::OutputEof { id },
+                    } if id == &beta_job
+                )
+            })
+            .await;
+        assert!(beta_output_messages.iter().any(|message| matches!(
+            message,
+            Message::Event {
+                payload: EventPayload::OutputChunk { id, data, .. },
+            } if id == &beta_job && data.contains("beta-session-output")
+        )));
+        assert!(
+            beta_output_messages.iter().all(|message| !matches!(
+                message,
+                Message::Event {
+                    payload:
+                        EventPayload::OutputChunk { id, .. }
+                        | EventPayload::OutputChunkBinary { id, .. }
+                        | EventPayload::OutputEof { id },
+                } if id == &alpha_job
+            )),
+            "beta received alpha output despite only owning beta: {beta_output_messages:?}"
+        );
+
+        let mut legacy_alpha_eof = false;
+        let mut legacy_beta_eof = false;
+        let legacy_output_messages =
+            collect_until(&mut legacy_output, Duration::from_secs(5), |message| {
+                if let Message::Event {
+                    payload: EventPayload::OutputEof { id },
+                } = message
+                {
+                    legacy_alpha_eof |= id == &alpha_job;
+                    legacy_beta_eof |= id == &beta_job;
+                }
+                legacy_alpha_eof && legacy_beta_eof
+            })
+            .await;
+        for (expected_id, expected_output) in [
+            (&alpha_job, "alpha-session-output"),
+            (&beta_job, "beta-session-output"),
+        ] {
+            assert!(
+                legacy_output_messages.iter().any(|message| matches!(
+                    message,
+                    Message::Event {
+                        payload: EventPayload::OutputChunk { id, data, .. },
+                    } if id == expected_id && data.contains(expected_output)
+                )),
+                "legacy subscriber missed output for {expected_id}: {legacy_output_messages:?}"
+            );
+        }
+
+        match roundtrip(
+            &mut alpha_control,
+            3,
+            RequestPayload::JobOutput {
+                id: alpha_job.clone(),
+                stdout_bytes: None,
+                stderr_bytes: None,
+            },
+        )
+        .await
+        {
+            ResponsePayload::Ok(OkPayload::JobOutput { stdout, .. }) => {
+                assert!(stdout.data.contains("alpha-session-output"));
+            }
+            other => panic!("alpha must read its own output, got {other:?}"),
+        }
+        match roundtrip(
+            &mut beta_control,
+            3,
+            RequestPayload::JobOutput {
+                id: alpha_job.clone(),
+                stdout_bytes: None,
+                stderr_bytes: None,
+            },
+        )
+        .await
+        {
+            ResponsePayload::Err { code, .. } => assert_eq!(code, ipc::error_code::NOT_FOUND),
+            other => panic!("foreign output lookup must be hidden, got {other:?}"),
+        }
+
+        let alpha_long_job = job_id_from_created(
+            roundtrip(
+                &mut alpha_control,
+                4,
+                RequestPayload::Eval {
+                    input: alpha_long_script.display().to_string(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        wait_for_job_status(&mut alpha_control, 5, &alpha_long_job, |job| {
+            job.status == JobStatus::Running
+        })
+        .await;
+        match roundtrip(
+            &mut beta_control,
+            4,
+            RequestPayload::KillJob {
+                id: alpha_long_job.clone(),
+            },
+        )
+        .await
+        {
+            ResponsePayload::Err { code, .. } => assert_eq!(code, ipc::error_code::NOT_FOUND),
+            other => panic!("foreign kill must be hidden, got {other:?}"),
+        }
+        assert!(matches!(
+            roundtrip(
+                &mut alpha_control,
+                100,
+                RequestPayload::KillJob { id: alpha_long_job },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+
+        shutdown_daemon(&mut alpha_control, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_named_session_switch_fences_events_and_foreground_owner() {
+    run_daemon_test(async {
+        let env = TestEnv::new("named-session-switch-fence");
+        let output_gate = env.root.join("release-alpha-direct-output");
+        let alpha_script = env.root.join("alpha-direct-output.sh");
+        write_executable_script(
+            &alpha_script,
+            &format!(
+                "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nprintf 'alpha-direct-after-switch\\n'\n",
+                output_gate.display()
+            ),
+        );
+
+        let mut child = env.spawn_daemon();
+        let cwd = default_test_session_cwd(&env.socket);
+        let mut alpha_control =
+            wait_for_socket_with_session(&env.socket, &mut child, "switch-alpha-control", &cwd)
+                .await;
+        let alpha = create_named_session(&mut alpha_control, 1, "switch-alpha").await;
+        let mut beta_control =
+            wait_for_socket_with_session(&env.socket, &mut child, "switch-beta-control", &cwd)
+                .await;
+        let beta = create_named_session(&mut beta_control, 1, "switch-beta").await;
+
+        let mut switcher =
+            wait_for_socket_with_session(&env.socket, &mut child, "switching-client", &cwd).await;
+        assert!(matches!(
+            attach_named_session(&mut switcher, 1, &alpha.id, false).await,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info)) if info.id == alpha.id
+        ));
+        subscribe(&mut switcher, 2, ["jobs"]).await;
+
+        // File-script jobs stream output directly back to their submitting
+        // connection. Keep that A-owned output blocked until after the same
+        // connection has successfully attached to B.
+        let (script_id, alpha_script_job) = match roundtrip(
+            &mut switcher,
+            3,
+            RequestPayload::RunScript {
+                path: "alpha-direct-output.cue".into(),
+                input: alpha_script.display().to_string(),
+            },
+        )
+        .await
+        {
+            ResponsePayload::Ok(OkPayload::ScriptCreated {
+                script_id, items, ..
+            }) => {
+                assert_eq!(items.len(), 1);
+                let job_id = match &items[0].result {
+                    ScriptItemResult::Job { job_id, .. } => job_id.clone(),
+                    other => panic!("expected gated script job, got {other:?}"),
+                };
+                (script_id, job_id)
+            }
+            other => panic!("expected ScriptCreated, got {other:?}"),
+        };
+        subscribe(
+            &mut switcher,
+            4,
+            [format!("output:{alpha_script_job}")],
+        )
+        .await;
+        wait_for_job_status(&mut alpha_control, 10, &alpha_script_job, |job| {
+            job.status == JobStatus::Running
+        })
+        .await;
+
+        let alpha_fg_job = job_id_from_created(
+            roundtrip(
+                &mut switcher,
+                5,
+                RequestPayload::Eval {
+                    input: "cat".into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        wait_for_job_status(&mut alpha_control, 100, &alpha_fg_job, |job| {
+            job.status == JobStatus::Running
+        })
+        .await;
+
+        let attach_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut fg_attach_request = 10;
+        loop {
+            let response = roundtrip(
+                &mut switcher,
+                fg_attach_request,
+                RequestPayload::FgAttach {
+                    id: alpha_fg_job.clone(),
+                },
+            )
+            .await;
+            fg_attach_request += 1;
+            match response {
+                ResponsePayload::Ok(OkPayload::FgAttached(_)) => break,
+                ResponsePayload::Err { message, .. } if message.contains("is not running") => {
+                    assert!(
+                        tokio::time::Instant::now() < attach_deadline,
+                        "A foreground job never became attachable"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                other => panic!("unexpected A foreground attach response: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            roundtrip(
+                &mut switcher,
+                50,
+                RequestPayload::FgResize { cols: 100, rows: 40 },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+
+        // Submit one last A job immediately before the switch. Its already
+        // queued events may appear before the attach response, but never after
+        // that response has established the B boundary.
+        let queued_alpha_job = job_id_from_created(
+            roundtrip(
+                &mut alpha_control,
+                1000,
+                RequestPayload::Eval {
+                    input: "echo alpha-before-switch".into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        let (attach_beta, _messages_before_attach_ack) = roundtrip_with_messages(
+            &mut switcher,
+            51,
+            RequestPayload::AttachSession {
+                selector: beta.id.clone(),
+                refresh: false,
+            },
+        )
+        .await;
+        assert!(matches!(
+            attach_beta,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info))
+                if info.id == beta.id && info.current
+        ));
+
+        let alpha_job_ids = [&alpha_script_job, &alpha_fg_job, &queued_alpha_job];
+        let is_alpha_event = |message: &Message| {
+            let Message::Event { payload } = message else {
+                return false;
+            };
+            match payload {
+                EventPayload::JobCreated { job_id, .. }
+                | EventPayload::JobStateChanged { job_id, .. }
+                | EventPayload::JobRemoved { job_id } => alpha_job_ids
+                    .iter()
+                    .any(|expected| expected.as_str() == job_id),
+                EventPayload::OutputChunk { id, .. }
+                | EventPayload::OutputChunkBinary { id, .. }
+                | EventPayload::OutputEof { id } => id == &alpha_script_job,
+                EventPayload::ScriptItemCreated {
+                    script_id: observed,
+                    ..
+                }
+                | EventPayload::ScriptFinished {
+                    script_id: observed,
+                    ..
+                } => observed == &script_id,
+                EventPayload::FgOutput { .. } => true,
+                EventPayload::FgExited { id, .. } => id == &alpha_fg_job,
+                _ => false,
+            }
+        };
+
+        let (input_after_switch, mut messages_after_attach_ack) = roundtrip_with_messages(
+            &mut switcher,
+            52,
+            RequestPayload::FgInput {
+                data: b"must-not-reach-alpha\n".to_vec(),
+            },
+        )
+        .await;
+        match input_after_switch {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, ipc::error_code::INVALID_STATE);
+                assert!(message.contains("no foreground session attached"));
+            }
+            other => panic!("B must not retain A foreground input ownership: {other:?}"),
+        }
+
+        let (resize_after_switch, observed) = roundtrip_with_messages(
+            &mut switcher,
+            53,
+            RequestPayload::FgResize { cols: 80, rows: 24 },
+        )
+        .await;
+        messages_after_attach_ack.extend(observed);
+        match resize_after_switch {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, ipc::error_code::INVALID_STATE);
+                assert!(message.contains("no foreground session attached"));
+            }
+            other => panic!("B must not retain A foreground resize ownership: {other:?}"),
+        }
+
+        fs::write(&output_gate, "release\n")
+            .expect("release A direct output only after B attach acknowledgement");
+        messages_after_attach_ack.extend(
+            collect_until(&mut switcher, Duration::from_secs(2), |_| false).await,
+        );
+        assert_eq!(
+            wait_for_job_terminal(&mut alpha_control, 2000, &alpha_script_job).await,
+            JobStatus::Done
+        );
+        messages_after_attach_ack.extend(
+            collect_until(&mut switcher, Duration::from_millis(300), |_| false).await,
+        );
+        assert!(
+            messages_after_attach_ack
+                .iter()
+                .all(|message| !is_alpha_event(message)),
+            "A resource event crossed the B attach ACK fence: {messages_after_attach_ack:?}"
+        );
+
+        assert!(matches!(
+            roundtrip(
+                &mut alpha_control,
+                3000,
+                RequestPayload::KillJob { id: alpha_fg_job },
+            )
+            .await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        shutdown_daemon(&mut beta_control, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sensitive_named_session_requires_refresh_after_restart() {
+    run_daemon_test(async {
+        let env = TestEnv::new("named-session-sensitive-restart");
+        let cwd = default_test_session_cwd(&env.socket);
+        let mut child = env.spawn_daemon();
+        let mut owner = wait_for_raw_socket(&env.socket, &mut child).await;
+        handshake_with_env(
+            &mut owner,
+            "sensitive-owner",
+            &cwd,
+            BTreeMap::from([
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                (
+                    "TEST_API_TOKEN".into(),
+                    "fixture-sensitive-value-do-not-persist".into(),
+                ),
+            ]),
+        )
+        .await;
+        let created = create_named_session(&mut owner, 1, "volatile-session").await;
+        assert_eq!(created.scope_state, SessionScopeState::ReadyVolatile);
+        assert!(!created.restart_safe);
+
+        shutdown_daemon(&mut owner, &mut child).await;
+
+        let mut child = env.spawn_daemon();
+        let mut restored =
+            wait_for_socket_with_session(&env.socket, &mut child, "fresh-owner", &cwd).await;
+        match roundtrip(&mut restored, 1, RequestPayload::ListSessions {}).await {
+            ResponsePayload::Ok(OkPayload::SessionList(sessions)) => {
+                let session = sessions
+                    .iter()
+                    .find(|session| session.id == created.id)
+                    .expect("volatile named session identity survives restart");
+                assert_eq!(session.scope_state, SessionScopeState::NeedsRefresh);
+                assert!(!session.restart_safe);
+                assert!(!session.current);
+            }
+            other => panic!("expected restored SessionList, got {other:?}"),
+        }
+
+        match attach_named_session(&mut restored, 2, &created.id, false).await {
+            ResponsePayload::Err { code, .. } => assert_eq!(code, ipc::error_code::INVALID_STATE),
+            other => panic!("attach without refresh must fail closed, got {other:?}"),
+        }
+        match attach_named_session(&mut restored, 3, &created.id, true).await {
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) => {
+                assert_eq!(info.id, created.id);
+                assert_eq!(info.scope_state, SessionScopeState::ReadyDurable);
+                assert!(info.restart_safe);
+                assert!(info.current);
+            }
+            other => panic!("explicit refresh must restore session, got {other:?}"),
+        }
+
+        shutdown_daemon(&mut restored, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_background_job_survives_client_disconnect() {
     run_daemon_test(async {
         let env = TestEnv::new("background-disconnect");
@@ -2610,7 +3918,7 @@ async fn test_fg_attach_input_and_detach() {
         assert!(
             matches!(
                 attach_resp,
-                ResponsePayload::Ok(OkPayload::FgAttached { .. })
+                ResponsePayload::Ok(OkPayload::FgAttached(_))
             ),
             "expected FgAttached, got {attach_resp:?}"
         );
@@ -2634,7 +3942,7 @@ async fn test_fg_attach_input_and_detach() {
             matches!(
                 msg,
                 Message::Event {
-                    payload: EventPayload::FgOutput { data },
+                    payload: EventPayload::FgOutput { data, .. },
                 } if data.windows(expected_fragment.len()).any(|window| window == expected_fragment.as_slice())
             )
         })
@@ -2643,7 +3951,7 @@ async fn test_fg_attach_input_and_detach() {
             msgs.iter().any(|msg| matches!(
                 msg,
                 Message::Event {
-                    payload: EventPayload::FgOutput { data },
+                    payload: EventPayload::FgOutput { data, .. },
                 } if data.windows(expected_fragment.len()).any(|window| window == expected_fragment.as_slice())
             )),
             "expected FgOutput containing tty echo, got {msgs:?}"
@@ -2660,7 +3968,7 @@ async fn test_fg_attach_input_and_detach() {
             matches!(
                 msg,
                 Message::Event {
-                    payload: EventPayload::FgExited { id, reason },
+                    payload: EventPayload::FgExited { id, reason, .. },
                 } if id == &job_id && reason == "detached"
             )
         }) {
@@ -2669,7 +3977,7 @@ async fn test_fg_attach_input_and_detach() {
                     matches!(
                         msg,
                         Message::Event {
-                            payload: EventPayload::FgExited { id, reason },
+                            payload: EventPayload::FgExited { id, reason, .. },
                         } if id == &job_id && reason == "detached"
                     )
                 })
@@ -2680,15 +3988,73 @@ async fn test_fg_attach_input_and_detach() {
             msgs.iter().any(|msg| matches!(
                 msg,
                 Message::Event {
-                    payload: EventPayload::FgExited { id, reason },
+                    payload: EventPayload::FgExited { id, reason, .. },
                 } if id == &job_id && reason == "detached"
             )),
             "expected detached fg exit event, got {msgs:?}"
         );
 
-        let jobs_resp = roundtrip(
+        let (reattach_resp, before_reattach) = roundtrip_with_messages(
             &mut stream,
             5,
+            RequestPayload::FgAttach { id: job_id.clone() },
+        )
+        .await;
+        let reattached = match reattach_resp {
+            ResponsePayload::Ok(OkPayload::FgAttached(info)) => *info,
+            other => panic!("expected foreground reattach, got {other:?}"),
+        };
+        assert_ne!(reattached.attachment_id, 0);
+        assert!(
+            reattached
+                .snapshot
+                .windows(expected_fragment.len())
+                .any(|window| window == expected_fragment.as_slice()),
+            "reattach snapshot missed retained tty history: {reattached:?}"
+        );
+        assert!(
+            before_reattach.iter().all(|message| !matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::FgOutput { id, .. },
+                } if id == &job_id
+            )),
+            "legacy snapshot event crossed the attach response fence: {before_reattach:?}"
+        );
+        let legacy_snapshot = collect_until(&mut stream, Duration::from_secs(5), |message| {
+            matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::FgOutput {
+                        id,
+                        attachment_id: 0,
+                        data,
+                    },
+                } if id == &job_id
+                    && data.windows(expected_fragment.len())
+                        .any(|window| window == expected_fragment.as_slice())
+            )
+        })
+        .await;
+        assert!(
+            legacy_snapshot.iter().any(|message| matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::FgOutput {
+                        id,
+                        attachment_id: 0,
+                        data,
+                    },
+                } if id == &job_id
+                    && data.windows(expected_fragment.len())
+                        .any(|window| window == expected_fragment.as_slice())
+            )),
+            "old clients need the retained snapshot as a legacy epoch-0 event: {legacy_snapshot:?}"
+        );
+
+        let jobs_resp = roundtrip(
+            &mut stream,
+            6,
             RequestPayload::Eval {
                 input: ":jobs".into(),
                 mode: Mode::Job,
@@ -2702,7 +4068,7 @@ async fn test_fg_attach_input_and_detach() {
 
         let _ = roundtrip(
             &mut stream,
-            6,
+            7,
             RequestPayload::Eval {
                 input: format!(":kill {job_id}"),
                 mode: Mode::Job,
@@ -2711,6 +4077,344 @@ async fn test_fg_attach_input_and_detach() {
         .await;
 
         shutdown_daemon(&mut stream, &mut child).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_named_session_shares_foreground_output_and_hands_off_control() {
+    run_daemon_test(async {
+        let env = TestEnv::new("named-session-shared-fg");
+        let mut child = env.spawn_daemon();
+        let cwd = default_test_session_cwd(&env.socket);
+
+        let mut human =
+            wait_for_socket_with_session(&env.socket, &mut child, "shared-fg-human", &cwd).await;
+        let shared = create_named_session(&mut human, 1, "shared-foreground").await;
+
+        let mut agent =
+            wait_for_socket_with_session(&env.socket, &mut child, "shared-fg-agent", &cwd).await;
+        assert!(matches!(
+            attach_named_session(&mut agent, 1, &shared.id, false).await,
+            ResponsePayload::Ok(OkPayload::SessionInfo(ref info)) if info.id == shared.id
+        ));
+
+        let mut foreign =
+            wait_for_socket_with_session(&env.socket, &mut child, "foreign-fg-client", &cwd).await;
+        let foreign_session = create_named_session(&mut foreign, 1, "foreign-foreground").await;
+        assert_ne!(foreign_session.id, shared.id);
+
+        let first_job = job_id_from_created(
+            roundtrip(
+                &mut human,
+                2,
+                RequestPayload::Eval {
+                    input: "cat".into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        let second_job = job_id_from_created(
+            roundtrip(
+                &mut human,
+                3,
+                RequestPayload::Eval {
+                    input: "cat".into(),
+                    mode: Mode::Job,
+                },
+            )
+            .await,
+        );
+        wait_for_job_status(&mut human, 10, &first_job, |job| {
+            job.status == JobStatus::Running
+        })
+        .await;
+        wait_for_job_status(&mut human, 20, &second_job, |job| {
+            job.status == JobStatus::Running
+        })
+        .await;
+
+        match roundtrip(
+            &mut foreign,
+            2,
+            RequestPayload::FgWatch {
+                id: first_job.clone(),
+            },
+        )
+        .await
+        {
+            ResponsePayload::Err { code, .. } => assert_eq!(code, ipc::error_code::NOT_FOUND),
+            other => panic!("foreign named session must not watch {first_job}, got {other:?}"),
+        }
+
+        let (controller_response, before_controller_response) = roundtrip_with_messages(
+            &mut human,
+            30,
+            RequestPayload::FgAttach {
+                id: first_job.clone(),
+            },
+        )
+        .await;
+        let controller_info = match controller_response {
+            ResponsePayload::Ok(OkPayload::FgAttached(info)) => *info,
+            other => panic!("expected controller FgAttached response, got {other:?}"),
+        };
+        assert_eq!(controller_info.id, first_job);
+        assert_ne!(controller_info.attachment_id, 0);
+        assert_eq!(controller_info.role, ForegroundRole::Controller);
+        assert!(!controller_info.control_available);
+        assert!(
+            before_controller_response.iter().all(|message| !matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::FgOutput { id, .. },
+                } if id == &first_job
+            )),
+            "foreground output crossed the controller attach response fence: {before_controller_response:?}"
+        );
+
+        // Seed the ring before the observer attaches. The observer must receive
+        // this as response snapshot data, never as an event before FgAttached.
+        let snapshot_input = b"snapshot-before-observer\n";
+        let snapshot_marker = b"snapshot-before-observer";
+        let (snapshot_input, snapshot_events) = roundtrip_with_messages(
+            &mut human,
+            31,
+            RequestPayload::FgInput {
+                data: snapshot_input.to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            snapshot_input,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        let _ = wait_for_foreground_output(
+            &mut human,
+            &first_job,
+            snapshot_marker,
+            snapshot_events,
+        )
+        .await;
+
+        let (observer_response, before_observer_response) = roundtrip_with_messages(
+            &mut agent,
+            2,
+            RequestPayload::FgWatch {
+                id: first_job.clone(),
+            },
+        )
+        .await;
+        let observer_info = match observer_response {
+            ResponsePayload::Ok(OkPayload::FgAttached(info)) => *info,
+            other => panic!("expected observer FgAttached response, got {other:?}"),
+        };
+        assert_eq!(observer_info.id, first_job);
+        assert_ne!(observer_info.attachment_id, 0);
+        assert_ne!(observer_info.attachment_id, controller_info.attachment_id);
+        assert_eq!(observer_info.role, ForegroundRole::Observer);
+        assert!(!observer_info.control_available);
+        assert!(
+            observer_info
+                .snapshot
+                .windows(snapshot_marker.len())
+                .any(|window| window == snapshot_marker),
+            "observer snapshot missed seeded PTY output: {observer_info:?}"
+        );
+        assert!(
+            before_observer_response.iter().all(|message| !matches!(
+                message,
+                Message::Event {
+                    payload: EventPayload::FgOutput { id, .. },
+                } if id == &first_job
+            )),
+            "FgOutput arrived before observer FgAttached: {before_observer_response:?}"
+        );
+
+        match roundtrip(
+            &mut human,
+            32,
+            RequestPayload::FgWatch {
+                id: second_job.clone(),
+            },
+        )
+        .await
+        {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, ipc::error_code::INVALID_STATE);
+                assert!(message.contains("already foreground-attached"));
+                assert!(message.contains(&first_job));
+            }
+            other => panic!("one client must not attach a second job, got {other:?}"),
+        }
+
+        for (request_id, request, operation) in [
+            (
+                3,
+                RequestPayload::FgInput {
+                    data: b"observer-input-must-fail\n".to_vec(),
+                },
+                "FgInput",
+            ),
+            (
+                4,
+                RequestPayload::FgResize { cols: 100, rows: 40 },
+                "FgResize",
+            ),
+            (
+                5,
+                RequestPayload::Eval {
+                    input: format!(":send {first_job} observer-send-must-fail"),
+                    mode: Mode::Job,
+                },
+                ":send",
+            ),
+        ] {
+            match roundtrip(&mut agent, request_id, request).await {
+                ResponsePayload::Err { code, .. } => {
+                    assert_eq!(code, ipc::error_code::INVALID_STATE, "{operation}")
+                }
+                other => panic!("observer {operation} must be rejected, got {other:?}"),
+            }
+        }
+
+        // The first output produced after FgAttached must be a live, job-scoped
+        // event delivered to both controller and observer.
+        let shared_input_bytes = b"shared-live-before-handoff\n";
+        let shared_marker = b"shared-live-before-handoff";
+        let (shared_input, human_live_events) = roundtrip_with_messages(
+            &mut human,
+            33,
+            RequestPayload::FgInput {
+                data: shared_input_bytes.to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            shared_input,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        let _ = wait_for_foreground_output(
+            &mut human,
+            &first_job,
+            shared_marker,
+            human_live_events,
+        )
+        .await;
+        let _ = wait_for_foreground_output(
+            &mut agent,
+            &first_job,
+            shared_marker,
+            Vec::new(),
+        )
+        .await;
+
+        match roundtrip(
+            &mut human,
+            34,
+            RequestPayload::FgReleaseControl {},
+        )
+        .await
+        {
+            ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                id,
+                attachment_id,
+                role,
+                control_available,
+            }) => {
+                assert_eq!(id, first_job);
+                assert_eq!(attachment_id, controller_info.attachment_id);
+                assert_eq!(role, ForegroundRole::Observer);
+                assert!(control_available);
+            }
+            other => panic!("expected controller release role update, got {other:?}"),
+        }
+
+        match roundtrip(&mut agent, 6, RequestPayload::FgClaimControl {}).await {
+            ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                id,
+                attachment_id,
+                role,
+                control_available,
+            }) => {
+                assert_eq!(id, first_job);
+                assert_eq!(attachment_id, observer_info.attachment_id);
+                assert_eq!(role, ForegroundRole::Controller);
+                assert!(!control_available);
+            }
+            other => panic!("expected observer control claim, got {other:?}"),
+        }
+
+        match roundtrip(
+            &mut human,
+            35,
+            RequestPayload::FgInput {
+                data: b"old-controller-must-fail\n".to_vec(),
+            },
+        )
+        .await
+        {
+            ResponsePayload::Err { code, .. } => {
+                assert_eq!(code, ipc::error_code::INVALID_STATE)
+            }
+            other => panic!("released controller must lose input authority, got {other:?}"),
+        }
+
+        let handoff_input_bytes = b"shared-live-after-handoff\n";
+        let handoff_marker = b"shared-live-after-handoff";
+        let (handoff_input, agent_live_events) = roundtrip_with_messages(
+            &mut agent,
+            7,
+            RequestPayload::FgInput {
+                data: handoff_input_bytes.to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            handoff_input,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        let _ = wait_for_foreground_output(
+            &mut agent,
+            &first_job,
+            handoff_marker,
+            agent_live_events,
+        )
+        .await;
+        let _ = wait_for_foreground_output(
+            &mut human,
+            &first_job,
+            handoff_marker,
+            Vec::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            roundtrip(&mut human, 36, RequestPayload::FgDetach {}).await,
+            ResponsePayload::Ok(OkPayload::Ack {})
+        ));
+        let (reattach_response, _) = roundtrip_with_messages(
+            &mut human,
+            37,
+            RequestPayload::FgWatch {
+                id: first_job.clone(),
+            },
+        )
+        .await;
+        let reattached_info = match reattach_response {
+            ResponsePayload::Ok(OkPayload::FgAttached(info)) => *info,
+            other => panic!("expected observer reattach response, got {other:?}"),
+        };
+        assert_eq!(reattached_info.id, first_job);
+        assert_eq!(reattached_info.role, ForegroundRole::Observer);
+        assert!(!reattached_info.control_available);
+        assert!(
+            reattached_info.attachment_id > controller_info.attachment_id,
+            "reattach must allocate a fresh epoch: first={controller_info:?}, reattached={reattached_info:?}"
+        );
+
+        shutdown_daemon(&mut human, &mut child).await;
     })
     .await;
 }
@@ -3201,7 +4905,7 @@ async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
             remote_request_id += 1;
 
             match attach_resp {
-                ResponsePayload::Ok(OkPayload::FgAttached { .. }) => break,
+                ResponsePayload::Ok(OkPayload::FgAttached(_)) => break,
                 ResponsePayload::Err { message, .. } if message.contains("is not running") => {
                     assert!(
                         tokio::time::Instant::now() < attach_deadline,
@@ -3220,10 +4924,11 @@ async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
         )
         .await;
         match local_attach_resp {
-            ResponsePayload::Err { message, .. } => {
+            ResponsePayload::Err { code, message } => {
+                assert_eq!(code, ipc::error_code::INVALID_STATE);
                 assert!(
-                    message.contains("already foreground-attached"),
-                    "expected single-owner fg rejection, got {message:?}"
+                    message.contains("foreground control is already held"),
+                    "expected controller-busy foreground rejection, got {message:?}"
                 );
             }
             other => {
@@ -3250,9 +4955,9 @@ async fn test_gateway_stdio_bridge_releases_fg_owner_after_disconnect() {
             local_request_id += 1;
 
             match attach_resp {
-                ResponsePayload::Ok(OkPayload::FgAttached { .. }) => break,
+                ResponsePayload::Ok(OkPayload::FgAttached(_)) => break,
                 ResponsePayload::Err { message, .. }
-                    if message.contains("already foreground-attached") =>
+                    if message.contains("foreground control is already held") =>
                 {
                     assert!(
                         tokio::time::Instant::now() < retry_deadline,

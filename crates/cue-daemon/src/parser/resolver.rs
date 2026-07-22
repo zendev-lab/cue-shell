@@ -10,7 +10,7 @@ use cue_core::command::{ModeParams, ParamValue};
 use cue_core::cron::{
     CronPreset, CronSchedule, CrontabSchedule, parse_day_filter, parse_time_of_day,
 };
-use cue_core::ipc::ScriptSource;
+use cue_core::ipc::{ForegroundRole, ScriptSource};
 use cue_core::mode::Mode;
 use cue_core::pipeline::{self as core_pipeline};
 
@@ -62,8 +62,8 @@ pub enum ResolvedCommand {
         stdout_bytes: Option<usize>,
         stderr_bytes: Option<usize>,
     },
-    /// Foreground attach.
-    Fg { id: String },
+    /// Attach to a PTY job as either its controller or a read-only observer.
+    Fg { id: String, role: ForegroundRole },
     /// Wait for job completion.
     Wait { id: String },
     /// Send stdin.
@@ -255,6 +255,11 @@ impl Resolver {
             },
             "fg" => ResolvedCommand::Fg {
                 id: extract_id(argument, span, "fg")?,
+                role: ForegroundRole::Controller,
+            },
+            "watch" => ResolvedCommand::Fg {
+                id: extract_id(argument, span, "watch")?,
+                role: ForegroundRole::Observer,
             },
             "wait" => ResolvedCommand::Wait {
                 id: extract_id(argument, span, "wait")?,
@@ -1158,6 +1163,24 @@ mod tests {
             ResolvedCommand::Kill { id } => assert_eq!(id, "J1"),
             _ => panic!("expected Kill"),
         }
+    }
+
+    #[test]
+    fn resolve_foreground_role_is_explicit() {
+        assert!(matches!(
+            resolve(":fg J1", Mode::Job),
+            ResolvedCommand::Fg {
+                id,
+                role: ForegroundRole::Controller,
+            } if id == "J1"
+        ));
+        assert!(matches!(
+            resolve(":watch J1", Mode::Job),
+            ResolvedCommand::Fg {
+                id,
+                role: ForegroundRole::Observer,
+            } if id == "J1"
+        ));
     }
 
     #[test]

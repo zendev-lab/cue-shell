@@ -172,6 +172,8 @@ mod tests {
             payload: ResponsePayload::Ok(OkPayload::Pong {
                 version: "0.1.0".into(),
                 instance_id: "00000000-0000-4000-8000-000000000000".into(),
+                generation_id: "generation-1".into(),
+                ready: true,
                 protocol_version: IPC_PROTOCOL_VERSION,
                 capabilities: current_protocol_capabilities(),
             }),

@@ -91,7 +91,9 @@ fn shared_prefix(items: &[String]) -> String {
 
 fn target_id_candidates(command: &str, job_ids: &[String], cron_ids: &[String]) -> Vec<String> {
     match command {
-        ":out" | ":err" | ":tail" | ":retry" | ":fg" | ":wait" | ":send" => job_ids.to_vec(),
+        ":out" | ":err" | ":tail" | ":retry" | ":fg" | ":watch" | ":wait" | ":send" => {
+            job_ids.to_vec()
+        }
         ":kill" | ":cancel" | ":pause" | ":resume" | ":log" => {
             let mut ids = job_ids.to_vec();
             ids.extend_from_slice(cron_ids);
@@ -384,6 +386,15 @@ mod tests {
             cron_ids: &cron_ids,
         })
         .expect("wait completion");
+        let watch_candidates = completion_candidates(CompletionScope {
+            mode: Mode::Job,
+            content: ":watch J",
+            cursor: 8,
+            word_range: 7..8,
+            job_ids: &job_ids,
+            cron_ids: &cron_ids,
+        })
+        .expect("watch completion");
         let kill_candidates = completion_candidates(CompletionScope {
             mode: Mode::Job,
             content: ":kill C",
@@ -395,6 +406,7 @@ mod tests {
         .expect("kill completion");
 
         assert_eq!(wait_candidates, vec!["J1".to_string(), "J2".to_string()]);
+        assert_eq!(watch_candidates, vec!["J1".to_string(), "J2".to_string()]);
         assert_eq!(kill_candidates, vec!["C1".to_string()]);
     }
 

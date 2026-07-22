@@ -25,6 +25,7 @@ mod message;
 mod mouse_mode;
 mod record_format;
 mod script_summary;
+mod session_binding;
 mod sidebar_action;
 mod status_view;
 mod submission;
@@ -46,6 +47,11 @@ use cue_client::{ClientConnector, CuedClient, RestartHandle};
 use message::AppMsg;
 use terminal::{PanicHookGuard, TerminalRestoreGuard, initial_terminal_size};
 
+/// Entry point used by the thin `src/main.rs` binary.
+pub fn run_cli() -> anyhow::Result<()> {
+    cli::run()
+}
+
 /// Inputs needed to start the TUI.
 ///
 /// Keeping this as a named boundary avoids a long positional `run(...)`
@@ -55,6 +61,8 @@ pub struct RunOptions {
     client_connector: ClientConnector,
     client: Option<CuedClient>,
     session_profile_name: Option<String>,
+    named_session_selector: Option<String>,
+    named_session_refresh: bool,
     restart_handle: Option<RestartHandle>,
     debug_socket: Option<PathBuf>,
 }
@@ -65,6 +73,8 @@ impl RunOptions {
             client_connector,
             client: None,
             session_profile_name: None,
+            named_session_selector: None,
+            named_session_refresh: false,
             restart_handle: None,
             debug_socket: None,
         }
@@ -85,6 +95,22 @@ impl RunOptions {
         self
     }
 
+    /// Select a durable named daemon session for the initial connection and
+    /// every subsequent reconnect.
+    pub fn with_named_session_selector(mut self, selector: Option<String>) -> Self {
+        self.named_session_selector = selector;
+        self
+    }
+
+    /// Permit recovery of a selected named session whose volatile scope was
+    /// lost during daemon restart. Ready scopes are never replaced: each
+    /// connection first attempts a normal attach and refreshes only after the
+    /// daemon confirms `needs_refresh`.
+    pub fn with_named_session_refresh(mut self, refresh: bool) -> Self {
+        self.named_session_refresh = refresh;
+        self
+    }
+
     pub fn with_restart_handle(mut self, restart_handle: Option<RestartHandle>) -> Self {
         self.restart_handle = restart_handle;
         self
@@ -100,15 +126,38 @@ impl RunOptions {
 ///
 /// [`RunOptions`] accepts an optional pre-connected client (from
 /// `ensure_daemon_running`) to avoid double-connecting. If `None`, the app
-/// starts in offline mode and auto-reconnects using the provided connector.
+/// starts in offline mode and auto-reconnects using the provided connector. A
+/// selected named session is attached before the initial client is split and
+/// after every connector-created reconnect.
 pub async fn run(options: RunOptions) -> Result<()> {
     let RunOptions {
         client_connector,
-        client,
+        mut client,
         session_profile_name,
+        named_session_selector,
+        named_session_refresh,
         restart_handle,
         debug_socket,
     } = options;
+
+    if let Some(selector) = named_session_selector.as_deref()
+        && let Some(connected_client) = client.take()
+    {
+        client = Some(
+            session_binding::attach_named_session(
+                connected_client,
+                selector,
+                named_session_refresh,
+            )
+            .await
+            .context("bind initial TUI connection to named session")?,
+        );
+    }
+    let client_connector = session_binding::connector_with_named_session(
+        client_connector,
+        named_session_selector.clone(),
+        named_session_refresh,
+    );
 
     // Split client into reader/writer handle if connected.
     let (socket_reader, writer_handle, connected) = match client {
@@ -138,6 +187,8 @@ pub async fn run(options: RunOptions) -> Result<()> {
     // Build app state.
     let mut state = AppState::new();
     state.set_session_profile_name(session_profile_name);
+    state.set_named_session_selector(named_session_selector);
+    state.set_named_session_refresh(named_session_refresh);
     state.set_restart_handle(restart_handle);
     if let Err(error) = history::load_history().map(|items| state.input.replace_history(items)) {
         tracing::warn!(%error, "failed to load prompt history");

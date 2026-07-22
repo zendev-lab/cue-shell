@@ -1,6 +1,6 @@
 # cue-shell
 
-Durable process substrate with a TUI for managing long-lived jobs, scopes, and schedules.
+Durable process substrate with named sessions shared by humans and agents.
 
 > ⚠️ **Pre-1.0** — core JOB / CRON flows, `.cue` scripts, real `:fg` PTY
 > attach, client target resolution, and the official command set are implemented.
@@ -8,19 +8,20 @@ Durable process substrate with a TUI for managing long-lived jobs, scopes, and s
 
 ## Overview
 
-cue-shell (`cue`) is a terminal-native runtime for durable async processes. It is **not** a traditional shell — it's a structured environment where jobs, scopes, chains, and crons are first-class primitives.
+cue-shell (`cue`) is a terminal-native runtime for durable async processes. It is **not** a traditional shell — it's a structured environment where sessions, jobs, scopes, chains, and crons are first-class primitives.
 
 ### Key Features
 
 - **Three-layer architecture**: Process substrate (`cued` daemon) → Core model → Frontends (TUI/MCP/API)
+- **Named shared sessions**: humans and agents attach to one persistent job/scope context instead of maintaining separate terminal state
 - **Primary interaction modes**: JOB ⚡ · CRON ⏰ — switch with `Shift+Tab`
 - **`:` prefix commands**: Vim-style builtin access (`:run`, `:kill`, `:jobs`, `:cron`, ...)
 - **`.cue` file scripts**: `cue run <file.cue>` submits one `R<n>` script with fail-fast execution
-- **Foreground PTY attach**: `:fg J<n>` proxies a real terminal session with input, paste, and resize support
+- **Shared foreground PTY attach**: `:fg J<n>` claims the single controller lease; `:watch J<n>` observes the same terminal read-only
 - **Display tabs with clean semantics**: `:out J<n>` snapshots stdout, `:tail J<n>` follows live stdout, `:err J<n>` opens stderr
 - **Scope persistence**: Environment snapshots with delta storage and lifecycle management
 - **Chain syntax**: `->` serial · `~>` ignore-failure · `|||` parallel · `|?|` any-success; `&&` / `||` stay inside one job
-- **Daemon durability**: job history, cron definitions, and per-session cursor reconnects
+- **Daemon durability**: named sessions, job history, cron definitions, and safe scope cursors survive client disconnects and daemon restarts
 
 ## Architecture
 
@@ -29,7 +30,7 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 │  L3 Frontend: TUI / MCP / REST API      │
 ├─────────────────────────────────────────┤
 │  L2 Core model (cue-core)                │
-│  Job · Scope · Chain · Cron             │
+│  Session · Job · Scope · Chain · Cron   │
 ├─────────────────────────────────────────┤
 │  L1 Process substrate (cued daemon)     │
 │  Unix socket · SQLite · Process mgmt    │
@@ -40,8 +41,8 @@ cue-shell (`cue`) is a terminal-native runtime for durable async processes. It i
 
 ```
 crates/
-├── cue-core/   — Core types and logic: Job, Scope, Chain, Cron
-├── cue-client/ — Client connection stack and `cue-client` CLI for target/run commands
+├── cue-core/   — Core types and logic: Session, Job, Scope, Chain, Cron
+├── cue-client/ — Client connection stack and `cue-client` CLI for session/target/run commands
 ├── cue-daemon/ — Background daemon library plus `cue-daemon` / `cued` CLIs
 ├── cue-tui/    — Interactive TUI frontend plus `cue-tui` CLI
 ├── cue-cli/    — `cue` aggregator entrypoint for explicit namespaces and extensions
@@ -67,12 +68,17 @@ cargo build
 cued -f
 
 # Show the top-level aggregator help
-cargo run -p cue-cli --
+cargo run -p cue-cli --bin cue --
 
 # Start TUI (auto-connect / auto-reconnect)
 cargo run -p cue-tui --bin cue-tui
 # or through the aggregator
-cargo run -p cue-cli -- tui
+cargo run -p cue-cli --bin cue -- tui
+
+# Create, inspect, and share a durable named session
+cargo run -p cue-cli --bin cue -- session create dev
+cargo run -p cue-cli --bin cue -- session list
+cargo run -p cue-cli --bin cue -- tui --session dev
 
 # Restart the daemon directly
 cargo run -p cue-daemon --bin cue-daemon -- restart
@@ -111,6 +117,69 @@ cue-shell uses split config files in the platform config dir:
 - `client.toml` — client-side transport/profile selection used by `cue-client`, `cue-tui`, and `cue client ...`
 - `daemon.toml` — daemon-side runtime defaults used by `cue-daemon` / `cued`
 
+### Named sessions
+
+Named sessions are daemon-owned process workspaces. Creating one captures the
+current cwd/environment scope; another human or agent client can attach by name
+and sees the same owned jobs, crons, output events, and subsequent scope cursor.
+Closing a TUI or client does not delete the session or stop its jobs.
+
+```text
+cue session create dev
+cue session list
+cue tui --session dev
+CUE_SESSION=dev cue run examples/hello.cue
+```
+
+Finished sessions can be hidden from the everyday list without deleting their
+state:
+
+```text
+cue session archive old-dev
+cue session list --archived
+cue session list --all --json
+cue session restore old-dev
+```
+
+Archive is deliberately reversible: the session identity, scope cursor, job
+history, and retained terminal history remain intact. `cue session list` shows
+active sessions by default, and archived sessions cannot be attached until
+restored. The daemon refuses to archive a session that still has connected
+clients, non-terminal jobs, pending script/chain work, or an owned cron; detach
+clients and explicitly finish/cancel/remove those blockers first. There is no
+force-archive or deletion path. Archive-aware clients require the daemon's
+`session-archive` IPC capability and fail locally with an upgrade/restart hint
+before sending an unsupported request to an older daemon.
+
+Scopes containing credential-like environment values are deliberately not
+written to SQLite. After a daemon restart such a session reports
+`needs_refresh`; recover it explicitly from a trusted process environment with
+`cue tui --session dev --session-refresh` or
+`CUE_SESSION=dev cue run examples/hello.cue --session-refresh`. Ordinary
+reconnects never replace an already-ready shared scope.
+
+Foreground PTY jobs can be shared without sharing write access:
+
+```text
+:fg J1       # attach and claim the controller lease
+:watch J1    # attach as a read-only observer
+cue fg watch J1 --session dev  # persistent non-interactive observer
+```
+
+Every attachment receives the current terminal snapshot and subsequent live
+output. Exactly one attached client may send keys, paste, resize, or use
+`:send` against that PTY. In the fullscreen terminal view, `Ctrl+]` releases
+control (or claims it when free), `Ctrl+Z` detaches, and `Ctrl+Y` copies the
+visible terminal. Releasing control keeps the client attached as an observer;
+disconnecting releases its controller lease without stopping the job.
+
+`cue fg watch` keeps its daemon connection open until the PTY job exits. Its
+default stdout is the exact initial terminal snapshot followed by matching live
+PTY bytes, so it can be redirected without text conversion; lifecycle notices
+go to stderr. Add `--jsonl` for `snapshot`, `output`, `control_changed`, and
+`exited` records (binary fields are base64), or `--session-refresh` when a
+selected named session explicitly needs recovery after a daemon restart.
+
 ### `.cue` file script mode
 
 Scripts are `.cue` files executed through the client CLI, with a top-level shortcut retained by the aggregator:
@@ -136,7 +205,7 @@ and [`examples/`](examples/).
 
 ### Client transport and extension config
 
-`cue-client` and `cue-tui` default to a local Unix socket profile, so local users do not need any config for the current flow. The top-level `cue` command is an explicit aggregator: bare `cue` prints help, `cue client ...` forwards to `cue-client ...`, `cue tui ...` forwards to `cue-tui`, and `cue daemon ...` forwards to `cue-daemon`. Target/profile commands are intentionally namespaced under the client surface; use `cue-client target ...` or `cue client target ...` rather than `cue target ...`.
+`cue-client` and `cue-tui` default to a local Unix socket profile, so local users do not need any config for the current flow. The top-level `cue` command is an explicit aggregator: bare `cue` prints help, `cue session ...` forwards to `cue-client session ...`, `cue client ...` forwards to `cue-client ...`, `cue tui ...` forwards to `cue-tui`, and `cue daemon ...` forwards to `cue-daemon`. Target/profile commands are intentionally namespaced under the client surface; use `cue-client target ...` or `cue client target ...` rather than `cue target ...`.
 
 To make the split explicit:
 
@@ -313,9 +382,9 @@ fails immediately because file-script execution needs a live daemon.
 | Cargo workspace | ✅ Multi-crate workspace |
 | CI/CD | ✅ Tests, package smokes, PyPI/GitHub release path |
 | cue-core | ✅ Core types / IPC / parser in place |
-| cue-client | ✅ Transport profiles / target JSON / script runner |
-| cue-daemon | ✅ Durable jobs / crons / scopes / PTY attach |
-| cue-tui | ✅ Interactive job+cron frontend / reconnect view |
+| cue-client | ✅ Named sessions / transport profiles / target JSON / script runner |
+| cue-daemon | ✅ Durable sessions / jobs / crons / scopes / PTY attach |
+| cue-tui | ✅ Session attach / interactive job+cron frontend / reconnect view |
 | cue-cli | ✅ Aggregator / extension dispatch / package feature gates for first-party commands |
 
 ## License

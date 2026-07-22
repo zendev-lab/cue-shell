@@ -30,7 +30,13 @@ pub(super) enum BeginOutcome {
     /// An identical execution is already pending; its response will be fanned out.
     Wait,
     /// Return a cached response or a deterministic ledger rejection immediately.
-    Respond(ResponsePayload),
+    Respond(Box<ResponsePayload>),
+}
+
+impl BeginOutcome {
+    pub(super) fn respond(response: ResponsePayload) -> Self {
+        Self::Respond(Box::new(response))
+    }
 }
 
 #[derive(Debug)]
@@ -80,7 +86,7 @@ enum OperationState {
         waiters: Vec<OperationWaiter>,
     },
     Completed {
-        response: ResponsePayload,
+        response: Box<ResponsePayload>,
         completed_at: Instant,
         response_bytes: usize,
     },
@@ -147,7 +153,7 @@ impl OperationLedger {
         self.prune_expired(Instant::now());
 
         if let Some(message) = invalid_operation_id(operation_id) {
-            return BeginOutcome::Respond(ResponsePayload::err(
+            return BeginOutcome::respond(ResponsePayload::err(
                 error_code::INVALID_REQUEST,
                 message,
             ));
@@ -162,7 +168,7 @@ impl OperationLedger {
         if let Some(entry) = self.entries.get(&key)
             && entry.fingerprint != fingerprint
         {
-            return BeginOutcome::Respond(ResponsePayload::err(
+            return BeginOutcome::respond(ResponsePayload::err(
                 error_code::INVALID_REQUEST,
                 format!("operation_id {operation_id:?} was reused with a different payload"),
             ));
@@ -172,7 +178,7 @@ impl OperationLedger {
             return if existing == &key {
                 BeginOutcome::Wait
             } else {
-                BeginOutcome::Respond(ResponsePayload::err(
+                BeginOutcome::respond(ResponsePayload::err(
                     error_code::INVALID_REQUEST,
                     format!(
                         "request {} is already waiting on another operation",
@@ -186,7 +192,7 @@ impl OperationLedger {
             return match &mut entry.state {
                 OperationState::Pending { waiters } => {
                     if waiters.len() >= self.limits.max_waiters {
-                        BeginOutcome::Respond(ResponsePayload::err(
+                        BeginOutcome::respond(ResponsePayload::err(
                             error_code::INVALID_STATE,
                             format!(
                                 "operation_id {operation_id:?} has too many pending retry waiters"
@@ -201,7 +207,7 @@ impl OperationLedger {
                 OperationState::Completed { response, .. } => {
                     BeginOutcome::Respond(response.clone())
                 }
-                OperationState::Tombstone => BeginOutcome::Respond(ResponsePayload::err(
+                OperationState::Tombstone => BeginOutcome::respond(ResponsePayload::err(
                     error_code::INVALID_STATE,
                     format!(
                         "operation_id {operation_id:?} already completed, but its replay response expired"
@@ -211,7 +217,7 @@ impl OperationLedger {
         }
 
         if self.entries.len() >= self.limits.identity_capacity {
-            return BeginOutcome::Respond(ResponsePayload::err(
+            return BeginOutcome::respond(ResponsePayload::err(
                 error_code::INVALID_STATE,
                 "operation identity ledger is saturated; refusing a new side effect",
             ));
@@ -255,7 +261,7 @@ impl OperationLedger {
             return Some(CompletedOperation { waiters, response });
         }
         entry.state = OperationState::Completed {
-            response: response.clone(),
+            response: Box::new(response.clone()),
             completed_at: Instant::now(),
             response_bytes,
         };
@@ -381,6 +387,16 @@ mod tests {
         assert!(matches!(response, ResponsePayload::Ok(OkPayload::Ack {})));
     }
 
+    fn unwrap_error(outcome: BeginOutcome) -> (String, String) {
+        match outcome {
+            BeginOutcome::Respond(response) => match *response {
+                ResponsePayload::Err { code, message } => (code, message),
+                other => panic!("expected error response, got {other:?}"),
+            },
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
     #[test]
     fn pending_retries_join_and_completed_retries_replay() {
         let mut ledger = OperationLedger::default();
@@ -423,13 +439,10 @@ mod tests {
             BeginOutcome::Route
         ));
 
-        match ledger.begin(namespace, "same", fingerprint("second"), waiter(2, 1)) {
-            BeginOutcome::Respond(ResponsePayload::Err { code, message }) => {
-                assert_eq!(code, error_code::INVALID_REQUEST);
-                assert!(message.contains("different payload"));
-            }
-            other => panic!("expected conflict, got {other:?}"),
-        }
+        let (code, message) =
+            unwrap_error(ledger.begin(namespace, "same", fingerprint("second"), waiter(2, 1)));
+        assert_eq!(code, error_code::INVALID_REQUEST);
+        assert!(message.contains("different payload"));
     }
 
     #[test]
@@ -442,11 +455,9 @@ mod tests {
             BeginOutcome::Route
         ));
 
-        assert!(matches!(
-            ledger.begin(namespace, "same", fingerprint("second"), same_waiter),
-            BeginOutcome::Respond(ResponsePayload::Err { code, .. })
-                if code == error_code::INVALID_REQUEST
-        ));
+        let (code, _) =
+            unwrap_error(ledger.begin(namespace, "same", fingerprint("second"), same_waiter));
+        assert_eq!(code, error_code::INVALID_REQUEST);
     }
 
     #[test]
@@ -499,13 +510,10 @@ mod tests {
             BeginOutcome::Route
         ));
 
-        match ledger.begin(namespace, "second", fingerprint("second"), waiter(2, 1)) {
-            BeginOutcome::Respond(ResponsePayload::Err { code, message }) => {
-                assert_eq!(code, error_code::INVALID_STATE);
-                assert!(message.contains("identity ledger is saturated"));
-            }
-            other => panic!("expected bounded-capacity rejection, got {other:?}"),
-        }
+        let (code, message) =
+            unwrap_error(ledger.begin(namespace, "second", fingerprint("second"), waiter(2, 1)));
+        assert_eq!(code, error_code::INVALID_STATE);
+        assert!(message.contains("identity ledger is saturated"));
     }
 
     #[test]
@@ -513,11 +521,9 @@ mod tests {
         let mut ledger = OperationLedger::default();
         let namespace = OperationLedger::session_namespace("session-a");
         let oversized = "x".repeat(MAX_OPERATION_ID_BYTES + 1);
-        assert!(matches!(
-            ledger.begin(namespace, &oversized, fingerprint("payload"), waiter(1, 1)),
-            BeginOutcome::Respond(ResponsePayload::Err { code, .. })
-                if code == error_code::INVALID_REQUEST
-        ));
+        let (code, _) =
+            unwrap_error(ledger.begin(namespace, &oversized, fingerprint("payload"), waiter(1, 1)));
+        assert_eq!(code, error_code::INVALID_REQUEST);
     }
 
     #[test]
@@ -531,11 +537,9 @@ mod tests {
             ledger.begin(namespace, "busy", fingerprint("payload"), waiter(1, 1)),
             BeginOutcome::Route
         ));
-        assert!(matches!(
-            ledger.begin(namespace, "busy", fingerprint("payload"), waiter(2, 1)),
-            BeginOutcome::Respond(ResponsePayload::Err { code, .. })
-                if code == error_code::INVALID_STATE
-        ));
+        let (code, _) =
+            unwrap_error(ledger.begin(namespace, "busy", fingerprint("payload"), waiter(2, 1)));
+        assert_eq!(code, error_code::INVALID_STATE);
     }
 
     #[test]
@@ -555,11 +559,9 @@ mod tests {
             .complete(first, ResponsePayload::ack())
             .expect("complete first operation");
 
-        assert!(matches!(
-            ledger.begin(namespace, "first", fingerprint("first"), waiter(2, 1)),
-            BeginOutcome::Respond(ResponsePayload::Err { code, .. })
-                if code == error_code::INVALID_STATE
-        ));
+        let (code, _) =
+            unwrap_error(ledger.begin(namespace, "first", fingerprint("first"), waiter(2, 1)));
+        assert_eq!(code, error_code::INVALID_STATE);
         assert!(matches!(
             ledger.begin(namespace, "second", fingerprint("second"), waiter(2, 2)),
             BeginOutcome::Route
@@ -584,11 +586,9 @@ mod tests {
                 .expect("complete operation");
         }
 
-        assert!(matches!(
-            ledger.begin(namespace, "first", fingerprint("first"), waiter(2, 1)),
-            BeginOutcome::Respond(ResponsePayload::Err { code, .. })
-                if code == error_code::INVALID_STATE
-        ));
+        let (code, _) =
+            unwrap_error(ledger.begin(namespace, "first", fingerprint("first"), waiter(2, 1)));
+        assert_eq!(code, error_code::INVALID_STATE);
     }
 
     #[test]
@@ -609,15 +609,8 @@ mod tests {
             .expect("complete oversized response");
         assert_ack(&completed.response);
 
-        assert!(matches!(
-            ledger.begin(
-                namespace,
-                "large",
-                fingerprint("payload"),
-                waiter(2, 1)
-            ),
-            BeginOutcome::Respond(ResponsePayload::Err { code, .. })
-                if code == error_code::INVALID_STATE
-        ));
+        let (code, _) =
+            unwrap_error(ledger.begin(namespace, "large", fingerprint("payload"), waiter(2, 1)));
+        assert_eq!(code, error_code::INVALID_STATE);
     }
 }

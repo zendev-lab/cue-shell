@@ -168,6 +168,7 @@ mod tests {
     fn job_list_snapshot_formats_pending_reason() {
         let text = format_job_list_snapshot(&[JobInfo {
             id: "J1".into(),
+            session_id: None,
             status: JobStatus::Pending,
             pipeline: "train".into(),
             exit_code: None,

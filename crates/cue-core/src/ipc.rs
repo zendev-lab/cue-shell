@@ -25,12 +25,24 @@ pub const IPC_CAPABILITY_CANCEL_EXECUTION: &str = "cancel-execution";
 pub const IPC_CAPABILITY_OPERATION_IDEMPOTENCY: &str = "operation-idempotency";
 /// Typed daemon-lifetime snapshots for reconnect-safe file-script recovery.
 pub const IPC_CAPABILITY_SCRIPT_INFO_RECOVERY: &str = "script-info-recovery";
+/// Drain-first daemon restart with a fenced single successor.
+pub const IPC_CAPABILITY_GRACEFUL_RESTART: &str = "graceful-restart";
+/// Durable named process sessions that multiple human and agent clients can attach to.
+pub const IPC_CAPABILITY_NAMED_SESSIONS: &str = "named-sessions";
+/// Multiple foreground observers with an explicit single-controller lease.
+pub const IPC_CAPABILITY_FOREGROUND_OBSERVERS: &str = "foreground-observers";
+/// Safe, reversible archive/restore lifecycle for durable named sessions.
+pub const IPC_CAPABILITY_SESSION_ARCHIVE: &str = "session-archive";
 const IPC_CAPABILITIES: &[&str] = &[
     IPC_CAPABILITY_SESSION_HANDSHAKE_REQUIRED,
     IPC_CAPABILITY_SCRIPT_ITEM_CREATED,
     IPC_CAPABILITY_CANCEL_EXECUTION,
     IPC_CAPABILITY_OPERATION_IDEMPOTENCY,
     IPC_CAPABILITY_SCRIPT_INFO_RECOVERY,
+    IPC_CAPABILITY_GRACEFUL_RESTART,
+    IPC_CAPABILITY_NAMED_SESSIONS,
+    IPC_CAPABILITY_FOREGROUND_OBSERVERS,
+    IPC_CAPABILITY_SESSION_ARCHIVE,
 ];
 
 pub fn current_protocol_capabilities() -> Vec<String> {
@@ -95,6 +107,42 @@ pub enum RequestPayload {
         #[serde(default)]
         refresh: bool,
     },
+    /// Create a durable named session from the calling client's current scope
+    /// and attach that client to it.
+    CreateSession {
+        name: String,
+    },
+    /// List active durable named sessions known to this daemon.
+    /// Archived sessions are omitted; use `ListArchivedSessions` or
+    /// `ListAllSessions` when cleanup state must be inspected explicitly.
+    ListSessions {},
+    /// List only archived durable named sessions.
+    ListArchivedSessions {},
+    /// List active and archived durable named sessions.
+    ListAllSessions {},
+    /// Hide an idle durable named session from the default list without
+    /// deleting its identity, scope cursor, or terminal history.
+    ArchiveSession {
+        selector: String,
+    },
+    /// Make a previously archived durable named session attachable again.
+    RestoreSession {
+        selector: String,
+    },
+    /// Attach the calling client to an existing durable named session.
+    ///
+    /// `refresh` is required when a sensitive, process-local scope could not
+    /// survive a daemon restart. It deliberately replaces the named session's
+    /// missing cursor with the calling client's current scope.
+    AttachSession {
+        selector: String,
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// Inspect the current named session or an explicitly selected one.
+    SessionInfo {
+        selector: Option<String>,
+    },
     Subscribe {
         channels: Vec<String>,
     },
@@ -106,6 +154,14 @@ pub enum RequestPayload {
     FgAttach {
         id: String,
     },
+    /// Observe a PTY job without acquiring its input/controller lease.
+    FgWatch {
+        id: String,
+    },
+    /// Acquire the free controller lease for the currently observed PTY job.
+    FgClaimControl {},
+    /// Release the controller lease while remaining an observer.
+    FgReleaseControl {},
     FgDetach {},
     FgInput {
         #[serde(with = "serde_bytes_base64")]
@@ -169,6 +225,9 @@ pub enum RequestPayload {
 
     // System
     Ping {},
+    /// Stop new execution admission, let already accepted work finish, then
+    /// hand ownership to one successor daemon.
+    Restart {},
     Shutdown {},
 }
 
@@ -249,6 +308,8 @@ pub enum OkPayload {
         scopes: Vec<ScopeInfo>,
         page: PageInfo,
     },
+    SessionInfo(Box<SessionInfo>),
+    SessionList(Vec<SessionInfo>),
     ScriptInfo(ScriptInfo),
     Output {
         id: String,
@@ -285,8 +346,14 @@ pub enum OkPayload {
         spans: Vec<HighlightSpan>,
     },
 
-    FgAttached {
+    FgAttached(Box<ForegroundAttachmentInfo>),
+    FgRoleChanged {
         id: String,
+        /// Identifies the exact foreground attachment this transition belongs to.
+        #[serde(default)]
+        attachment_id: u64,
+        role: ForegroundRole,
+        control_available: bool,
     },
     Pong {
         /// Daemon `cued` build version reported by the running daemon.
@@ -295,11 +362,32 @@ pub enum OkPayload {
         /// Empty when talking to a daemon that predates instance IDs.
         #[serde(default)]
         instance_id: String,
+        /// Restart generation token. A planned successor must match the target
+        /// generation preallocated in the restart intent.
+        #[serde(default)]
+        generation_id: String,
+        /// True only after startup restoration, exact restart fencing, and
+        /// scheduler execution activation have all completed. Missing means
+        /// true for compatibility with daemons predating startup fencing.
+        #[serde(default = "default_pong_ready")]
+        ready: bool,
         /// IPC protocol version implemented by the daemon.
         protocol_version: u32,
         /// Feature flags implemented by the daemon for explicit client gating.
         capabilities: Vec<String>,
     },
+    RestartAccepted {
+        /// Stable across repeated restart requests handled by this generation.
+        restart_id: String,
+        /// The daemon generation that accepted and owns the drain.
+        daemon_instance_id: String,
+        /// Exact generation token the successor must advertise in Pong.
+        target_generation: String,
+    },
+}
+
+fn default_pong_ready() -> bool {
+    true
 }
 
 // ── Events (cued → Client, pushed) ──
@@ -374,11 +462,27 @@ pub enum EventPayload {
 
     // :fg (sent only to fg-attached client)
     FgOutput {
+        /// Empty only when decoded from daemons predating job-scoped foreground streams.
+        #[serde(default)]
+        id: String,
+        /// Zero only when decoded from daemons predating attachment epochs.
+        #[serde(default)]
+        attachment_id: u64,
         #[serde(with = "serde_bytes_base64")]
         data: Vec<u8>,
     },
+    FgControlChanged {
+        id: String,
+        /// Zero only when decoded from daemons predating attachment epochs.
+        #[serde(default)]
+        attachment_id: u64,
+        control_available: bool,
+    },
     FgExited {
         id: String,
+        /// Zero only when decoded from daemons predating attachment epochs.
+        #[serde(default)]
+        attachment_id: u64,
         reason: String,
     },
 
@@ -401,6 +505,36 @@ pub enum Stream {
 pub enum JobOpenHint {
     Stream,
     Fg,
+}
+
+/// A client's effective role in a shared foreground attachment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForegroundRole {
+    /// Owns the exclusive input and resize lease.
+    #[default]
+    Controller,
+    /// Receives output and exit events but cannot write or resize.
+    Observer,
+}
+
+/// Atomic foreground registration result: a byte snapshot followed by live events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForegroundAttachmentInfo {
+    pub id: String,
+    /// Monotonic, non-zero identifier for this exact job/client attachment.
+    #[serde(default)]
+    pub attachment_id: u64,
+    /// Defaults to the historical exclusive attachment role when decoding an
+    /// old `{ "FgAttached": { "id": ... } }` response.
+    #[serde(default)]
+    pub role: ForegroundRole,
+    #[serde(default)]
+    pub control_available: bool,
+    #[serde(default, with = "serde_bytes_base64")]
+    pub snapshot: Vec<u8>,
+    #[serde(default)]
+    pub snapshot_truncated: bool,
 }
 
 // ── Info structs (shared by Response and queries) ──
@@ -436,6 +570,9 @@ pub enum OutputEncoding {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub id: String,
+    /// Durable named-session owner. Legacy and anonymous-session jobs have no owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub status: JobStatus,
     pub pipeline: String,
     pub exit_code: Option<i32>,
@@ -452,6 +589,8 @@ pub struct JobInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronInfo {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub schedule: String,
     pub command: String,
     pub status: CronStatus,
@@ -463,6 +602,37 @@ pub struct ScopeInfo {
     pub parent: Option<String>,
     pub cwd: String,
     pub env_count: usize,
+}
+
+/// Whether a named session cursor can survive a daemon restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionScopeState {
+    /// The scope is available now and has a durable SQLite record.
+    ReadyDurable,
+    /// The scope is available to this daemon process but intentionally stays
+    /// in memory because it contains credential-like environment names.
+    ReadyVolatile,
+    /// The durable identity survived a restart, but its volatile scope did
+    /// not. An explicit refreshed attach is required before execution.
+    NeedsRefresh,
+}
+
+/// Public metadata for a durable named process session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub name: String,
+    pub scope_state: SessionScopeState,
+    pub scope_hash: Option<String>,
+    pub connected_clients: usize,
+    pub restart_safe: bool,
+    pub current: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// Present when the session is hidden from the default active-session list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -618,6 +788,7 @@ pub mod error_code {
     pub const BLOCKED: &str = "BLOCKED";
     pub const WARNED: &str = "WARNED";
     pub const INTERNAL: &str = "INTERNAL";
+    pub const DAEMON_DRAINING: &str = "DAEMON_DRAINING";
 }
 
 impl ResponsePayload {
@@ -798,6 +969,65 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn named_session_requests_and_info_roundtrip() {
+        let requests = [
+            RequestPayload::CreateSession {
+                name: "shared-dev".into(),
+            },
+            RequestPayload::ListSessions {},
+            RequestPayload::ListArchivedSessions {},
+            RequestPayload::ListAllSessions {},
+            RequestPayload::ArchiveSession {
+                selector: "shared-dev".into(),
+            },
+            RequestPayload::RestoreSession {
+                selector: "SS-1".into(),
+            },
+            RequestPayload::AttachSession {
+                selector: "shared-dev".into(),
+                refresh: true,
+            },
+            RequestPayload::SessionInfo { selector: None },
+        ];
+        for payload in requests {
+            let json = serde_json::to_string(&payload).expect("serialize session request");
+            serde_json::from_str::<RequestPayload>(&json).expect("deserialize session request");
+        }
+
+        let info = SessionInfo {
+            id: "SS-1".into(),
+            name: "shared-dev".into(),
+            scope_state: SessionScopeState::ReadyVolatile,
+            scope_hash: Some("abc".into()),
+            connected_clients: 2,
+            restart_safe: false,
+            current: true,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            archived_at_ms: Some(3),
+        };
+        let payload = OkPayload::SessionInfo(Box::new(info.clone()));
+        let decoded: OkPayload =
+            serde_json::from_str(&serde_json::to_string(&payload).expect("serialize session info"))
+                .expect("deserialize session info");
+        assert!(matches!(decoded, OkPayload::SessionInfo(actual) if actual.as_ref() == &info));
+        assert!(
+            current_protocol_capabilities()
+                .iter()
+                .any(|capability| capability == IPC_CAPABILITY_NAMED_SESSIONS)
+        );
+        assert!(
+            current_protocol_capabilities()
+                .iter()
+                .any(|capability| capability == IPC_CAPABILITY_SESSION_ARCHIVE)
+        );
+
+        let legacy_json = r#"{"id":"SS-1","name":"shared-dev","scope_state":"ready_durable","scope_hash":null,"connected_clients":0,"restart_safe":true,"current":false,"created_at_ms":1,"updated_at_ms":2}"#;
+        let legacy: SessionInfo = serde_json::from_str(legacy_json).expect("legacy session info");
+        assert_eq!(legacy.archived_at_ms, None);
     }
 
     #[test]
@@ -1050,11 +1280,167 @@ mod tests {
     fn binary_payloads_serialize_as_base64_strings() {
         let msg = Message::Event {
             payload: EventPayload::FgOutput {
+                id: "J7".into(),
+                attachment_id: 11,
                 data: vec![0, 1, 2, 0xfe, 0xff],
             },
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"AAEC/v8=\""));
+    }
+
+    #[test]
+    fn foreground_attachment_decodes_legacy_exclusive_response() {
+        let json = r#"{"Ok":{"FgAttached":{"id":"J7"}}}"#;
+        let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
+
+        match decoded {
+            ResponsePayload::Ok(OkPayload::FgAttached(info)) => {
+                assert_eq!(info.id, "J7");
+                assert_eq!(info.attachment_id, 0);
+                assert_eq!(info.role, ForegroundRole::Controller);
+                assert!(!info.control_available);
+                assert!(info.snapshot.is_empty());
+                assert!(!info.snapshot_truncated);
+            }
+            _ => panic!("wrong foreground response"),
+        }
+    }
+
+    #[test]
+    fn foreground_attachment_snapshot_serializes_as_base64() {
+        let payload =
+            ResponsePayload::Ok(OkPayload::FgAttached(Box::new(ForegroundAttachmentInfo {
+                id: "J7".into(),
+                attachment_id: 23,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: vec![0, 1, 2, 0xfe, 0xff],
+                snapshot_truncated: true,
+            })));
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("\"AAEC/v8=\""));
+        let decoded: ResponsePayload = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            ResponsePayload::Ok(OkPayload::FgAttached(info))
+                if info.attachment_id == 23
+                    && info.role == ForegroundRole::Observer
+                    && info.control_available
+                    && info.snapshot == vec![0, 1, 2, 0xfe, 0xff]
+                    && info.snapshot_truncated
+        ));
+    }
+
+    #[test]
+    fn foreground_output_decodes_legacy_event_without_job_id() {
+        let json = r#"{"type":"event","payload":{"FgOutput":{"data":"QUJD"}}}"#;
+        let decoded: Message = serde_json::from_str(json).unwrap();
+
+        assert!(matches!(
+            decoded,
+            Message::Event {
+                payload: EventPayload::FgOutput {
+                    id,
+                    attachment_id,
+                    data,
+                }
+            } if id.is_empty() && attachment_id == 0 && data == b"ABC"
+        ));
+    }
+
+    #[test]
+    fn shared_foreground_requests_and_control_event_roundtrip() {
+        for payload in [
+            RequestPayload::FgWatch { id: "J7".into() },
+            RequestPayload::FgClaimControl {},
+            RequestPayload::FgReleaseControl {},
+        ] {
+            let json = serde_json::to_string(&payload).unwrap();
+            serde_json::from_str::<RequestPayload>(&json).unwrap();
+        }
+
+        let message = Message::Event {
+            payload: EventPayload::FgControlChanged {
+                id: "J7".into(),
+                attachment_id: 29,
+                control_available: true,
+            },
+        };
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Message>(&json).unwrap(),
+            Message::Event {
+                payload: EventPayload::FgControlChanged {
+                    id,
+                    attachment_id: 29,
+                    control_available: true,
+                },
+            } if id == "J7"
+        ));
+
+        let role_response = ResponsePayload::Ok(OkPayload::FgRoleChanged {
+            id: "J7".into(),
+            attachment_id: 29,
+            role: ForegroundRole::Controller,
+            control_available: false,
+        });
+        let json = serde_json::to_string(&role_response).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ResponsePayload>(&json).unwrap(),
+            ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                id,
+                attachment_id: 29,
+                role: ForegroundRole::Controller,
+                control_available: false,
+            }) if id == "J7"
+        ));
+        assert!(
+            current_protocol_capabilities()
+                .iter()
+                .any(|capability| capability == IPC_CAPABILITY_FOREGROUND_OBSERVERS)
+        );
+    }
+
+    #[test]
+    fn foreground_epoch_defaults_for_legacy_role_and_lifecycle_payloads() {
+        let role_json =
+            r#"{"Ok":{"FgRoleChanged":{"id":"J7","role":"observer","control_available":true}}}"#;
+        assert!(matches!(
+            serde_json::from_str::<ResponsePayload>(role_json).unwrap(),
+            ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                id,
+                attachment_id: 0,
+                role: ForegroundRole::Observer,
+                control_available: true,
+            }) if id == "J7"
+        ));
+
+        let control_json = r#"{"type":"event","payload":{"FgControlChanged":{"id":"J7","control_available":true}}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Message>(control_json).unwrap(),
+            Message::Event {
+                payload: EventPayload::FgControlChanged {
+                    id,
+                    attachment_id: 0,
+                    control_available: true,
+                },
+            } if id == "J7"
+        ));
+
+        let exit_json =
+            r#"{"type":"event","payload":{"FgExited":{"id":"J7","reason":"detached"}}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Message>(exit_json).unwrap(),
+            Message::Event {
+                payload: EventPayload::FgExited {
+                    id,
+                    attachment_id: 0,
+                    reason,
+                },
+            } if id == "J7" && reason == "detached"
+        ));
     }
 
     #[test]
@@ -1131,12 +1517,16 @@ mod tests {
                     ResponsePayload::Ok(OkPayload::Pong {
                         version,
                         instance_id,
+                        generation_id,
+                        ready,
                         protocol_version,
                         capabilities,
                     }),
             } => {
                 assert_eq!(version, "0.1.0");
                 assert_eq!(instance_id, "");
+                assert_eq!(generation_id, "");
+                assert!(ready);
                 assert_eq!(protocol_version, IPC_PROTOCOL_VERSION);
                 assert_eq!(
                     capabilities,
@@ -1149,17 +1539,21 @@ mod tests {
 
     #[test]
     fn pong_decodes_versioned_payload() {
-        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery"]}}}"#;
+        let json = r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#;
         let decoded: ResponsePayload = serde_json::from_str(json).unwrap();
         match decoded {
             ResponsePayload::Ok(OkPayload::Pong {
                 version,
                 instance_id,
+                generation_id,
+                ready,
                 protocol_version,
                 capabilities,
             }) => {
                 assert_eq!(version, "0.1.0");
                 assert_eq!(instance_id, "00000000-0000-4000-8000-000000000000");
+                assert_eq!(generation_id, "generation-1");
+                assert!(ready);
                 assert_eq!(protocol_version, IPC_PROTOCOL_VERSION);
                 assert_eq!(capabilities, current_protocol_capabilities());
             }
@@ -1172,13 +1566,15 @@ mod tests {
         let payload = ResponsePayload::Ok(OkPayload::Pong {
             version: "0.1.0".into(),
             instance_id: "00000000-0000-4000-8000-000000000000".into(),
+            generation_id: "generation-1".into(),
+            ready: true,
             protocol_version: IPC_PROTOCOL_VERSION,
             capabilities: current_protocol_capabilities(),
         });
         let json = serde_json::to_string(&payload).unwrap();
         assert_eq!(
             json,
-            r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery"]}}}"#
+            r#"{"Ok":{"Pong":{"version":"0.1.0","instance_id":"00000000-0000-4000-8000-000000000000","generation_id":"generation-1","ready":true,"protocol_version":2,"capabilities":["session-handshake-required","script-item-created","cancel-execution","operation-idempotency","script-info-recovery","graceful-restart","named-sessions","foreground-observers","session-archive"]}}}"#
         );
     }
 

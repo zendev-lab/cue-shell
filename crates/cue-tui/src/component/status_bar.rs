@@ -27,6 +27,8 @@ pub(crate) enum StatusBarMsg {
     ClearEnabled(bool),
     /// Update current overview counts.
     Overview(OverviewCounts),
+    /// Update the durable named session bound to this TUI.
+    NamedSession(Option<String>),
 }
 
 // ── StatusBar ──
@@ -42,6 +44,8 @@ pub(crate) struct StatusBar {
     pub(crate) clear_enabled: bool,
     /// Aggregate counts shown in the session header.
     pub(crate) overview: OverviewCounts,
+    /// Durable named-session selector shown as the workspace identity.
+    pub(crate) named_session: Option<String>,
 }
 
 impl StatusBar {
@@ -52,6 +56,7 @@ impl StatusBar {
             mode: Mode::default(),
             clear_enabled: true,
             overview: OverviewCounts::default(),
+            named_session: None,
         }
     }
 
@@ -112,10 +117,29 @@ impl StatusBar {
         chars.min(u16::MAX as usize) as u16
     }
 
+    fn rendered_action_width(&self, area_width: u16) -> u16 {
+        let action_width = self.action_text_width();
+        let Some(selector) = self.named_session.as_deref() else {
+            return action_width.min(area_width);
+        };
+
+        // A named session is the identity of this workspace. At narrow widths,
+        // keep that identity visible and drop the optional mouse action labels
+        // as a group instead of letting them consume the whole header.
+        let identity_width = 6usize
+            .saturating_add(compact_session_badge(selector).chars().count())
+            .min(u16::MAX as usize) as u16;
+        if area_width.saturating_sub(identity_width) >= action_width {
+            action_width
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn action_at(&self, area: Rect, column: u16) -> Option<AppMsg> {
         let actions = self.action_labels();
-        let width = self.action_text_width();
-        if width == 0 || area.width < width {
+        let width = self.rendered_action_width(area.width);
+        if width == 0 {
             return None;
         }
         let start = area.x + area.width - width;
@@ -154,6 +178,7 @@ impl Component for StatusBar {
             StatusBarMsg::Mode(mode) => self.mode = mode,
             StatusBarMsg::ClearEnabled(enabled) => self.clear_enabled = enabled,
             StatusBarMsg::Overview(overview) => self.overview = overview,
+            StatusBarMsg::NamedSession(selector) => self.named_session = selector,
         }
     }
 
@@ -188,11 +213,18 @@ impl Component for StatusBar {
             "J:{} {}  C:{}",
             self.overview.jobs, running, self.overview.crons
         );
-        let left = Line::from(vec![
-            Span::styled(
-                format!(" {} ", self.mode_label()),
-                Style::default().fg(Color::Black).bg(Color::Cyan),
-            ),
+        let mut left_spans = vec![Span::styled(
+            format!(" {} ", self.mode_label()),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        )];
+        if let Some(selector) = self.named_session.as_deref() {
+            left_spans.push(Span::raw(" "));
+            left_spans.push(Span::styled(
+                compact_session_badge(selector),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        left_spans.extend([
             Span::raw(" "),
             Span::styled(counts, Style::default().fg(Color::White)),
             Span::raw("  "),
@@ -205,8 +237,9 @@ impl Component for StatusBar {
             Span::raw("  "),
             Span::styled(now, Style::default().fg(Color::DarkGray)),
         ]);
+        let left = Line::from(left_spans);
 
-        let action_width = self.action_text_width();
+        let action_width = self.rendered_action_width(area.width);
         let sections = Layout::horizontal([
             Constraint::Min(0),
             Constraint::Length(action_width.min(area.width)),
@@ -236,5 +269,62 @@ impl Component for StatusBar {
 
     fn handle_mouse(&mut self, _mouse: MouseEvent) -> Option<AppMsg> {
         None
+    }
+}
+
+pub(crate) fn compact_session_badge(selector: &str) -> String {
+    const MAX_SELECTOR_CHARS: usize = 20;
+
+    let mut chars = selector.chars();
+    let prefix: String = chars.by_ref().take(MAX_SELECTOR_CHARS).collect();
+    if chars.next().is_some() {
+        format!("session:{prefix}…")
+    } else {
+        format!("session:{prefix}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    use super::*;
+
+    fn rendered_header(status_bar: &StatusBar, width: u16) -> String {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| status_bar.render(frame, Rect::new(0, 0, width, 1)))
+            .expect("draw status bar");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn named_session_identity_remains_visible_in_a_narrow_header() {
+        let mut status_bar = StatusBar::new();
+        status_bar.update(StatusBarMsg::NamedSession(Some("shared".into())));
+
+        let rendered = rendered_header(&status_bar, 32);
+
+        assert!(rendered.contains("session:shared"), "{rendered:?}");
+        assert!(
+            !rendered.contains("[clear]"),
+            "optional action labels should yield to the workspace identity: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn long_named_session_identity_is_compact() {
+        assert_eq!(
+            compact_session_badge("abcdefghijklmnopqrstuv"),
+            "session:abcdefghijklmnopqrst…"
+        );
     }
 }

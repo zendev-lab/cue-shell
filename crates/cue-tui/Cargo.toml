@@ -6,6 +6,11 @@ rust-version.workspace = true
 description = "TUI frontend for cue-shell: mode switching, command input, job display"
 repository.workspace = true
 license.workspace = true
+autobins = false
+
+[[bin]]
+name = "cue-tui"
+path = "src/main.rs"
 
 [dependencies]
 ansi-to-tui.workspace = true

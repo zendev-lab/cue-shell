@@ -6,6 +6,15 @@ rust-version.workspace = true
 description = "Background daemon for cue-shell: Unix socket server, job orchestration"
 repository.workspace = true
 license.workspace = true
+autobins = false
+
+[[bin]]
+name = "cued"
+path = "src/main.rs"
+
+[[bin]]
+name = "cue-daemon"
+path = "src/bin/cue-daemon.rs"
 
 [dependencies]
 anyhow.workspace = true

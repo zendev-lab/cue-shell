@@ -64,6 +64,16 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
             program: "cue-client".into(),
             args: args.collect(),
         }),
+        Some("session") => Ok(CueCommand::Forward {
+            program: "cue-client".into(),
+            args: std::iter::once(OsString::from("session"))
+                .chain(args)
+                .collect(),
+        }),
+        Some("fg") => Ok(CueCommand::Forward {
+            program: "cue-client".into(),
+            args: std::iter::once(OsString::from("fg")).chain(args).collect(),
+        }),
         Some("tui") => Ok(CueCommand::Forward {
             program: "cue-tui".into(),
             args: args.collect(),
@@ -73,19 +83,38 @@ fn parse_command(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cue
             args: args.collect(),
         }),
         Some("run") => {
-            let Some(path) = args.next() else {
+            let run_args = args.collect::<Vec<_>>();
+            let mut path = None;
+            let mut session_refresh_seen = false;
+            for arg in &run_args {
+                match arg.to_str() {
+                    Some("--session-refresh") if !session_refresh_seen => {
+                        session_refresh_seen = true;
+                    }
+                    Some("--session-refresh") => {
+                        bail!("`--session-refresh` may only be specified once");
+                    }
+                    Some(value) if value.starts_with('-') => {
+                        bail!("unknown `cue run` option `{value}`");
+                    }
+                    _ if path.replace(arg).is_some() => {
+                        bail!("`cue run` accepts exactly one .cue file path");
+                    }
+                    _ => {}
+                }
+            }
+            let Some(path) = path else {
                 bail!("`cue run` expects a .cue file path");
             };
-            if args.next().is_some() {
-                bail!("`cue run` accepts exactly one .cue file path");
-            }
             let path = PathBuf::from(path);
             if path.extension().and_then(|ext| ext.to_str()) != Some("cue") {
                 bail!("`cue run` only accepts files with the .cue extension");
             }
+            let mut forwarded = vec![OsString::from("run")];
+            forwarded.extend(run_args);
             Ok(CueCommand::Forward {
                 program: "cue-client".into(),
-                args: vec![OsString::from("run"), path.into_os_string()],
+                args: forwarded,
             })
         }
         Some("target") => {
@@ -184,13 +213,13 @@ fn print_help() {
 
 fn help_text() -> String {
     format!(
-        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue>\n  cue --help\n  cue --version\n  cue <extension> [args...]\n\nNamespaces:\n  client      Client-side commands: target profiles, run, IPC utilities\n  tui         Interactive terminal UI\n  daemon      Daemon lifecycle and gateway commands\n  <extension>  Run a configured external command, or cue-<extension> when enabled\n\nShortcuts:\n  run         Alias for `cue client run`\n\nExamples:\n  cue client target list\n  cue client target resolve --json\n  cue client run script.cue\n  cue tui\n  cue daemon status\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version information",
+        "cue {}\n\nUsage:\n  cue <namespace> [args...]\n  cue run <file.cue> [--session-refresh]\n  cue fg watch <Jid> [--session <name-or-id>] [--session-refresh] [--jsonl]\n  cue --help\n  cue --version\n  cue <extension> [args...]\n\nNamespaces:\n  client      Client-side commands: target profiles, run, IPC utilities\n  session     Named persistent session management\n  tui         Interactive terminal UI\n  daemon      Daemon lifecycle and gateway commands\n  <extension>  Run a configured external command, or cue-<extension> when enabled\n\nShortcuts:\n  run         Alias for `cue client run`\n  fg          Alias for `cue client fg`\n  session     Alias for `cue client session`\n\nExamples:\n  cue session create dev\n  cue session list\n  cue session archive old-dev\n  cue session list --archived\n  cue fg watch J1 --session dev\n  cue client target resolve --json\n  cue run script.cue\n  cue tui --session dev\n  cue daemon status\n\nOptions:\n  --session-refresh  Explicitly recover a selected named session for `cue run` or `cue fg watch`\n  -h, --help          Print help\n  -V, --version       Print version information",
         env!("CARGO_PKG_VERSION"),
     )
 }
 
 fn supported_subcommands() -> &'static str {
-    "client, tui, daemon, run, help, version, <extension>"
+    "client, session, fg, tui, daemon, run, help, version, <extension>"
 }
 
 #[cfg(test)]
@@ -280,6 +309,72 @@ mod tests {
                 args: vec![OsString::from("run"), OsString::from("build.cue")],
             }
         );
+
+        assert_eq!(
+            parse_command([
+                OsString::from("cue"),
+                OsString::from("run"),
+                OsString::from("build.cue"),
+                OsString::from("--session-refresh"),
+            ])
+            .expect("parse named-session recovery option"),
+            CueCommand::Forward {
+                program: "cue-client".into(),
+                args: vec![
+                    OsString::from("run"),
+                    OsString::from("build.cue"),
+                    OsString::from("--session-refresh"),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_command_accepts_session_shortcut() {
+        assert_eq!(
+            parse_command([
+                OsString::from("cue"),
+                OsString::from("session"),
+                OsString::from("attach"),
+                OsString::from("dev"),
+            ])
+            .expect("parse command"),
+            CueCommand::Forward {
+                program: "cue-client".into(),
+                args: vec![
+                    OsString::from("session"),
+                    OsString::from("attach"),
+                    OsString::from("dev"),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_command_accepts_foreground_watch_shortcut() {
+        assert_eq!(
+            parse_command([
+                OsString::from("cue"),
+                OsString::from("fg"),
+                OsString::from("watch"),
+                OsString::from("J3"),
+                OsString::from("--session"),
+                OsString::from("dev"),
+                OsString::from("--jsonl"),
+            ])
+            .expect("parse foreground shortcut"),
+            CueCommand::Forward {
+                program: "cue-client".into(),
+                args: vec![
+                    OsString::from("fg"),
+                    OsString::from("watch"),
+                    OsString::from("J3"),
+                    OsString::from("--session"),
+                    OsString::from("dev"),
+                    OsString::from("--jsonl"),
+                ],
+            }
+        );
     }
 
     #[test]
@@ -340,10 +435,12 @@ mod tests {
         assert!(text.contains("cue <namespace> [args...]"));
         assert!(text.contains("cue <extension> [args...]"));
         assert!(text.contains("client"));
+        assert!(text.contains("session"));
         assert!(text.contains("tui"));
         assert!(text.contains("daemon"));
         assert!(text.contains("<extension>  Run a configured external command"));
         assert!(text.contains("Alias for `cue client run`"));
+        assert!(text.contains("Alias for `cue client session`"));
         assert!(text.contains("cue client target resolve --json"));
     }
 }

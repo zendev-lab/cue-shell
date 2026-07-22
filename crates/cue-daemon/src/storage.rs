@@ -39,7 +39,7 @@ where
 // ── Schema migration ──
 
 /// Current schema version (bump when adding migrations).
-const SCHEMA_VERSION: u32 = 15;
+const SCHEMA_VERSION: u32 = 18;
 
 const MIGRATION_V1: &str = r"
 CREATE TABLE IF NOT EXISTS scopes (
@@ -130,6 +130,18 @@ ALTER TABLE crons ADD COLUMN scope_enabled INTEGER NOT NULL DEFAULT 0;
 
 const MIGRATION_V12: &str = r"
 ALTER TABLE crons ADD COLUMN wrapper_enabled INTEGER NOT NULL DEFAULT 0;
+";
+
+const MIGRATION_V16: &str = r"
+CREATE TABLE IF NOT EXISTS sessions (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL UNIQUE,
+    scope_hash          BLOB REFERENCES scopes(hash),
+    pty_default         INTEGER,
+    wrapper_enabled     INTEGER,
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
+);
 ";
 
 const CRON_CREATED_AT_MS_EXPR: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
@@ -287,6 +299,35 @@ fn migrate(conn: &Connection) -> Result<()> {
             );
         }
         set_schema_version(conn, &mut current, 15)?;
+    }
+    if current < 16 {
+        conn.execute_batch(MIGRATION_V16)
+            .context("failed to run schema migration v16")?;
+        set_schema_version(conn, &mut current, 16)?;
+    }
+    if current < 17 {
+        if !column_exists(conn, "jobs_history", "session_id")? {
+            conn.execute_batch(
+                "ALTER TABLE jobs_history
+                 ADD COLUMN session_id TEXT REFERENCES sessions(id);",
+            )
+            .context("failed to add jobs_history.session_id")?;
+        }
+        if !column_exists(conn, "crons", "session_id")? {
+            conn.execute_batch(
+                "ALTER TABLE crons
+                 ADD COLUMN session_id TEXT REFERENCES sessions(id);",
+            )
+            .context("failed to add crons.session_id")?;
+        }
+        set_schema_version(conn, &mut current, 17)?;
+    }
+    if current < 18 {
+        if !column_exists(conn, "sessions", "archived_at_ms")? {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN archived_at_ms INTEGER;")
+                .context("failed to add sessions.archived_at_ms")?;
+        }
+        set_schema_version(conn, &mut current, 18)?;
     }
     Ok(())
 }
@@ -623,8 +664,9 @@ fn durable_scope_reference(conn: &Connection, scope: Option<ScopeHash>) -> Resul
 /// Delete every persisted scope outside the scheduler-supplied reachable set.
 ///
 /// The caller must already have expanded roots to their complete ancestor
-/// closure. Durable job and cron references are checked inside the transaction;
-/// a missing root therefore fails the sweep instead of creating dangling data.
+/// closure. Durable job, cron, and named-session references are checked inside
+/// the transaction; a missing root therefore fails the sweep instead of
+/// creating dangling data.
 pub fn sweep_scopes(conn: &Connection, reachable: &HashSet<ScopeHash>) -> Result<usize> {
     let tx = conn
         .unchecked_transaction()
@@ -663,6 +705,9 @@ pub fn sweep_scopes(conn: &Connection, reachable: &HashSet<ScopeHash>) -> Result
                    OR scopes.hash IN (
                        SELECT scope_hash FROM crons WHERE scope_hash IS NOT NULL
                    )
+                   OR scopes.hash IN (
+                       SELECT scope_hash FROM sessions WHERE scope_hash IS NOT NULL
+                   )
                )
              LIMIT 1",
             [],
@@ -671,7 +716,7 @@ pub fn sweep_scopes(conn: &Connection, reachable: &HashSet<ScopeHash>) -> Result
         .optional()?;
     if let Some(hash) = unmarked_reference {
         return Err(anyhow!(
-            "refusing scope sweep: persisted job or cron still references unmarked scope {hash}"
+            "refusing scope sweep: persisted job, cron, or session still references unmarked scope {hash}"
         ));
     }
 
@@ -772,8 +817,24 @@ fn scope_from_row_parts(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSession {
+    pub id: String,
+    pub name: String,
+    /// Durable scope cursor. Volatile scopes are represented as `None` on disk.
+    pub scope_hash: Option<ScopeHash>,
+    /// `None` inherits the daemon default.
+    pub pty_default: Option<bool>,
+    /// `None` inherits the daemon default.
+    pub wrapper_enabled: Option<bool>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub archived_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredJob {
     pub id: String,
+    pub session_id: Option<String>,
     pub pipeline: String,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
@@ -787,6 +848,7 @@ pub struct StoredJob {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredCron {
     pub id: String,
+    pub session_id: Option<String>,
     pub schedule: String,
     pub command: String,
     pub status: CronStatus,
@@ -849,6 +911,116 @@ pub struct StoredScriptItem {
     pub job_ids: Vec<String>,
 }
 
+/// Insert or update a durable named-session record.
+///
+/// The returned boolean reports whether the requested scope hash was stored as
+/// a durable reference. Missing and process-local volatile scopes are both
+/// persisted as `NULL`, preserving the named identity without persisting its
+/// environment.
+pub fn upsert_session(conn: &Connection, session: &StoredSession) -> Result<bool> {
+    let scope_hash = durable_scope_reference(conn, session.scope_hash)?;
+    let stored_scope = scope_hash.is_some();
+    let pty_default = session.pty_default.map(i64::from);
+    let wrapper_enabled = session.wrapper_enabled.map(i64::from);
+
+    conn.execute(
+        "INSERT INTO sessions (
+             id, name, scope_hash, pty_default, wrapper_enabled, created_at_ms, updated_at_ms,
+             archived_at_ms
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(id) DO UPDATE SET
+              name = excluded.name,
+              scope_hash = excluded.scope_hash,
+              pty_default = excluded.pty_default,
+              wrapper_enabled = excluded.wrapper_enabled,
+              updated_at_ms = excluded.updated_at_ms,
+              archived_at_ms = excluded.archived_at_ms",
+        rusqlite::params![
+            session.id,
+            session.name,
+            scope_hash,
+            pty_default,
+            wrapper_enabled,
+            session.created_at_ms,
+            session.updated_at_ms,
+            session.archived_at_ms,
+        ],
+    )?;
+    Ok(stored_scope)
+}
+
+/// Atomically update only the reversible lifecycle state of a durable session.
+///
+/// The scheduler applies the in-memory change only after this statement
+/// succeeds, so a storage failure cannot make memory disagree with SQLite.
+pub fn set_session_archived_at(
+    conn: &Connection,
+    id: &str,
+    archived_at_ms: Option<i64>,
+    updated_at_ms: i64,
+) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE sessions
+         SET archived_at_ms = ?2, updated_at_ms = ?3
+         WHERE id = ?1",
+        rusqlite::params![id, archived_at_ms, updated_at_ms],
+    )?;
+    if changed != 1 {
+        return Err(anyhow!("named session {id} is missing from storage"));
+    }
+    Ok(())
+}
+
+pub fn load_sessions(conn: &Connection) -> Result<Vec<StoredSession>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, scope_hash, pty_default, wrapper_enabled,
+                created_at_ms, updated_at_ms, archived_at_ms
+         FROM sessions
+         ORDER BY created_at_ms, id",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<bool>>(3)?,
+            row.get::<_, Option<bool>>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, Option<i64>>(7)?,
+        ))
+    })?;
+
+    let mut sessions = Vec::new();
+    for row in rows {
+        let (
+            id,
+            name,
+            scope_hash_blob,
+            pty_default,
+            wrapper_enabled,
+            created_at_ms,
+            updated_at_ms,
+            archived_at_ms,
+        ) = row?;
+        sessions.push(StoredSession {
+            id,
+            name,
+            scope_hash: scope_hash_blob
+                .as_deref()
+                .map(blob_to_scope_hash)
+                .transpose()?,
+            pty_default,
+            wrapper_enabled,
+            created_at_ms,
+            updated_at_ms,
+            archived_at_ms,
+        });
+    }
+    Ok(sessions)
+}
+
 pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
     let status_json = serde_json::to_string(&job.status).context("serialize job status")?;
     let start_scope = durable_scope_reference(conn, job.start_scope)?;
@@ -857,12 +1029,13 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
 
     conn.execute(
         "INSERT INTO jobs_history (
-             id, pipeline, status, exit_code, scope_hash, start_scope, end_scope, chain_id, stderr, finished_at
+             id, session_id, pipeline, status, exit_code, scope_hash, start_scope, end_scope, chain_id, stderr, finished_at
          )
          VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CASE WHEN ?10 THEN datetime('now') ELSE NULL END
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?11 THEN datetime('now') ELSE NULL END
          )
          ON CONFLICT(id) DO UPDATE SET
+              session_id = excluded.session_id,
               pipeline = excluded.pipeline,
               status = excluded.status,
               exit_code = excluded.exit_code,
@@ -871,9 +1044,10 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
               end_scope = excluded.end_scope,
               chain_id = excluded.chain_id,
               stderr = excluded.stderr,
-              finished_at = CASE WHEN ?10 THEN datetime('now') ELSE jobs_history.finished_at END",
+              finished_at = CASE WHEN ?11 THEN datetime('now') ELSE jobs_history.finished_at END",
         rusqlite::params![
             job.id,
+            job.session_id,
             job.pipeline,
             status_json,
             job.exit_code,
@@ -890,22 +1064,24 @@ pub fn upsert_job_history(conn: &Connection, job: &StoredJob) -> Result<()> {
 
 pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
     let mut stmt = conn.prepare(
-        "SELECT id, pipeline, status, exit_code, start_scope, end_scope,
+        "SELECT id, session_id, pipeline, status, exit_code, start_scope, end_scope,
                 COALESCE(chain_id, NULL) AS chain_id,
                 COALESCE(stderr, '') AS stderr
          FROM jobs_history",
     )?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
-        let pipeline: String = row.get(1)?;
-        let status_text: String = row.get(2)?;
-        let exit_code: Option<i32> = row.get(3)?;
-        let start_scope_blob: Option<Vec<u8>> = row.get(4)?;
-        let end_scope_blob: Option<Vec<u8>> = row.get(5)?;
-        let chain_id: Option<String> = row.get(6)?;
-        let stderr: String = row.get(7)?;
+        let session_id: Option<String> = row.get(1)?;
+        let pipeline: String = row.get(2)?;
+        let status_text: String = row.get(3)?;
+        let exit_code: Option<i32> = row.get(4)?;
+        let start_scope_blob: Option<Vec<u8>> = row.get(5)?;
+        let end_scope_blob: Option<Vec<u8>> = row.get(6)?;
+        let chain_id: Option<String> = row.get(7)?;
+        let stderr: String = row.get(8)?;
         Ok((
             id,
+            session_id,
             pipeline,
             status_text,
             exit_code,
@@ -920,6 +1096,7 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
     for row in rows {
         let (
             id,
+            session_id,
             pipeline,
             status_text,
             exit_code,
@@ -933,6 +1110,7 @@ pub fn load_job_history(conn: &Connection) -> Result<Vec<StoredJob>> {
             n,
             StoredJob {
                 id,
+                session_id,
                 pipeline,
                 status: parse_job_status(&status_text)?,
                 exit_code,
@@ -980,9 +1158,10 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
     let wrapper_enabled = i64::from(cron.wrapper_enabled);
     conn.execute(
         &format!(
-            "INSERT INTO crons (id, schedule, command, enabled, scope_hash, status, cwd_override, scope_enabled, wrapper_enabled, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, {CRON_CREATED_AT_MS_EXPR})
+            "INSERT INTO crons (id, session_id, schedule, command, enabled, scope_hash, status, cwd_override, scope_enabled, wrapper_enabled, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, {CRON_CREATED_AT_MS_EXPR})
          ON CONFLICT(id) DO UPDATE SET
+              session_id = excluded.session_id,
               schedule = excluded.schedule,
               command = excluded.command,
               enabled = excluded.enabled,
@@ -994,6 +1173,7 @@ pub fn upsert_cron(conn: &Connection, cron: &StoredCron) -> Result<()> {
         ),
         rusqlite::params![
             cron.id,
+            cron.session_id,
             cron.schedule,
             cron.command,
             enabled,
@@ -1162,7 +1342,7 @@ pub fn delete_cron(conn: &Connection, id: &str) -> Result<()> {
 pub fn load_crons(conn: &Connection) -> Result<Vec<LoadedCron>> {
     let mut stmt = conn.prepare(&format!(
         "WITH now_ms(value) AS (SELECT {CRON_CREATED_AT_MS_EXPR})
-         SELECT id, schedule, command, scope_hash,
+         SELECT id, session_id, schedule, command, scope_hash,
                 status,
                 cwd_override,
                 scope_enabled,
@@ -1172,16 +1352,18 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<LoadedCron>> {
     ))?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
-        let schedule: String = row.get(1)?;
-        let command: String = row.get(2)?;
-        let scope_blob: Option<Vec<u8>> = row.get(3)?;
-        let status_text: String = row.get(4)?;
-        let cwd_override: Option<String> = row.get(5)?;
-        let scope_enabled: i64 = row.get(6)?;
-        let wrapper_enabled: i64 = row.get(7)?;
-        let age_millis: i64 = row.get(8)?;
+        let session_id: Option<String> = row.get(1)?;
+        let schedule: String = row.get(2)?;
+        let command: String = row.get(3)?;
+        let scope_blob: Option<Vec<u8>> = row.get(4)?;
+        let status_text: String = row.get(5)?;
+        let cwd_override: Option<String> = row.get(6)?;
+        let scope_enabled: i64 = row.get(7)?;
+        let wrapper_enabled: i64 = row.get(8)?;
+        let age_millis: i64 = row.get(9)?;
         Ok((
             id,
+            session_id,
             schedule,
             command,
             scope_blob,
@@ -1197,6 +1379,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<LoadedCron>> {
     for row in rows {
         let (
             id,
+            session_id,
             schedule,
             command,
             scope_blob,
@@ -1214,6 +1397,7 @@ pub fn load_crons(conn: &Connection) -> Result<Vec<LoadedCron>> {
             LoadedCron {
                 record: StoredCron {
                     id,
+                    session_id,
                     schedule,
                     command,
                     status,
@@ -1367,6 +1551,132 @@ mod tests {
         let conn = in_memory_db();
         // Running migrate again should be a no-op.
         migrate(&conn).expect("second migration");
+    }
+
+    #[test]
+    fn migration_from_v15_adds_named_sessions_table() {
+        let conn = Connection::open_in_memory().expect("open legacy in-memory db");
+        conn.execute_batch(MIGRATION_V1)
+            .expect("seed legacy schema");
+        conn.pragma_update(None, "user_version", 15)
+            .expect("mark schema version 15");
+
+        migrate(&conn).expect("migrate schema to v16");
+
+        for column in [
+            "id",
+            "name",
+            "scope_hash",
+            "pty_default",
+            "wrapper_enabled",
+            "created_at_ms",
+            "updated_at_ms",
+            "archived_at_ms",
+        ] {
+            assert!(
+                column_exists(&conn, "sessions", column).expect("inspect sessions schema"),
+                "missing sessions.{column}"
+            );
+        }
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v17_and_v18_preserve_legacy_unowned_jobs_and_crons() {
+        let conn = Connection::open_in_memory().expect("open legacy in-memory db");
+        conn.execute_batch(MIGRATION_V1)
+            .expect("seed legacy base schema");
+        conn.execute_batch(
+            "ALTER TABLE jobs_history ADD COLUMN chain_id TEXT;
+             ALTER TABLE jobs_history ADD COLUMN stderr TEXT NOT NULL DEFAULT '';
+             ALTER TABLE crons ADD COLUMN status TEXT;
+             CREATE TABLE sessions (
+                 id                  TEXT PRIMARY KEY,
+                 name                TEXT NOT NULL UNIQUE,
+                 scope_hash          BLOB REFERENCES scopes(hash),
+                 pty_default         INTEGER,
+                 wrapper_enabled     INTEGER,
+                 created_at_ms       INTEGER NOT NULL,
+                 updated_at_ms       INTEGER NOT NULL
+             );",
+        )
+        .expect("complete schema version 16 fixture");
+        let job_status = serde_json::to_string(&JobStatus::Done).expect("serialize job status");
+        conn.execute(
+            "INSERT INTO jobs_history (id, pipeline, status)
+             VALUES ('J1', 'echo legacy job', ?1)",
+            rusqlite::params![job_status],
+        )
+        .expect("insert legacy unowned job");
+        let cron_status =
+            serde_json::to_string(&CronStatus::Paused).expect("serialize cron status");
+        conn.execute(
+            &format!(
+                "INSERT INTO crons (
+                     id, schedule, command, enabled, status, created_at_ms
+                 ) VALUES (
+                     'C1', 'every 5m', 'echo legacy cron', 0, ?1, {CRON_CREATED_AT_MS_EXPR}
+                 )"
+            ),
+            rusqlite::params![cron_status],
+        )
+        .expect("insert legacy unowned cron");
+        conn.pragma_update(None, "user_version", 16)
+            .expect("mark schema version 16");
+
+        migrate(&conn).expect("migrate schema to current version");
+
+        assert!(column_exists(&conn, "jobs_history", "session_id").expect("inspect jobs schema"));
+        assert!(column_exists(&conn, "crons", "session_id").expect("inspect crons schema"));
+        assert!(
+            column_exists(&conn, "sessions", "archived_at_ms").expect("inspect sessions schema")
+        );
+        assert_eq!(
+            load_job_history(&conn).expect("load legacy jobs")[0].session_id,
+            None
+        );
+        assert_eq!(
+            load_crons(&conn).expect("load legacy crons")[0]
+                .record
+                .session_id,
+            None
+        );
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v18_preserves_sessions_as_active() {
+        let conn = Connection::open_in_memory().expect("open legacy in-memory db");
+        conn.execute_batch(MIGRATION_V1)
+            .expect("seed legacy base schema");
+        conn.execute_batch(MIGRATION_V16)
+            .expect("seed legacy sessions schema");
+        conn.execute(
+            "INSERT INTO sessions (
+                 id, name, scope_hash, pty_default, wrapper_enabled, created_at_ms, updated_at_ms
+             ) VALUES ('SS-legacy', 'legacy', NULL, NULL, NULL, 10, 20)",
+            [],
+        )
+        .expect("insert legacy session");
+        conn.pragma_update(None, "user_version", 17)
+            .expect("mark schema version 17");
+
+        migrate(&conn).expect("migrate schema to v18");
+
+        assert_eq!(
+            load_sessions(&conn).expect("load migrated session")[0].archived_at_ms,
+            None
+        );
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
@@ -1563,6 +1873,7 @@ mod tests {
             &conn,
             &StoredJob {
                 id: "J1".into(),
+                session_id: None,
                 pipeline: "volatile scopes".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -1583,6 +1894,7 @@ mod tests {
         for cron in [
             StoredCron {
                 id: "C1".into(),
+                session_id: None,
                 schedule: "every 5m".into(),
                 command: "echo scoped".into(),
                 status: CronStatus::Scheduled,
@@ -1593,6 +1905,7 @@ mod tests {
             },
             StoredCron {
                 id: "C2".into(),
+                session_id: None,
                 schedule: "every 5m".into(),
                 command: "echo unscoped".into(),
                 status: CronStatus::Scheduled,
@@ -1648,6 +1961,7 @@ mod tests {
             &conn,
             &StoredJob {
                 id: "J1".into(),
+                session_id: None,
                 pipeline: "first".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -1662,6 +1976,7 @@ mod tests {
             &conn,
             &StoredJob {
                 id: "J2".into(),
+                session_id: None,
                 pipeline: "second".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -1675,6 +1990,7 @@ mod tests {
         for cron in [
             StoredCron {
                 id: "C1".into(),
+                session_id: None,
                 schedule: "every 5m".into(),
                 command: "echo scoped".into(),
                 status: CronStatus::Scheduled,
@@ -1685,6 +2001,7 @@ mod tests {
             },
             StoredCron {
                 id: "C2".into(),
+                session_id: None,
                 schedule: "every 5m".into(),
                 command: "echo unscoped".into(),
                 status: CronStatus::Scheduled,
@@ -1695,6 +2012,7 @@ mod tests {
             },
             StoredCron {
                 id: "C3".into(),
+                session_id: None,
                 schedule: "every 5m".into(),
                 command: "echo safe".into(),
                 status: CronStatus::Scheduled,
@@ -1850,6 +2168,7 @@ mod tests {
             &conn,
             &StoredJob {
                 id: "J1".into(),
+                session_id: None,
                 pipeline: "echo retained".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -1870,6 +2189,157 @@ mod tests {
                 .contains("still references unmarked scope")
         );
         assert!(get_scope(&conn, &root.hash).expect("load root").is_some());
+    }
+
+    #[test]
+    fn sweep_scopes_refuses_to_delete_named_session_scope() {
+        let conn = in_memory_db();
+        let scope_hash = insert_safe_scope(&conn, "/tmp/named-session");
+        let session = StoredSession {
+            id: "session-1".into(),
+            name: "shared".into(),
+            scope_hash: Some(scope_hash),
+            pty_default: None,
+            wrapper_enabled: None,
+            created_at_ms: 100,
+            updated_at_ms: 100,
+            archived_at_ms: None,
+        };
+        assert!(upsert_session(&conn, &session).expect("persist named session"));
+
+        let error = sweep_scopes(&conn, &HashSet::new())
+            .expect_err("unmarked named-session scope must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("session still references unmarked scope")
+        );
+        assert!(
+            get_scope(&conn, &scope_hash)
+                .expect("load named-session scope")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn named_session_roundtrips_durable_scope_and_defaults() {
+        let conn = in_memory_db();
+        let scope_hash = insert_safe_scope(&conn, "/tmp/shared");
+        let session = StoredSession {
+            id: "session-2".into(),
+            name: "pairing".into(),
+            scope_hash: Some(scope_hash),
+            pty_default: Some(true),
+            wrapper_enabled: Some(false),
+            created_at_ms: 200,
+            updated_at_ms: 250,
+            archived_at_ms: Some(260),
+        };
+
+        assert!(upsert_session(&conn, &session).expect("persist durable session scope"));
+
+        assert_eq!(
+            load_sessions(&conn).expect("load named sessions"),
+            vec![session]
+        );
+    }
+
+    #[test]
+    fn named_session_archive_state_updates_without_replacing_identity_or_scope() {
+        let conn = in_memory_db();
+        let scope_hash = insert_safe_scope(&conn, "/tmp/archive-state");
+        let session = StoredSession {
+            id: "session-archive".into(),
+            name: "archive-state".into(),
+            scope_hash: Some(scope_hash),
+            pty_default: Some(true),
+            wrapper_enabled: Some(false),
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            archived_at_ms: None,
+        };
+        assert!(upsert_session(&conn, &session).expect("persist session"));
+
+        set_session_archived_at(&conn, &session.id, Some(30), 30).expect("archive session");
+        let archived = load_sessions(&conn).expect("load archived session");
+        assert_eq!(archived[0].archived_at_ms, Some(30));
+        assert_eq!(archived[0].scope_hash, Some(scope_hash));
+        assert_eq!(archived[0].name, session.name);
+
+        set_session_archived_at(&conn, &session.id, None, 40).expect("restore session");
+        let restored = load_sessions(&conn).expect("load restored session");
+        assert_eq!(restored[0].archived_at_ms, None);
+        assert_eq!(restored[0].updated_at_ms, 40);
+    }
+
+    #[test]
+    fn named_session_without_scope_reports_not_durable() {
+        let conn = in_memory_db();
+        let session = StoredSession {
+            id: "session-unbound".into(),
+            name: "needs-refresh".into(),
+            scope_hash: None,
+            pty_default: None,
+            wrapper_enabled: None,
+            created_at_ms: 275,
+            updated_at_ms: 275,
+            archived_at_ms: None,
+        };
+
+        assert!(!upsert_session(&conn, &session).expect("persist unbound session"));
+        assert_eq!(
+            load_sessions(&conn).expect("load unbound session"),
+            vec![session]
+        );
+    }
+
+    #[test]
+    fn named_session_keeps_identity_but_not_volatile_scope() {
+        let conn = in_memory_db();
+        let volatile_scope = Scope::root(EnvSnapshot {
+            env: BTreeMap::from([
+                ("PATH".into(), "/usr/bin".into()),
+                ("API_TOKEN".into(), "fixture-do-not-persist".into()),
+            ]),
+            cwd: PathBuf::from("/tmp/volatile-session"),
+        });
+        assert_eq!(
+            insert_scope(&conn, &volatile_scope).expect("insert volatile session scope"),
+            ScopePersistence::VolatileSensitiveEnvironment
+        );
+        let requested = StoredSession {
+            id: "session-3".into(),
+            name: "agent-pair".into(),
+            scope_hash: Some(volatile_scope.hash),
+            pty_default: Some(false),
+            wrapper_enabled: None,
+            created_at_ms: 300,
+            updated_at_ms: 300,
+            archived_at_ms: None,
+        };
+
+        assert!(
+            !upsert_session(&conn, &requested).expect("persist volatile session metadata"),
+            "volatile scope must not be reported as durable"
+        );
+
+        let mut expected = requested;
+        expected.scope_hash = None;
+        assert_eq!(
+            load_sessions(&conn).expect("load volatile session metadata"),
+            vec![expected]
+        );
+        let persisted_fixture_values: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM scopes
+                 WHERE instr(COALESCE(delta_json, ''), 'fixture-do-not-persist') != 0
+                    OR instr(COALESCE(snap_json, ''), 'fixture-do-not-persist') != 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check volatile value was not persisted");
+        assert_eq!(persisted_fixture_values, 0);
     }
 
     #[test]
@@ -1899,6 +2369,7 @@ mod tests {
             &scheduler_conn,
             &StoredJob {
                 id: "J1".into(),
+                session_id: None,
                 pipeline: "echo volatile".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -1919,12 +2390,58 @@ mod tests {
     }
 
     #[test]
+    fn named_session_owner_roundtrips_for_jobs_and_crons() {
+        let conn = in_memory_db();
+        let scope_hash = insert_safe_scope(&conn, "/tmp/owned-work");
+        let session = StoredSession {
+            id: "session-owned".into(),
+            name: "owned-work".into(),
+            scope_hash: Some(scope_hash),
+            pty_default: None,
+            wrapper_enabled: None,
+            created_at_ms: 400,
+            updated_at_ms: 400,
+            archived_at_ms: None,
+        };
+        assert!(upsert_session(&conn, &session).expect("persist owning session"));
+        let job = StoredJob {
+            id: "J40".into(),
+            session_id: Some(session.id.clone()),
+            pipeline: "echo owned job".into(),
+            status: JobStatus::Done,
+            exit_code: Some(0),
+            start_scope: Some(scope_hash),
+            end_scope: Some(scope_hash),
+            chain_id: None,
+            stderr: String::new(),
+        };
+        let cron = StoredCron {
+            id: "C40".into(),
+            session_id: Some(session.id.clone()),
+            schedule: "every 5m".into(),
+            command: "echo owned cron".into(),
+            status: CronStatus::Scheduled,
+            scope_hash: Some(scope_hash),
+            cwd_override: None,
+            scope_enabled: false,
+            wrapper_enabled: false,
+        };
+
+        upsert_job_history(&conn, &job).expect("persist owned job");
+        upsert_cron(&conn, &cron).expect("persist owned cron");
+
+        assert_eq!(load_job_history(&conn).expect("load owned job"), vec![job]);
+        assert_eq!(load_crons(&conn).expect("load owned cron")[0].record, cron);
+    }
+
+    #[test]
     fn job_history_roundtrip() {
         let conn = in_memory_db();
         let start_scope = insert_safe_scope(&conn, "/tmp/job-start");
         let end_scope = insert_safe_scope(&conn, "/tmp/job-end");
         let job = StoredJob {
             id: "J12".into(),
+            session_id: None,
             pipeline: "cargo test".into(),
             status: JobStatus::Cancelled(CancelReason::User),
             exit_code: Some(130),
@@ -1990,6 +2507,7 @@ mod tests {
         for job in [
             StoredJob {
                 id: "J1".into(),
+                session_id: None,
                 pipeline: "sleep 60".into(),
                 status: JobStatus::Running,
                 exit_code: None,
@@ -2000,6 +2518,7 @@ mod tests {
             },
             StoredJob {
                 id: "J2".into(),
+                session_id: None,
                 pipeline: "echo old".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -2010,6 +2529,7 @@ mod tests {
             },
             StoredJob {
                 id: "J3".into(),
+                session_id: None,
                 pipeline: "echo latest".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -2045,6 +2565,7 @@ mod tests {
         let scope_hash = insert_safe_scope(&conn, "/tmp/cron");
         let cron = StoredCron {
             id: "C3".into(),
+            session_id: None,
             schedule: "every 5m".into(),
             command: "cargo test".into(),
             status: CronStatus::Scheduled,
@@ -2075,6 +2596,7 @@ mod tests {
         let scope_hash = insert_safe_scope(&conn, "/tmp/failed-cron");
         let cron = StoredCron {
             id: "C4".into(),
+            session_id: None,
             schedule: "in 1s".into(),
             command: "echo due".into(),
             status: CronStatus::Failed,
@@ -2097,6 +2619,7 @@ mod tests {
         let scope_hash = insert_safe_scope(&conn, "/tmp/elapsed-cron");
         let cron = StoredCron {
             id: "C7".into(),
+            session_id: None,
             schedule: "in 1500ms".into(),
             command: "echo soon".into(),
             status: CronStatus::Scheduled,
@@ -2367,6 +2890,7 @@ mod tests {
         let conn = in_memory_db();
         let job = StoredJob {
             id: "J3".into(),
+            session_id: None,
             pipeline: "echo oops 1>&2".into(),
             status: cue_core::job::JobStatus::Failed,
             exit_code: Some(1),

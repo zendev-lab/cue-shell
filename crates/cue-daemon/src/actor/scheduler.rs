@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rusqlite::Connection;
@@ -18,10 +18,13 @@ use cue_core::chain::{
 use cue_core::command::ModeParams;
 use cue_core::command_spec::{COMMAND_SPECS, CommandCategory, CommandSpec, command_spec};
 use cue_core::cron::{CronSchedule, CronStatus, parse_schedule_text};
+#[cfg(test)]
+use cue_core::ipc::ForegroundRole;
 use cue_core::ipc::{
     ChainInfo, ChainJobInfo, CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload,
     OutputEncoding, PageInfo, ResponsePayload, ScriptInfo, ScriptInfoStatus, ScriptItemInfo,
-    ScriptItemResult, ScriptRunStatus, ScriptSource, ScriptSubmitError, StreamText, error_code,
+    ScriptItemResult, ScriptRunStatus, ScriptSource, ScriptSubmitError, SessionInfo,
+    SessionScopeState, StreamText, error_code,
 };
 use cue_core::job::{CancelReason, EXIT_CODE_UNAVAILABLE, JobStatus, LaunchOptions};
 use cue_core::mode::Mode;
@@ -45,8 +48,9 @@ use super::script_record::{
 };
 use super::{
     ActorSystem, GatewayMsg, ProcessJobOptions, ProcessMgrMsg, SchedulerMsg, ScopeStoreMsg,
-    SessionBinding, StderrSnapshot, publish_event as publish_actor_event,
-    publish_event_except as publish_actor_event_except,
+    SessionBinding, SessionCommand, SessionCommandResult, StderrSnapshot,
+    publish_session_event as publish_actor_session_event,
+    publish_session_event_except as publish_actor_session_event_except,
     send_gateway_event as send_actor_gateway_event,
 };
 
@@ -73,6 +77,8 @@ struct ChainState {
     process: ProcessJobContext,
     /// Whether scope-transform leaves may derive a new scope for later leaves.
     scope_enabled: bool,
+    /// Durable named-session owner inherited by every leaf.
+    session_id: Option<String>,
 }
 
 // ── Job tracking ────────────────────────────────────────────────────────────
@@ -80,6 +86,7 @@ struct ChainState {
 /// Scheduler-side view of every spawned job.
 struct JobEntry {
     job_id: JobId,
+    session_id: Option<String>,
     pipeline_text: String,
     status: JobStatus,
     exit_code: Option<i32>,
@@ -115,6 +122,8 @@ struct CronEntry {
     scope_enabled: bool,
     /// Whether the wrapper binary is enabled for jobs spawned by this cron.
     wrapper_enabled: bool,
+    /// Durable named-session owner inherited by triggered jobs.
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,18 +143,23 @@ struct PendingScriptRun {
     created_items: Vec<ScriptItemInfo>,
     last_exit_code: i32,
     waiting_index: Option<usize>,
+    /// Captured at submission so later items do not depend on a live transport.
+    session_id: Option<String>,
 }
 
 struct CompletedScriptSnapshot {
     info: Option<ScriptInfo>,
+    /// Durable named-session owner captured when the script was submitted.
+    session_id: Option<String>,
     completed_at: Instant,
     response_bytes: usize,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct CommandExecutionContext {
     scope_override: Option<ScopeHash>,
     direct_output_client: Option<u64>,
+    session_id: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -160,6 +174,27 @@ struct SessionState {
     defaults: LaunchDefaults,
     connected_clients: usize,
     disconnected_at: Option<Instant>,
+    /// Present only for daemon-owned durable named sessions. Anonymous
+    /// handshake sessions keep using the bounded disconnect TTL.
+    named: Option<NamedSessionMeta>,
+}
+
+#[derive(Clone)]
+struct NamedSessionMeta {
+    id: String,
+    name: String,
+    scope_durable: bool,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    archived_at_ms: Option<i64>,
+}
+
+/// Durable identity restored without a cursor because its live scope contained
+/// credential-like environment names and intentionally stayed process-local.
+#[derive(Clone)]
+struct UnavailableNamedSession {
+    meta: NamedSessionMeta,
+    defaults: LaunchDefaults,
 }
 
 const SESSION_GC_TTL: Duration = Duration::from_secs(300);
@@ -210,6 +245,8 @@ struct SchedulerState {
     completed_script_snapshot_bytes: usize,
     /// Logical sessions keyed by stable client-provided session id.
     sessions: HashMap<String, SessionState>,
+    /// Named sessions whose volatile scope did not survive a daemon restart.
+    unavailable_named_sessions: HashMap<String, UnavailableNamedSession>,
     /// Transport client id to logical session id.
     client_sessions: HashMap<u64, String>,
     /// Jobs waiting for resource admission, preserved in FIFO retry order.
@@ -267,6 +304,7 @@ impl SchedulerState {
             completed_script_snapshot_responses: 0,
             completed_script_snapshot_bytes: 0,
             sessions: HashMap::new(),
+            unavailable_named_sessions: HashMap::new(),
             client_sessions: HashMap::new(),
             pending_resource_jobs: VecDeque::new(),
             pending_resource: HashMap::new(),
@@ -297,6 +335,7 @@ impl SchedulerState {
             .and_then(|session_id| self.sessions.get(session_id))
     }
 
+    #[cfg(test)]
     fn session_for_client_mut(&mut self, client_id: u64) -> Option<&mut SessionState> {
         let session_id = self.client_sessions.get(&client_id)?.clone();
         self.sessions.get_mut(&session_id)
@@ -305,6 +344,21 @@ impl SchedulerState {
     fn client_scope(&self, client_id: u64) -> Option<ScopeHash> {
         self.session_for_client(client_id)
             .map(|session| session.scope)
+    }
+
+    fn named_session_id_for_client(&self, client_id: u64) -> Option<&str> {
+        self.session_for_client(client_id)
+            .and_then(|session| session.named.as_ref())
+            .map(|named| named.id.as_str())
+    }
+
+    fn has_named_session_id(&self, session_id: &str) -> bool {
+        self.sessions.values().any(|session| {
+            session
+                .named
+                .as_ref()
+                .is_some_and(|named| named.id == session_id)
+        }) || self.unavailable_named_sessions.contains_key(session_id)
     }
 
     fn wrapper_enabled(&self, client_id: u64, config: &Config) -> bool {
@@ -323,6 +377,124 @@ impl SchedulerState {
         let id = ScriptId(self.next_script);
         self.next_script += 1;
         id
+    }
+
+    fn alloc_session_incarnation(&mut self) -> anyhow::Result<u64> {
+        let incarnation = self.next_session_incarnation;
+        self.next_session_incarnation = self
+            .next_session_incarnation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("session incarnation space exhausted"))?;
+        Ok(incarnation)
+    }
+}
+
+/// A scheduler identity whose visibility and mutation rights follow its
+/// durable named-session owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionOwnedTarget {
+    Job(JobId),
+    Chain(ChainId),
+    Script(ScriptId),
+    Cron(CronId),
+}
+
+impl SessionOwnedTarget {
+    fn display(self) -> String {
+        match self {
+            Self::Job(id) => format!("job {id}"),
+            Self::Chain(id) => format!("chain {id}"),
+            Self::Script(id) => format!("script {id}"),
+            Self::Cron(id) => format!("cron {id}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionAccessDenied(SessionOwnedTarget);
+
+impl SessionAccessDenied {
+    fn into_response(self) -> ResponsePayload {
+        ResponsePayload::err(
+            error_code::NOT_FOUND,
+            format!("{} not found", self.0.display()),
+        )
+    }
+}
+
+/// Resolve the identity targeted by a command. Keeping this mapping in one
+/// place makes it difficult for a newly added ID operation to accidentally
+/// bypass the named-session boundary.
+fn session_owned_target_for_command(command: &ResolvedCommand) -> Option<SessionOwnedTarget> {
+    match command {
+        ResolvedCommand::Kill { id } => parse_job_id(id)
+            .map(SessionOwnedTarget::Job)
+            .or_else(|| parse_cron_id(id).map(SessionOwnedTarget::Cron)),
+        ResolvedCommand::KillJob { id }
+        | ResolvedCommand::Retry { id }
+        | ResolvedCommand::Out { id, .. }
+        | ResolvedCommand::Err { id }
+        | ResolvedCommand::JobOutput { id, .. }
+        | ResolvedCommand::Fg { id, .. }
+        | ResolvedCommand::Wait { id }
+        | ResolvedCommand::Send { id, .. }
+        | ResolvedCommand::Cancel { id } => parse_job_id(id).map(SessionOwnedTarget::Job),
+        ResolvedCommand::CancelExecution { id } => parse_job_id(id)
+            .map(SessionOwnedTarget::Job)
+            .or_else(|| parse_chain_id(id).map(SessionOwnedTarget::Chain))
+            .or_else(|| parse_script_id(id).map(SessionOwnedTarget::Script)),
+        ResolvedCommand::RemoveCron { id }
+        | ResolvedCommand::Pause { id }
+        | ResolvedCommand::Resume { id } => parse_cron_id(id).map(SessionOwnedTarget::Cron),
+        ResolvedCommand::Log { id: Some(id) } | ResolvedCommand::ShowLog { id: Some(id), .. } => {
+            parse_job_id(id)
+                .map(SessionOwnedTarget::Job)
+                .or_else(|| parse_cron_id(id).map(SessionOwnedTarget::Cron))
+        }
+        _ => None,
+    }
+}
+
+/// Enforce the named-session ownership boundary without changing legacy
+/// anonymous behavior. Cross-session and unowned targets are reported as not
+/// found so their existence is not disclosed to another named session.
+fn authorize_session_owned_target(
+    state: &SchedulerState,
+    requester_session_id: Option<&str>,
+    target: SessionOwnedTarget,
+) -> Result<(), SessionAccessDenied> {
+    let Some(requester_session_id) = requester_session_id else {
+        return Ok(());
+    };
+    let authorized = match target {
+        SessionOwnedTarget::Job(id) => state
+            .jobs
+            .get(&id)
+            .is_some_and(|entry| entry.session_id.as_deref() == Some(requester_session_id)),
+        SessionOwnedTarget::Chain(id) => state
+            .chains
+            .get(&id)
+            .is_some_and(|entry| entry.session_id.as_deref() == Some(requester_session_id)),
+        SessionOwnedTarget::Script(id) => state
+            .pending_scripts
+            .get(&id)
+            .map(|entry| entry.session_id.as_deref())
+            .or_else(|| {
+                state
+                    .completed_script_snapshots
+                    .get(&id)
+                    .map(|snapshot| snapshot.session_id.as_deref())
+            })
+            .is_some_and(|owner| owner == Some(requester_session_id)),
+        SessionOwnedTarget::Cron(id) => state
+            .crons
+            .get(&id)
+            .is_some_and(|entry| entry.session_id.as_deref() == Some(requester_session_id)),
+    };
+    if authorized {
+        Ok(())
+    } else {
+        Err(SessionAccessDenied(target))
     }
 }
 
@@ -366,15 +538,35 @@ fn scope_gc_roots(state: &SchedulerState) -> HashSet<ScopeHash> {
 
 // ── Spawn the actor ─────────────────────────────────────────────────────────
 
+fn command_starts_execution(command: &ResolvedCommand) -> bool {
+    matches!(
+        command,
+        ResolvedCommand::Script { .. }
+            | ResolvedCommand::Run { .. }
+            | ResolvedCommand::Cron { .. }
+            | ResolvedCommand::Retry { .. }
+            | ResolvedCommand::Resume { .. }
+    )
+}
+
+fn scheduler_is_idle_for_restart(state: &SchedulerState) -> bool {
+    state.jobs.values().all(|job| job.status.is_terminal())
+        && state.chains.is_empty()
+        && state.pending_scripts.is_empty()
+        && state.pending_resource.is_empty()
+}
+
 /// Restore durable Scheduler state and spawn the actor task.
 pub(super) async fn spawn(
     mut rx: mpsc::Receiver<SchedulerMsg>,
     conn: Connection,
     sys: ActorSystem,
+    lifecycle: Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> anyhow::Result<()> {
     let db = storage::shared_connection(conn);
     let config = sys.config.clone();
     let mut state = SchedulerState::new();
+    restore_named_sessions(&db, &mut state).await?;
     restore_jobs(&db, &mut state).await?;
     restore_crons(&db, &mut state).await?;
     restore_script_counter(&db, &mut state).await?;
@@ -383,6 +575,12 @@ pub(super) async fn spawn(
         prune_retained_job_history(&mut state, &db, &config, &sys).await;
         garbage_collect_scopes(&state, &sys).await;
         let mut next_scope_gc = Instant::now() + SCOPE_GC_INTERVAL;
+        // A fenced successor may answer control-plane Ping while it proves its
+        // exact identity, but it must not execute restored crons or new work
+        // until the Armed -> Completed CAS has committed.
+        let mut execution_paused = lifecycle.is_starting();
+        let mut startup_activation_armed = false;
+        let mut draining = false;
         debug!("scheduler: started");
 
         loop {
@@ -393,12 +591,13 @@ pub(super) async fn spawn(
             let next_cron_deadline = state
                 .crons
                 .values()
-                .filter(|c| c.status.is_runnable())
+                .filter(|c| !execution_paused && !draining && c.status.is_runnable())
                 .map(|c| c.next_trigger)
                 .min();
             let next_session_gc_deadline = state
                 .sessions
                 .values()
+                .filter(|session| session.named.is_none())
                 .filter(|session| session.connected_clients == 0)
                 .filter_map(|session| session.disconnected_at)
                 .map(|disconnected_at| disconnected_at + SESSION_GC_TTL)
@@ -418,11 +617,63 @@ pub(super) async fn spawn(
             tokio::select! {
                 biased;
 
+                // Once the durable completion signal is published, startup
+                // activation must outrank an arbitrarily busy control queue.
+                // Otherwise a stream of status/output traffic could keep a
+                // valid successor in Starting until its readiness timeout.
+                _ = lifecycle.wait_for_startup_activation(), if execution_paused && startup_activation_armed => {
+                    execution_paused = false;
+                    lifecycle.mark_startup_execution_ready();
+                    debug!("scheduler: restart successor execution activated");
+                }
+
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
                     match msg {
+                        SchedulerMsg::Activate { reply } => {
+                            let result = if draining || !execution_paused || !lifecycle.is_starting() {
+                                Err(anyhow::anyhow!(
+                                    "scheduler cannot arm successor activation in its current lifecycle state"
+                                ))
+                            } else {
+                                startup_activation_armed = true;
+                                Ok(())
+                            };
+                            let _ = reply.send(result);
+                        }
+
+                        SchedulerMsg::BeginDrain { reply } => {
+                            draining = true;
+                            let _ = reply.send(());
+                        }
+
                         SchedulerMsg::Connect { client_id, session_id, snapshot, refresh, reply } => {
-                            let result = connect_session(client_id, session_id, snapshot, refresh, &mut state, &sys).await;
+                            let result = match connect_session(client_id, session_id, snapshot, refresh, &mut state, &sys).await {
+                                Ok(binding) => match set_client_event_session(&sys, client_id, &binding).await {
+                                    Ok(()) => Ok(binding),
+                                    Err(error) => Err(error),
+                                },
+                                Err(error) => Err(error),
+                            };
+                            let _ = reply.send(result);
+                        }
+
+                        SchedulerMsg::Session { client_id, command, reply } => {
+                            let mut result = handle_session_command(
+                                client_id,
+                                command,
+                                &mut state,
+                                &db,
+                            )
+                            .await;
+                            if let Some(binding) = result.binding.as_ref()
+                                && let Err(error) = set_client_event_session(&sys, client_id, binding).await
+                            {
+                                result = SessionCommandResult {
+                                    payload: ResponsePayload::err(error_code::INTERNAL, error.to_string()),
+                                    binding: None,
+                                };
+                            }
                             let _ = reply.send(result);
                         }
 
@@ -437,7 +688,7 @@ pub(super) async fn spawn(
                                     "client session handshake required",
                                 )
                             } else {
-                                script_info_response(&id, &mut state)
+                                script_info_response(&id, client_id, &mut state)
                             };
                             send_gateway_response(&sys, client_id, request_id, response).await;
                         }
@@ -449,6 +700,19 @@ pub(super) async fn spawn(
                                     client_id,
                                     request_id,
                                     ResponsePayload::err(error_code::INVALID_REQUEST, "client session handshake required"),
+                                )
+                                .await;
+                                continue;
+                            }
+                            if (execution_paused || draining) && command_starts_execution(&command) {
+                                send_gateway_response(
+                                    &sys,
+                                    client_id,
+                                    request_id,
+                                    ResponsePayload::err(
+                                        error_code::DAEMON_DRAINING,
+                                        "daemon is draining; new execution admission is closed",
+                                    ),
                                 )
                                 .await;
                                 continue;
@@ -614,6 +878,9 @@ pub(super) async fn spawn(
                             break;
                         }
                     }
+                    if draining && scheduler_is_idle_for_restart(&state) {
+                        lifecycle.mark_drained();
+                    }
                     if prune_retained_job_history(&mut state, &db, &config, &sys).await {
                         garbage_collect_scopes(&state, &sys).await;
                     }
@@ -621,7 +888,10 @@ pub(super) async fn spawn(
 
                 () = &mut sleep => {
                     let now = Instant::now();
-                    if next_cron_deadline.is_some_and(|deadline| deadline <= now) {
+                    if !execution_paused
+                        && !draining
+                        && next_cron_deadline.is_some_and(|deadline| deadline <= now)
+                    {
                         fire_due_crons(&mut state, &db, &config, &sys).await;
                     }
                     if next_scope_gc <= now {
@@ -637,6 +907,85 @@ pub(super) async fn spawn(
 
     Ok(())
 }
+
+fn named_session_key(id: &str) -> String {
+    format!("named:{id}")
+}
+
+fn ephemeral_session_key(id: &str) -> String {
+    format!("ephemeral:{id}")
+}
+
+async fn restore_named_sessions(
+    db: &storage::SharedConnection,
+    state: &mut SchedulerState,
+) -> anyhow::Result<()> {
+    let restored = storage::with_connection(db, |conn| {
+        let sessions = storage::load_sessions(conn)?;
+        for session in &sessions {
+            if let Some(scope_hash) = session.scope_hash
+                && storage::get_scope(conn, &scope_hash)?.is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "named session {} references missing scope {}",
+                    session.id,
+                    scope_hash
+                ));
+            }
+        }
+        Ok(sessions)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("load persisted named sessions: {error}"))?;
+
+    for session in restored {
+        let incarnation = state.alloc_session_incarnation()?;
+        let meta = NamedSessionMeta {
+            id: session.id.clone(),
+            name: session.name,
+            scope_durable: session.scope_hash.is_some(),
+            created_at_ms: session.created_at_ms,
+            updated_at_ms: session.updated_at_ms,
+            archived_at_ms: session.archived_at_ms,
+        };
+        let defaults = LaunchDefaults {
+            pty: session.pty_default,
+            wrapper_enabled: session.wrapper_enabled,
+        };
+        if let Some(scope) = session.scope_hash {
+            state.sessions.insert(
+                named_session_key(&session.id),
+                SessionState {
+                    scope,
+                    incarnation,
+                    defaults,
+                    connected_clients: 0,
+                    disconnected_at: None,
+                    named: Some(meta),
+                },
+            );
+        } else {
+            state
+                .unavailable_named_sessions
+                .insert(session.id, UnavailableNamedSession { meta, defaults });
+        }
+    }
+
+    let ready = state
+        .sessions
+        .values()
+        .filter(|session| session.named.is_some())
+        .count();
+    if ready > 0 || !state.unavailable_named_sessions.is_empty() {
+        info!(
+            ready,
+            needs_refresh = state.unavailable_named_sessions.len(),
+            "scheduler: restored named sessions"
+        );
+    }
+    Ok(())
+}
+
 async fn restore_jobs(
     db: &storage::SharedConnection,
     state: &mut SchedulerState,
@@ -646,15 +995,37 @@ async fn restore_jobs(
         .map_err(|error| anyhow::anyhow!("load persisted job history: {error}"))?;
 
     let mut max_job = 0;
-    for job in restored {
+    let mut interrupted = 0usize;
+    for mut job in restored {
+        if let Some(session_id) = job.session_id.as_deref()
+            && !state.has_named_session_id(session_id)
+        {
+            return Err(anyhow::anyhow!(
+                "persisted job {} references missing named session {}",
+                job.id,
+                session_id
+            ));
+        }
         let Some(job_id) = parse_job_id(&job.id) else {
             return Err(anyhow::anyhow!("invalid persisted job id {}", job.id));
         };
+        if !job.status.is_terminal() {
+            interrupted += 1;
+            job.status = JobStatus::Killed;
+            job.exit_code = None;
+            let repaired = job.clone();
+            storage::with_connection(db, move |conn| storage::upsert_job_history(conn, &repaired))
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("persist interrupted job {} during restore: {error}", job.id)
+                })?;
+        }
         max_job = max_job.max(job_id.0);
         state.jobs.insert(
             job_id,
             JobEntry {
                 job_id,
+                session_id: job.session_id,
                 pipeline_text: job.pipeline,
                 status: job.status,
                 exit_code: job.exit_code,
@@ -677,6 +1048,12 @@ async fn restore_jobs(
             "scheduler: restored job history"
         );
     }
+    if interrupted > 0 {
+        warn!(
+            interrupted,
+            "scheduler: marked nonterminal history as killed because no process ownership survived"
+        );
+    }
 
     Ok(())
 }
@@ -695,6 +1072,15 @@ async fn restore_crons(
             record: cron,
             elapsed,
         } = loaded;
+        if let Some(session_id) = cron.session_id.as_deref()
+            && !state.has_named_session_id(session_id)
+        {
+            return Err(anyhow::anyhow!(
+                "persisted cron {} references missing named session {}",
+                cron.id,
+                session_id
+            ));
+        }
         let Some(cron_id) = parse_cron_id(&cron.id) else {
             return Err(anyhow::anyhow!("invalid persisted cron id {}", cron.id));
         };
@@ -734,6 +1120,7 @@ async fn restore_crons(
             status = CronStatus::Expired;
             let stored = storage::StoredCron {
                 id: cron.id.clone(),
+                session_id: cron.session_id.clone(),
                 schedule: cron.schedule.clone(),
                 command: cron.command.clone(),
                 status,
@@ -776,6 +1163,7 @@ async fn restore_crons(
                 cwd_override: cron.cwd_override,
                 scope_enabled: cron.scope_enabled,
                 wrapper_enabled: cron.wrapper_enabled,
+                session_id: cron.session_id,
             },
         );
     }
@@ -828,15 +1216,17 @@ async fn prune_retained_job_history(
     let removed_any = !removed.is_empty();
     for id in removed {
         if let Some(job_id) = parse_job_id(&id) {
-            state.jobs.remove(&job_id);
-            publish_event(
-                sys,
-                EventChannel::Jobs,
-                EventPayload::JobRemoved {
-                    job_id: job_id.to_string(),
-                },
-            )
-            .await;
+            if let Some(entry) = state.jobs.remove(&job_id) {
+                publish_session_event(
+                    sys,
+                    EventChannel::Jobs,
+                    EventPayload::JobRemoved {
+                        job_id: job_id.to_string(),
+                    },
+                    entry.session_id,
+                )
+                .await;
+            }
             remove_job_logs(job_id).await;
         }
     }
@@ -868,21 +1258,45 @@ async fn garbage_collect_scopes(state: &SchedulerState, sys: &ActorSystem) {
     }
 }
 
-async fn publish_event(sys: &ActorSystem, channel: EventChannel, payload: EventPayload) {
-    publish_actor_event("scheduler", &sys.event_bus, channel, payload).await;
-}
-
-async fn publish_event_except(
+async fn publish_session_event(
     sys: &ActorSystem,
     channel: EventChannel,
     payload: EventPayload,
+    session_id: Option<String>,
+) {
+    publish_actor_session_event("scheduler", &sys.event_bus, channel, payload, session_id).await;
+}
+
+/// Publish the binding from the scheduler actor before it acknowledges the
+/// handshake/session command. Messages sent by this actor are ordered, so a
+/// later cron or job event cannot overtake the audience update.
+async fn set_client_event_session(
+    sys: &ActorSystem,
+    client_id: u64,
+    binding: &SessionBinding,
+) -> anyhow::Result<()> {
+    sys.event_bus
+        .send(super::EventBusMsg::SetClientSession {
+            client_id,
+            named_session_id: binding.named_session_id.clone(),
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("event bus unreachable during session bind: {error}"))
+}
+
+async fn publish_session_event_except(
+    sys: &ActorSystem,
+    channel: EventChannel,
+    payload: EventPayload,
+    session_id: Option<String>,
     excluded_client_id: u64,
 ) {
-    publish_actor_event_except(
+    publish_actor_session_event_except(
         "scheduler",
         &sys.event_bus,
         channel,
         payload,
+        session_id,
         excluded_client_id,
     )
     .await;
@@ -933,6 +1347,7 @@ async fn persist_script_finished_with_retention(
 fn stored_job_from_entry(entry: &JobEntry) -> storage::StoredJob {
     storage::StoredJob {
         id: entry.job_id.to_string(),
+        session_id: entry.session_id.clone(),
         pipeline: entry.pipeline_text.clone(),
         status: entry.status.clone(),
         exit_code: entry.exit_code,
@@ -956,6 +1371,7 @@ async fn persist_job_entry(
 fn stored_cron_from_entry(entry: &CronEntry) -> storage::StoredCron {
     storage::StoredCron {
         id: entry.cron_id.to_string(),
+        session_id: entry.session_id.clone(),
         schedule: entry.schedule.display(),
         command: entry.chain.to_string(),
         status: entry.status,
@@ -998,14 +1414,15 @@ async fn remove_cron_entry(
     cid: CronId,
 ) -> anyhow::Result<()> {
     remove_cron_from_db(db, cid).await?;
-    if state.crons.remove(&cid).is_some() {
+    if let Some(entry) = state.crons.remove(&cid) {
         info!(%cid, "scheduler: cron removed");
-        publish_event(
+        publish_session_event(
             sys,
             EventChannel::Crons,
             EventPayload::CronRemoved {
                 cron_id: cid.to_string(),
             },
+            entry.session_id,
         )
         .await;
     }
@@ -1037,6 +1454,8 @@ async fn connect_session(
     state: &mut SchedulerState,
     sys: &ActorSystem,
 ) -> anyhow::Result<SessionBinding> {
+    let public_session_id = session_id;
+    let session_id = ephemeral_session_key(&public_session_id);
     let mut old_session_id = state.client_sessions.get(&client_id).cloned();
     let mut same_client_session = old_session_id.as_deref() == Some(session_id.as_str());
 
@@ -1067,17 +1486,17 @@ async fn connect_session(
         let incarnation = session.incarnation;
         state.client_sessions.insert(client_id, session_id.clone());
         mark_replaced_session_disconnected(state, old_session_id, &session_id);
-        return Ok(SessionBinding { scope, incarnation });
+        return Ok(SessionBinding {
+            session_id: public_session_id,
+            named_session_id: None,
+            scope,
+            incarnation,
+        });
     }
 
-    let incarnation = state.next_session_incarnation;
-    let next_session_incarnation = state
-        .next_session_incarnation
-        .checked_add(1)
-        .ok_or_else(|| anyhow::anyhow!("session incarnation space exhausted"))?;
+    let incarnation = state.alloc_session_incarnation()?;
     let scope = Scope::root(snapshot);
     let hash = insert_scope(sys, scope).await?;
-    state.next_session_incarnation = next_session_incarnation;
     state.sessions.insert(
         session_id.clone(),
         SessionState {
@@ -1086,14 +1505,693 @@ async fn connect_session(
             defaults: LaunchDefaults::default(),
             connected_clients: 1,
             disconnected_at: None,
+            named: None,
         },
     );
     state.client_sessions.insert(client_id, session_id.clone());
     mark_replaced_session_disconnected(state, old_session_id, &session_id);
     Ok(SessionBinding {
+        session_id: public_session_id,
+        named_session_id: None,
         scope: hash,
         incarnation,
     })
+}
+
+#[derive(Debug, Clone)]
+enum NamedSessionLocation {
+    Ready(String),
+    NeedsRefresh(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NamedSessionListFilter {
+    Active,
+    Archived,
+    All,
+}
+
+async fn handle_session_command(
+    client_id: u64,
+    command: SessionCommand,
+    state: &mut SchedulerState,
+    db: &storage::SharedConnection,
+) -> SessionCommandResult {
+    if state.session_for_client(client_id).is_none() {
+        return session_command_response(ResponsePayload::err(
+            error_code::INVALID_REQUEST,
+            "client session handshake required",
+        ));
+    }
+
+    match command {
+        SessionCommand::Create { name } => {
+            if let Err(message) = validate_session_name(&name) {
+                return session_command_response(ResponsePayload::err(
+                    error_code::INVALID_REQUEST,
+                    message,
+                ));
+            }
+            if find_named_session(state, &name).is_some() {
+                return session_command_response(ResponsePayload::err(
+                    error_code::ALREADY_EXISTS,
+                    format!("named session `{name}` already exists"),
+                ));
+            }
+
+            let Some(current) = state.session_for_client(client_id) else {
+                return session_command_response(missing_session_response());
+            };
+            let scope = current.scope;
+            let defaults = current.defaults.clone();
+            let now = unix_time_ms();
+            let id = format!("SS-{}", uuid::Uuid::new_v4());
+            let mut meta = NamedSessionMeta {
+                id: id.clone(),
+                name,
+                scope_durable: false,
+                created_at_ms: now,
+                updated_at_ms: now,
+                archived_at_ms: None,
+            };
+            let incarnation = match state.alloc_session_incarnation() {
+                Ok(incarnation) => incarnation,
+                Err(error) => {
+                    return session_command_response(ResponsePayload::err(
+                        error_code::INTERNAL,
+                        error.to_string(),
+                    ));
+                }
+            };
+            let durable = match persist_named_session(db, &meta, scope, &defaults).await {
+                Ok(durable) => durable,
+                Err(error) => {
+                    return session_command_response(ResponsePayload::err(
+                        error_code::INTERNAL,
+                        format!("persist named session: {error}"),
+                    ));
+                }
+            };
+            meta.scope_durable = durable;
+            let key = named_session_key(&id);
+            state.sessions.insert(
+                key.clone(),
+                SessionState {
+                    scope,
+                    incarnation,
+                    defaults,
+                    connected_clients: 0,
+                    disconnected_at: None,
+                    named: Some(meta),
+                },
+            );
+            let binding = bind_client_to_ready_session(state, client_id, &key)
+                .expect("newly inserted named session must be bindable");
+            let info = ready_session_info(state, &key, client_id)
+                .expect("newly inserted named session must have metadata");
+            SessionCommandResult {
+                payload: ResponsePayload::Ok(OkPayload::SessionInfo(Box::new(info))),
+                binding: Some(binding),
+            }
+        }
+
+        SessionCommand::List => {
+            let sessions = named_session_list(state, client_id, NamedSessionListFilter::Active);
+            session_command_response(ResponsePayload::Ok(OkPayload::SessionList(sessions)))
+        }
+
+        SessionCommand::ListArchived => {
+            let sessions = named_session_list(state, client_id, NamedSessionListFilter::Archived);
+            session_command_response(ResponsePayload::Ok(OkPayload::SessionList(sessions)))
+        }
+
+        SessionCommand::ListAll => {
+            let sessions = named_session_list(state, client_id, NamedSessionListFilter::All);
+            session_command_response(ResponsePayload::Ok(OkPayload::SessionList(sessions)))
+        }
+
+        SessionCommand::Archive { selector } => {
+            set_named_session_archived(state, db, client_id, &selector, true).await
+        }
+
+        SessionCommand::Restore { selector } => {
+            set_named_session_archived(state, db, client_id, &selector, false).await
+        }
+
+        SessionCommand::Attach { selector, refresh } => {
+            let Some(location) = find_named_session(state, &selector) else {
+                return session_command_response(ResponsePayload::err(
+                    error_code::NOT_FOUND,
+                    format!("named session `{selector}` not found"),
+                ));
+            };
+            let archived_at_ms = match &location {
+                NamedSessionLocation::Ready(key) => state
+                    .sessions
+                    .get(key)
+                    .and_then(|session| session.named.as_ref())
+                    .and_then(|meta| meta.archived_at_ms),
+                NamedSessionLocation::NeedsRefresh(id) => state
+                    .unavailable_named_sessions
+                    .get(id)
+                    .and_then(|session| session.meta.archived_at_ms),
+            };
+            if archived_at_ms.is_some() {
+                return session_command_response(ResponsePayload::err(
+                    error_code::INVALID_STATE,
+                    format!("named session `{selector}` is archived; restore it before attaching"),
+                ));
+            }
+            match location {
+                NamedSessionLocation::Ready(key) => {
+                    let replacement_scope = if refresh {
+                        state.client_scope(client_id)
+                    } else {
+                        state.sessions.get(&key).map(|session| session.scope)
+                    };
+                    let Some(replacement_scope) = replacement_scope else {
+                        return session_command_response(missing_session_response());
+                    };
+                    let Some(target) = state.sessions.get(&key) else {
+                        return session_command_response(ResponsePayload::err(
+                            error_code::NOT_FOUND,
+                            format!("named session `{selector}` not found"),
+                        ));
+                    };
+                    let mut meta = target
+                        .named
+                        .clone()
+                        .expect("ready named session must have metadata");
+                    let defaults = target.defaults.clone();
+                    meta.updated_at_ms = unix_time_ms();
+                    let durable = match persist_named_session(
+                        db,
+                        &meta,
+                        replacement_scope,
+                        &defaults,
+                    )
+                    .await
+                    {
+                        Ok(durable) => durable,
+                        Err(error) => {
+                            return session_command_response(ResponsePayload::err(
+                                error_code::INTERNAL,
+                                format!("persist named session attach: {error}"),
+                            ));
+                        }
+                    };
+                    meta.scope_durable = durable;
+                    if let Some(target) = state.sessions.get_mut(&key) {
+                        target.scope = replacement_scope;
+                        target.named = Some(meta);
+                    }
+                    let Some(binding) = bind_client_to_ready_session(state, client_id, &key) else {
+                        return session_command_response(ResponsePayload::err(
+                            error_code::INTERNAL,
+                            "named session disappeared while attaching",
+                        ));
+                    };
+                    let info = ready_session_info(state, &key, client_id)
+                        .expect("attached named session must have metadata");
+                    SessionCommandResult {
+                        payload: ResponsePayload::Ok(OkPayload::SessionInfo(Box::new(info))),
+                        binding: Some(binding),
+                    }
+                }
+                NamedSessionLocation::NeedsRefresh(id) => {
+                    if !refresh {
+                        return session_command_response(ResponsePayload::err(
+                            error_code::INVALID_STATE,
+                            format!(
+                                "named session `{selector}` lost its volatile scope during daemon restart; attach with refresh=true to replace it explicitly"
+                            ),
+                        ));
+                    }
+                    let Some(scope) = state.client_scope(client_id) else {
+                        return session_command_response(missing_session_response());
+                    };
+                    let Some(unavailable) = state.unavailable_named_sessions.get(&id).cloned()
+                    else {
+                        return session_command_response(ResponsePayload::err(
+                            error_code::NOT_FOUND,
+                            format!("named session `{selector}` not found"),
+                        ));
+                    };
+                    let mut meta = unavailable.meta;
+                    meta.updated_at_ms = unix_time_ms();
+                    let incarnation = match state.alloc_session_incarnation() {
+                        Ok(incarnation) => incarnation,
+                        Err(error) => {
+                            return session_command_response(ResponsePayload::err(
+                                error_code::INTERNAL,
+                                error.to_string(),
+                            ));
+                        }
+                    };
+                    let durable = match persist_named_session(
+                        db,
+                        &meta,
+                        scope,
+                        &unavailable.defaults,
+                    )
+                    .await
+                    {
+                        Ok(durable) => durable,
+                        Err(error) => {
+                            return session_command_response(ResponsePayload::err(
+                                error_code::INTERNAL,
+                                format!("refresh named session: {error}"),
+                            ));
+                        }
+                    };
+                    meta.scope_durable = durable;
+                    state.unavailable_named_sessions.remove(&id);
+                    let key = named_session_key(&id);
+                    state.sessions.insert(
+                        key.clone(),
+                        SessionState {
+                            scope,
+                            incarnation,
+                            defaults: unavailable.defaults,
+                            connected_clients: 0,
+                            disconnected_at: None,
+                            named: Some(meta),
+                        },
+                    );
+                    let binding = bind_client_to_ready_session(state, client_id, &key)
+                        .expect("refreshed named session must be bindable");
+                    let info = ready_session_info(state, &key, client_id)
+                        .expect("refreshed named session must have metadata");
+                    SessionCommandResult {
+                        payload: ResponsePayload::Ok(OkPayload::SessionInfo(Box::new(info))),
+                        binding: Some(binding),
+                    }
+                }
+            }
+        }
+
+        SessionCommand::Info { selector } => {
+            let location = if let Some(selector) = selector {
+                find_named_session(state, &selector)
+            } else {
+                let current_key = state.client_sessions.get(&client_id);
+                current_key.and_then(|key| {
+                    state
+                        .sessions
+                        .get(key)
+                        .and_then(|session| session.named.as_ref())
+                        .map(|_| NamedSessionLocation::Ready(key.clone()))
+                })
+            };
+            let Some(location) = location else {
+                return session_command_response(ResponsePayload::err(
+                    error_code::NOT_FOUND,
+                    "client is not attached to a named session",
+                ));
+            };
+            let info = match location {
+                NamedSessionLocation::Ready(key) => ready_session_info(state, &key, client_id),
+                NamedSessionLocation::NeedsRefresh(id) => {
+                    unavailable_session_info(state, &id, client_id)
+                }
+            };
+            match info {
+                Some(info) => session_command_response(ResponsePayload::Ok(
+                    OkPayload::SessionInfo(Box::new(info)),
+                )),
+                None => session_command_response(ResponsePayload::err(
+                    error_code::NOT_FOUND,
+                    "named session not found",
+                )),
+            }
+        }
+    }
+}
+
+fn session_command_response(payload: ResponsePayload) -> SessionCommandResult {
+    SessionCommandResult {
+        payload,
+        binding: None,
+    }
+}
+
+async fn set_named_session_archived(
+    state: &mut SchedulerState,
+    db: &storage::SharedConnection,
+    client_id: u64,
+    selector: &str,
+    archive: bool,
+) -> SessionCommandResult {
+    let Some(location) = find_named_session(state, selector) else {
+        return session_command_response(ResponsePayload::err(
+            error_code::NOT_FOUND,
+            format!("named session `{selector}` not found"),
+        ));
+    };
+    let (id, archived_at_ms) = match &location {
+        NamedSessionLocation::Ready(key) => {
+            let Some(meta) = state
+                .sessions
+                .get(key)
+                .and_then(|session| session.named.as_ref())
+            else {
+                return session_command_response(ResponsePayload::err(
+                    error_code::INTERNAL,
+                    "named session metadata disappeared",
+                ));
+            };
+            (meta.id.clone(), meta.archived_at_ms)
+        }
+        NamedSessionLocation::NeedsRefresh(id) => {
+            let Some(session) = state.unavailable_named_sessions.get(id) else {
+                return session_command_response(ResponsePayload::err(
+                    error_code::INTERNAL,
+                    "named session metadata disappeared",
+                ));
+            };
+            (session.meta.id.clone(), session.meta.archived_at_ms)
+        }
+    };
+
+    if archive == archived_at_ms.is_some() {
+        return session_info_for_location(state, &location, client_id).map_or_else(
+            || {
+                session_command_response(ResponsePayload::err(
+                    error_code::INTERNAL,
+                    "named session metadata disappeared",
+                ))
+            },
+            |info| {
+                session_command_response(ResponsePayload::Ok(OkPayload::SessionInfo(Box::new(
+                    info,
+                ))))
+            },
+        );
+    }
+
+    if archive && let Some(blocker) = named_session_archive_blocker(state, &id) {
+        return session_command_response(ResponsePayload::err(error_code::INVALID_STATE, blocker));
+    }
+
+    let now = unix_time_ms();
+    let next_archived_at_ms = archive.then_some(now);
+    let stored_id = id.clone();
+    if let Err(error) = storage::with_connection(db, move |conn| {
+        storage::set_session_archived_at(conn, &stored_id, next_archived_at_ms, now)
+    })
+    .await
+    {
+        return session_command_response(ResponsePayload::err(
+            error_code::INTERNAL,
+            format!("persist named session lifecycle: {error}"),
+        ));
+    }
+
+    match &location {
+        NamedSessionLocation::Ready(key) => {
+            let meta = state
+                .sessions
+                .get_mut(key)
+                .and_then(|session| session.named.as_mut())
+                .expect("persisted ready named session must still exist");
+            meta.archived_at_ms = next_archived_at_ms;
+            meta.updated_at_ms = now;
+        }
+        NamedSessionLocation::NeedsRefresh(id) => {
+            let meta = &mut state
+                .unavailable_named_sessions
+                .get_mut(id)
+                .expect("persisted unavailable named session must still exist")
+                .meta;
+            meta.archived_at_ms = next_archived_at_ms;
+            meta.updated_at_ms = now;
+        }
+    }
+
+    let info = session_info_for_location(state, &location, client_id)
+        .expect("updated named session must remain queryable");
+    session_command_response(ResponsePayload::Ok(OkPayload::SessionInfo(Box::new(info))))
+}
+
+fn session_info_for_location(
+    state: &SchedulerState,
+    location: &NamedSessionLocation,
+    client_id: u64,
+) -> Option<SessionInfo> {
+    match location {
+        NamedSessionLocation::Ready(key) => ready_session_info(state, key, client_id),
+        NamedSessionLocation::NeedsRefresh(id) => unavailable_session_info(state, id, client_id),
+    }
+}
+
+fn named_session_archive_blocker(state: &SchedulerState, session_id: &str) -> Option<String> {
+    if let Some(connected_clients) = state.sessions.values().find_map(|session| {
+        session
+            .named
+            .as_ref()
+            .filter(|meta| meta.id == session_id)
+            .map(|_| session.connected_clients)
+    }) && connected_clients > 0
+    {
+        return Some(format!(
+            "named session has {connected_clients} connected client(s); detach them before archiving"
+        ));
+    }
+    if let Some(job) = state
+        .jobs
+        .values()
+        .find(|job| job.session_id.as_deref() == Some(session_id) && !job.status.is_terminal())
+    {
+        return Some(format!(
+            "named session has non-terminal job {}; wait for or cancel it before archiving",
+            job.job_id
+        ));
+    }
+    if state
+        .pending_scripts
+        .values()
+        .any(|script| script.session_id.as_deref() == Some(session_id))
+    {
+        return Some(
+            "named session has pending script work; wait for or cancel it before archiving".into(),
+        );
+    }
+    if state
+        .chains
+        .values()
+        .any(|chain| chain.session_id.as_deref() == Some(session_id))
+    {
+        return Some(
+            "named session has pending chain work; wait for or cancel it before archiving".into(),
+        );
+    }
+    if state
+        .crons
+        .values()
+        .any(|cron| cron.session_id.as_deref() == Some(session_id))
+    {
+        return Some("named session owns a cron; remove it explicitly before archiving".into());
+    }
+    None
+}
+
+fn validate_session_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("session name must not be empty".into());
+    }
+    if name.trim() != name {
+        return Err("session name must not have leading or trailing whitespace".into());
+    }
+    if name.chars().count() > 64 {
+        return Err("session name must be at most 64 characters".into());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("session name must not contain control characters".into());
+    }
+    if name.starts_with("SS-") {
+        return Err("session names beginning with `SS-` are reserved for session ids".into());
+    }
+    Ok(())
+}
+
+fn find_named_session(state: &SchedulerState, selector: &str) -> Option<NamedSessionLocation> {
+    for (key, session) in &state.sessions {
+        let Some(named) = &session.named else {
+            continue;
+        };
+        if named.id == selector || named.name == selector {
+            return Some(NamedSessionLocation::Ready(key.clone()));
+        }
+    }
+    state
+        .unavailable_named_sessions
+        .iter()
+        .find(|(id, session)| *id == selector || session.meta.name == selector)
+        .map(|(id, _)| NamedSessionLocation::NeedsRefresh(id.clone()))
+}
+
+fn bind_client_to_ready_session(
+    state: &mut SchedulerState,
+    client_id: u64,
+    key: &str,
+) -> Option<SessionBinding> {
+    let old_session_id = state.client_sessions.get(&client_id).cloned();
+    let same_session = old_session_id.as_deref() == Some(key);
+    let target = state.sessions.get_mut(key)?;
+    if !same_session {
+        target.connected_clients += 1;
+    }
+    target.disconnected_at = None;
+    let named_id = target.named.as_ref()?.id.clone();
+    let scope = target.scope;
+    let incarnation = target.incarnation;
+    state.client_sessions.insert(client_id, key.to_string());
+    mark_replaced_session_disconnected(state, old_session_id, key);
+    Some(SessionBinding {
+        session_id: named_id.clone(),
+        named_session_id: Some(named_id),
+        scope,
+        incarnation,
+    })
+}
+
+async fn persist_named_session(
+    db: &storage::SharedConnection,
+    meta: &NamedSessionMeta,
+    scope: ScopeHash,
+    defaults: &LaunchDefaults,
+) -> anyhow::Result<bool> {
+    let stored = storage::StoredSession {
+        id: meta.id.clone(),
+        name: meta.name.clone(),
+        scope_hash: Some(scope),
+        pty_default: defaults.pty,
+        wrapper_enabled: defaults.wrapper_enabled,
+        created_at_ms: meta.created_at_ms,
+        updated_at_ms: meta.updated_at_ms,
+        archived_at_ms: meta.archived_at_ms,
+    };
+    storage::with_connection(db, move |conn| storage::upsert_session(conn, &stored))
+        .await
+        .map_err(|error| anyhow::anyhow!("persist session {}: {error}", meta.id))
+}
+
+async fn update_client_session_scope(
+    state: &mut SchedulerState,
+    client_id: u64,
+    scope: ScopeHash,
+    db: &storage::SharedConnection,
+) -> anyhow::Result<()> {
+    let key = state
+        .client_sessions
+        .get(&client_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("client session handshake required"))?;
+    let session = state
+        .sessions
+        .get(&key)
+        .ok_or_else(|| anyhow::anyhow!("client session is unavailable"))?;
+    let Some(mut meta) = session.named.clone() else {
+        state
+            .sessions
+            .get_mut(&key)
+            .expect("anonymous session exists")
+            .scope = scope;
+        return Ok(());
+    };
+    let defaults = session.defaults.clone();
+    meta.updated_at_ms = unix_time_ms();
+    let durable = persist_named_session(db, &meta, scope, &defaults).await?;
+    meta.scope_durable = durable;
+    let session = state
+        .sessions
+        .get_mut(&key)
+        .ok_or_else(|| anyhow::anyhow!("named session disappeared during scope update"))?;
+    session.scope = scope;
+    session.named = Some(meta);
+    Ok(())
+}
+
+fn named_session_list(
+    state: &SchedulerState,
+    client_id: u64,
+    filter: NamedSessionListFilter,
+) -> Vec<SessionInfo> {
+    let mut sessions = Vec::new();
+    for key in state.sessions.keys() {
+        if let Some(info) = ready_session_info(state, key, client_id) {
+            sessions.push(info);
+        }
+    }
+    for id in state.unavailable_named_sessions.keys() {
+        if let Some(info) = unavailable_session_info(state, id, client_id) {
+            sessions.push(info);
+        }
+    }
+    sessions.retain(|session| match filter {
+        NamedSessionListFilter::Active => session.archived_at_ms.is_none(),
+        NamedSessionListFilter::Archived => session.archived_at_ms.is_some(),
+        NamedSessionListFilter::All => true,
+    });
+    sessions.sort_by(|left, right| {
+        left.created_at_ms
+            .cmp(&right.created_at_ms)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    sessions
+}
+
+fn ready_session_info(state: &SchedulerState, key: &str, client_id: u64) -> Option<SessionInfo> {
+    let session = state.sessions.get(key)?;
+    let named = session.named.as_ref()?;
+    Some(SessionInfo {
+        id: named.id.clone(),
+        name: named.name.clone(),
+        scope_state: if named.scope_durable {
+            SessionScopeState::ReadyDurable
+        } else {
+            SessionScopeState::ReadyVolatile
+        },
+        scope_hash: Some(session.scope.to_string()),
+        connected_clients: session.connected_clients,
+        restart_safe: named.scope_durable,
+        current: state
+            .client_sessions
+            .get(&client_id)
+            .is_some_and(|id| id == key),
+        created_at_ms: named.created_at_ms,
+        updated_at_ms: named.updated_at_ms,
+        archived_at_ms: named.archived_at_ms,
+    })
+}
+
+fn unavailable_session_info(
+    state: &SchedulerState,
+    id: &str,
+    _client_id: u64,
+) -> Option<SessionInfo> {
+    let session = state.unavailable_named_sessions.get(id)?;
+    Some(SessionInfo {
+        id: session.meta.id.clone(),
+        name: session.meta.name.clone(),
+        scope_state: SessionScopeState::NeedsRefresh,
+        scope_hash: None,
+        connected_clients: 0,
+        restart_safe: false,
+        current: false,
+        created_at_ms: session.meta.created_at_ms,
+        updated_at_ms: session.meta.updated_at_ms,
+        archived_at_ms: session.meta.archived_at_ms,
+    })
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn mark_replaced_session_disconnected(
@@ -1129,7 +2227,8 @@ fn sweep_disconnected_sessions(state: &mut SchedulerState) -> usize {
     let now = Instant::now();
     let before = state.sessions.len();
     state.sessions.retain(|_, session| {
-        session.connected_clients > 0
+        session.named.is_some()
+            || session.connected_clients > 0
             || session
                 .disconnected_at
                 .is_none_or(|disconnected_at| now.duration_since(disconnected_at) < SESSION_GC_TTL)
@@ -1190,7 +2289,7 @@ async fn publish_job_created(
     start_scope: ScopeHash,
     open_hint: JobOpenHint,
 ) {
-    let (chain_id, chain_index, chain_total) = state
+    let (chain_id, chain_index, chain_total, session_id) = state
         .jobs
         .get(&job_id)
         .map(|entry| {
@@ -1198,10 +2297,11 @@ async fn publish_job_created(
                 entry.chain_id.map(|id| id.to_string()),
                 entry.chain_index,
                 entry.chain_total,
+                entry.session_id.clone(),
             )
         })
-        .unwrap_or((None, None, None));
-    publish_event(
+        .unwrap_or((None, None, None, None));
+    publish_session_event(
         sys,
         EventChannel::Jobs,
         EventPayload::JobCreated {
@@ -1213,6 +2313,7 @@ async fn publish_job_created(
             chain_index,
             chain_total,
         },
+        session_id,
     )
     .await;
 }
@@ -1225,12 +2326,18 @@ async fn publish_job_state_changed(
     new_state: JobStatus,
     end_scope: Option<ScopeHash>,
 ) {
-    let (chain_id, chain_index) = state
+    let (chain_id, chain_index, session_id) = state
         .jobs
         .get(&job_id)
-        .map(|entry| (entry.chain_id.map(|id| id.to_string()), entry.chain_index))
-        .unwrap_or((None, None));
-    publish_event(
+        .map(|entry| {
+            (
+                entry.chain_id.map(|id| id.to_string()),
+                entry.chain_index,
+                entry.session_id.clone(),
+            )
+        })
+        .unwrap_or((None, None, None));
+    publish_session_event(
         sys,
         EventChannel::Jobs,
         EventPayload::JobStateChanged {
@@ -1241,6 +2348,7 @@ async fn publish_job_state_changed(
             chain_id,
             chain_index,
         },
+        session_id,
     )
     .await;
 }
@@ -1294,11 +2402,16 @@ async fn publish_chain_progress(sys: &ActorSystem, state: &mut SchedulerState, c
     let Some(chain) = build_chain_info(state, chain_id) else {
         return;
     };
+    let session_id = state
+        .chains
+        .get(&chain_id)
+        .and_then(|entry| entry.session_id.clone());
     synchronize_pending_script_chain(state, chain_id, &chain);
-    publish_event(
+    publish_session_event(
         sys,
         EventChannel::Jobs,
         EventPayload::ChainProgress { chain },
+        session_id,
     )
     .await;
 }
@@ -1843,7 +2956,7 @@ struct ProcessJobContext {
 }
 
 impl ProcessJobContext {
-    fn process_job_options(&self) -> ProcessJobOptions {
+    fn process_job_options(&self, session_id: Option<String>) -> ProcessJobOptions {
         ProcessJobOptions {
             cwd_override: self.cwd_override.clone(),
             sandbox: self
@@ -1854,6 +2967,7 @@ impl ProcessJobContext {
             wrapper_enabled: self.wrapper_enabled,
             pty_enabled: self.launch.pty.unwrap_or(self.pty_default),
             direct_output_client: self.direct_output_client,
+            session_id,
         }
     }
 
@@ -1915,8 +3029,8 @@ impl ChainExecutionOptions {
         }
     }
 
-    fn process_job_options(&self) -> ProcessJobOptions {
-        self.process.process_job_options()
+    fn process_job_options(&self, session_id: Option<String>) -> ProcessJobOptions {
+        self.process.process_job_options(session_id)
     }
 }
 
@@ -1926,6 +3040,7 @@ struct SpawnChainRequest {
     options: ChainExecutionOptions,
     warnings: Vec<String>,
     retain_completed_chain: bool,
+    session_id: Option<String>,
 }
 
 struct ChainAdvance {
@@ -2118,6 +3233,7 @@ async fn set_job_terminal_state(
 fn job_info_from_entry(entry: &JobEntry) -> JobInfo {
     JobInfo {
         id: entry.job_id.to_string(),
+        session_id: entry.session_id.clone(),
         status: entry.status.clone(),
         pipeline: entry.pipeline_text.clone(),
         exit_code: entry.exit_code,
@@ -2217,6 +3333,7 @@ async fn fire_due_crons(
         let schedule = entry.schedule.clone();
         let is_oneshot = schedule.is_oneshot();
         let options = ChainExecutionOptions::from_cron_entry(entry);
+        let session_id = entry.session_id.clone();
 
         info!(%cron_id, "scheduler: cron triggered");
         let warnings = match check_chain_guardrails(&chain, config) {
@@ -2235,6 +3352,7 @@ async fn fire_due_crons(
                 options,
                 warnings,
                 retain_completed_chain: false,
+                session_id: session_id.clone(),
             },
             state,
             SchedulerIo::new(db, sys),
@@ -2253,13 +3371,14 @@ async fn fire_due_crons(
             _ => None,
         };
         if let Some(job_id) = first_job_id {
-            publish_event(
+            publish_session_event(
                 sys,
                 EventChannel::Crons,
                 EventPayload::CronTriggered {
                     cron_id: cron_id.to_string(),
                     job_id,
                 },
+                session_id,
             )
             .await;
         }
@@ -2314,6 +3433,7 @@ async fn spawn_chain(
         options,
         warnings,
         retain_completed_chain,
+        session_id,
     } = request;
 
     if options.scope_enabled
@@ -2340,6 +3460,7 @@ async fn spawn_chain(
                     jid,
                     JobEntry {
                         job_id: jid,
+                        session_id: session_id.clone(),
                         pipeline_text: leaf.pipeline_text.clone(),
                         status: JobStatus::Running,
                         exit_code: None,
@@ -2387,6 +3508,7 @@ async fn spawn_chain(
                     jid,
                     JobEntry {
                         job_id: jid,
+                        session_id: session_id.clone(),
                         pipeline_text: leaf.pipeline_text.clone(),
                         status: JobStatus::Running,
                         exit_code: None,
@@ -2467,6 +3589,7 @@ async fn spawn_chain(
                             jid,
                             JobEntry {
                                 job_id: jid,
+                                session_id: session_id.clone(),
                                 pipeline_text: leaf.pipeline_text.clone(),
                                 status: JobStatus::Pending,
                                 exit_code: None,
@@ -2486,7 +3609,7 @@ async fn spawn_chain(
                             PendingResourceAdmission {
                                 plan: leaf.plan.clone(),
                                 base_scope: scope_hash,
-                                options: options.process_job_options(),
+                                options: options.process_job_options(session_id.clone()),
                                 needs: needs.clone(),
                             },
                         );
@@ -2514,6 +3637,7 @@ async fn spawn_chain(
                             jid,
                             JobEntry {
                                 job_id: jid,
+                                session_id: session_id.clone(),
                                 pipeline_text: leaf.pipeline_text.clone(),
                                 status: JobStatus::Running,
                                 exit_code: None,
@@ -2541,7 +3665,7 @@ async fn spawn_chain(
                             jid,
                             leaf.plan.clone(),
                             spawn_scope,
-                            options.process_job_options(),
+                            options.process_job_options(session_id.clone()),
                         )
                         .await
                         {
@@ -2581,6 +3705,7 @@ async fn spawn_chain(
                             jid,
                             JobEntry {
                                 job_id: jid,
+                                session_id: session_id.clone(),
                                 pipeline_text: leaf.pipeline_text.clone(),
                                 status: JobStatus::Running,
                                 exit_code: None,
@@ -2645,6 +3770,7 @@ async fn spawn_chain(
         pipeline_text: chain_text,
         process: options.process.clone(),
         scope_enabled: options.scope_enabled,
+        session_id,
     };
     state.chains.insert(chain_id, chain_state);
 
@@ -2909,13 +4035,14 @@ async fn process_chain_advance(
         outcome.record_persist_error(error);
     }
 
-    let (leaves, chain_context) = {
+    let (leaves, chain_context, session_id) = {
         let Some(chain) = state.chains.get(&chain_id) else {
             return outcome;
         };
         (
             flatten_leaves(&chain.node),
             ChainExecutionOptions::from_chain(chain),
+            chain.session_id.clone(),
         )
     };
 
@@ -2940,6 +4067,7 @@ async fn process_chain_advance(
             jid,
             JobEntry {
                 job_id: jid,
+                session_id: session_id.clone(),
                 pipeline_text: leaves[idx].pipeline_text.clone(),
                 status: JobStatus::Running,
                 exit_code: None,
@@ -3023,7 +4151,7 @@ async fn process_chain_advance(
                 }
             }
             Ok(None) => {
-                let proc_options = chain_context.process_job_options();
+                let proc_options = chain_context.process_job_options(session_id.clone());
                 let needs = chain_context.process.needs().clone();
                 match admit_resource_scope(io.sys, jid, start_scope, &needs).await {
                     Ok(ResourceAdmission::Pending(reason)) => {
@@ -3198,6 +4326,16 @@ async fn handle_wait_command(
     state: &mut SchedulerState,
 ) -> Option<ResponsePayload> {
     if let Some(job_id) = parse_job_id(&id) {
+        let requester_session_id = state
+            .named_session_id_for_client(client_id)
+            .map(str::to_owned);
+        if let Err(response) = authorize_session_owned_target(
+            state,
+            requester_session_id.as_deref(),
+            SessionOwnedTarget::Job(job_id),
+        ) {
+            return Some(response.into_response());
+        }
         let Some(entry) = state.jobs.get(&job_id) else {
             return Some(ResponsePayload::err(
                 error_code::NOT_FOUND,
@@ -3268,6 +4406,9 @@ async fn start_pending_script_run(
         created_items: Vec::new(),
         last_exit_code: 0,
         waiting_index: None,
+        session_id: state
+            .named_session_id_for_client(client_id)
+            .map(str::to_owned),
     };
     submit_pending_script_next(pending, true, state, runtime).await
 }
@@ -3305,6 +4446,7 @@ async fn submit_pending_script_next(
             CommandExecutionContext {
                 scope_override: Some(pending.item_scope),
                 direct_output_client: Some(pending.client_id),
+                session_id: pending.session_id.clone(),
             },
         ))
         .await;
@@ -3345,6 +4487,7 @@ async fn submit_pending_script_next(
                         failed_item_index: Some(index),
                         items: &pending.created_items,
                         submit_error: submit_error.as_ref(),
+                        session_id: pending.session_id.as_deref(),
                     },
                 )
                 .await;
@@ -3370,10 +4513,12 @@ async fn submit_pending_script_next(
                 pending.created_items.push(created_item.clone());
                 if !respond_created {
                     publish_script_item_created(
+                        state,
                         runtime.io.sys,
                         pending.client_id,
                         pending.script_id,
                         created_item,
+                        pending.session_id.as_deref(),
                     )
                     .await;
                 }
@@ -3409,6 +4554,7 @@ async fn submit_pending_script_next(
                                 failed_item_index: Some(index),
                                 items: &pending.created_items,
                                 submit_error: None,
+                                session_id: pending.session_id.as_deref(),
                             },
                         )
                         .await;
@@ -3451,6 +4597,7 @@ async fn submit_pending_script_next(
                                     failed_item_index: Some(index),
                                     items: &pending.created_items,
                                     submit_error: None,
+                                    session_id: pending.session_id.as_deref(),
                                 },
                             )
                             .await;
@@ -3514,6 +4661,7 @@ async fn submit_pending_script_next(
                                     failed_item_index: Some(index),
                                     items: &pending.created_items,
                                     submit_error: None,
+                                    session_id: pending.session_id.as_deref(),
                                 },
                             )
                             .await;
@@ -3597,6 +4745,7 @@ async fn submit_pending_script_next(
             failed_item_index: None,
             items: &pending.created_items,
             submit_error: None,
+            session_id: pending.session_id.as_deref(),
         },
     )
     .await;
@@ -3709,6 +4858,7 @@ async fn finish_pending_script_failed(
             failed_item_index: failed_index,
             items: &pending.created_items,
             submit_error: None,
+            session_id: pending.session_id.as_deref(),
         },
     )
     .await;
@@ -3750,7 +4900,7 @@ fn immediate_script_item_exit_code(payload: &OkPayload, state: &SchedulerState) 
     }
 }
 
-fn script_info_response(id: &str, state: &mut SchedulerState) -> ResponsePayload {
+fn script_info_response(id: &str, client_id: u64, state: &mut SchedulerState) -> ResponsePayload {
     let Some(script_id) = parse_script_id(id) else {
         return ResponsePayload::err(
             error_code::INVALID_REQUEST,
@@ -3758,6 +4908,16 @@ fn script_info_response(id: &str, state: &mut SchedulerState) -> ResponsePayload
         );
     };
     prune_completed_script_snapshots(state, Instant::now());
+    let requester_session_id = state
+        .named_session_id_for_client(client_id)
+        .map(str::to_owned);
+    if let Err(response) = authorize_session_owned_target(
+        state,
+        requester_session_id.as_deref(),
+        SessionOwnedTarget::Script(script_id),
+    ) {
+        return response.into_response();
+    }
     if let Some(pending) = state.pending_scripts.get(&script_id) {
         let info = ScriptInfo {
             script_id: script_id.to_string(),
@@ -3797,7 +4957,11 @@ fn script_info_response(id: &str, state: &mut SchedulerState) -> ResponsePayload
     }
 }
 
-fn record_completed_script_snapshot(state: &mut SchedulerState, info: ScriptInfo) {
+fn record_completed_script_snapshot(
+    state: &mut SchedulerState,
+    info: ScriptInfo,
+    session_id: Option<String>,
+) {
     prune_completed_script_snapshots(state, Instant::now());
     let script_id = parse_script_id(&info.script_id).expect("scheduler created valid script id");
     let response_bytes = serialized_script_info_size(&info);
@@ -3810,6 +4974,7 @@ fn record_completed_script_snapshot(state: &mut SchedulerState, info: ScriptInfo
         script_id,
         CompletedScriptSnapshot {
             info,
+            session_id,
             completed_at: Instant::now(),
             response_bytes,
         },
@@ -3903,17 +5068,45 @@ fn script_created_response(
 }
 
 async fn publish_script_item_created(
+    state: &SchedulerState,
     sys: &ActorSystem,
     client_id: u64,
     script_id: ScriptId,
     item: ScriptItemInfo,
+    session_id: Option<&str>,
 ) {
     let payload = EventPayload::ScriptItemCreated {
         script_id: script_id.to_string(),
         item,
     };
-    send_actor_gateway_event("scheduler", sys, client_id, payload.clone()).await;
-    publish_event_except(sys, EventChannel::Jobs, payload, client_id).await;
+    if direct_client_can_receive_resource_event(state, client_id, session_id) {
+        send_actor_gateway_event(
+            "scheduler",
+            sys,
+            client_id,
+            payload.clone(),
+            session_id.map(str::to_owned),
+        )
+        .await;
+    }
+    publish_session_event_except(
+        sys,
+        EventChannel::Jobs,
+        payload,
+        session_id.map(str::to_owned),
+        client_id,
+    )
+    .await;
+}
+
+fn direct_client_can_receive_resource_event(
+    state: &SchedulerState,
+    client_id: u64,
+    session_id: Option<&str>,
+) -> bool {
+    state
+        .named_session_id_for_client(client_id)
+        .is_none_or(|attached| session_id == Some(attached))
 }
 
 struct ScriptCompletion<'a> {
@@ -3922,6 +5115,7 @@ struct ScriptCompletion<'a> {
     failed_item_index: Option<usize>,
     items: &'a [ScriptItemInfo],
     submit_error: Option<&'a ScriptSubmitError>,
+    session_id: Option<&'a str>,
 }
 
 async fn publish_script_finished(
@@ -3944,6 +5138,7 @@ async fn publish_script_finished(
             failed_item_index: completion.failed_item_index,
             submit_error: completion.submit_error.cloned(),
         },
+        completion.session_id.map(str::to_owned),
     );
     let payload = EventPayload::ScriptFinished {
         script_id: script_id.to_string(),
@@ -3951,8 +5146,24 @@ async fn publish_script_finished(
         exit_code: completion.exit_code,
         failed_item_index: completion.failed_item_index,
     };
-    send_actor_gateway_event("scheduler", sys, client_id, payload.clone()).await;
-    publish_event_except(sys, EventChannel::Jobs, payload, client_id).await;
+    if direct_client_can_receive_resource_event(state, client_id, completion.session_id) {
+        send_actor_gateway_event(
+            "scheduler",
+            sys,
+            client_id,
+            payload.clone(),
+            completion.session_id.map(str::to_owned),
+        )
+        .await;
+    }
+    publish_session_event_except(
+        sys,
+        EventChannel::Jobs,
+        payload,
+        completion.session_id.map(str::to_owned),
+        client_id,
+    )
+    .await;
 }
 
 async fn handle_command(
@@ -3999,6 +5210,18 @@ async fn handle_command_with_scope(
     sys: &ActorSystem,
     context: CommandExecutionContext,
 ) -> ResponsePayload {
+    let requester_session_id = context.session_id.clone().or_else(|| {
+        state
+            .named_session_id_for_client(client_id)
+            .map(str::to_owned)
+    });
+    if let Some(target) = session_owned_target_for_command(&cmd)
+        && let Err(response) =
+            authorize_session_owned_target(state, requester_session_id.as_deref(), target)
+    {
+        return response.into_response();
+    }
+
     match cmd {
         ResolvedCommand::Script { .. } => ResponsePayload::err(
             error_code::NOT_SUPPORTED,
@@ -4034,6 +5257,7 @@ async fn handle_command_with_scope(
                     options,
                     warnings,
                     retain_completed_chain: context.scope_override.is_some(),
+                    session_id: requester_session_id.clone(),
                 },
                 state,
                 SchedulerIo::new(db, sys),
@@ -4081,6 +5305,7 @@ async fn handle_command_with_scope(
                 cwd_override: None,
                 scope_enabled: options.scope_enabled,
                 wrapper_enabled: options.process.wrapper_enabled,
+                session_id: requester_session_id.clone(),
             };
             if let Err(error) = persist_cron_entry(db, &entry).await {
                 return ResponsePayload::err(error_code::INTERNAL, error.to_string());
@@ -4093,7 +5318,7 @@ async fn handle_command_with_scope(
             })
         }
 
-        ResolvedCommand::Fg { id } => {
+        ResolvedCommand::Fg { id, role } => {
             if let Some(job_id) = parse_job_id(&id) {
                 let Some(entry) = state.jobs.get(&job_id) else {
                     return ResponsePayload::err(
@@ -4114,6 +5339,7 @@ async fn handle_command_with_scope(
                     .send(ProcessMgrMsg::AttachFg {
                         client_id,
                         job_id,
+                        role,
                         reply: tx,
                     })
                     .await
@@ -4123,7 +5349,7 @@ async fn handle_command_with_scope(
                 }
 
                 match rx.await {
-                    Ok(Ok(())) => ResponsePayload::Ok(OkPayload::FgAttached { id }),
+                    Ok(Ok(info)) => ResponsePayload::Ok(OkPayload::FgAttached(Box::new(info))),
                     Ok(Err(message)) => ResponsePayload::err(error_code::INVALID_STATE, message),
                     Err(_) => {
                         ResponsePayload::err(error_code::INTERNAL, "process_mgr reply dropped")
@@ -4363,23 +5589,23 @@ async fn handle_command_with_scope(
         }
 
         ResolvedCommand::Jobs => {
-            let list = sorted_job_list(state);
+            let list = sorted_job_list_for_client(state, client_id);
             ResponsePayload::Ok(OkPayload::JobList(list))
         }
 
         ResolvedCommand::ListJobs { limit } => {
-            let list = sorted_job_list(state);
+            let list = sorted_job_list_for_client(state, client_id);
             let (jobs, page) = page_items(list, limit);
             ResponsePayload::Ok(OkPayload::JobListPage { jobs, page })
         }
 
         ResolvedCommand::Crons => {
-            let list = sorted_cron_list(state);
+            let list = sorted_cron_list_for_client(state, client_id);
             ResponsePayload::Ok(OkPayload::CronList(list))
         }
 
         ResolvedCommand::ListCrons { limit } => {
-            let list = sorted_cron_list(state);
+            let list = sorted_cron_list_for_client(state, client_id);
             let (crons, page) = page_items(list, limit);
             ResponsePayload::Ok(OkPayload::CronListPage { crons, page })
         }
@@ -4435,8 +5661,13 @@ async fn handle_command_with_scope(
                     };
                     match derive_scope(sys, base, delta).await {
                         Ok(hash) => {
-                            if let Some(session) = state.session_for_client_mut(client_id) {
-                                session.scope = hash;
+                            if let Err(error) =
+                                update_client_session_scope(state, client_id, hash, db).await
+                            {
+                                return ResponsePayload::err(
+                                    error_code::INTERNAL,
+                                    error.to_string(),
+                                );
                             }
                             match get_scope_snapshot_by_hash(sys, hash).await {
                                 Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
@@ -4463,8 +5694,13 @@ async fn handle_command_with_scope(
                     };
                     match derive_scope(sys, base, delta).await {
                         Ok(hash) => {
-                            if let Some(session) = state.session_for_client_mut(client_id) {
-                                session.scope = hash;
+                            if let Err(error) =
+                                update_client_session_scope(state, client_id, hash, db).await
+                            {
+                                return ResponsePayload::err(
+                                    error_code::INTERNAL,
+                                    error.to_string(),
+                                );
                             }
                             match get_scope_snapshot_by_hash(sys, hash).await {
                                 Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
@@ -4503,23 +5739,31 @@ async fn handle_command_with_scope(
 
         ResolvedCommand::Quit => ResponsePayload::ack(),
 
-        ResolvedCommand::Wrap { subcommand } => handle_session_bool_default(
-            state,
-            client_id,
-            subcommand.as_deref(),
-            "wrapper",
-            config.wrapper.enabled,
-            |defaults| &mut defaults.wrapper_enabled,
-        ),
+        ResolvedCommand::Wrap { subcommand } => {
+            handle_session_bool_default(
+                state,
+                client_id,
+                db,
+                subcommand.as_deref(),
+                "wrapper",
+                config.wrapper.enabled,
+                |defaults| &mut defaults.wrapper_enabled,
+            )
+            .await
+        }
 
-        ResolvedCommand::Pty { subcommand } => handle_session_bool_default(
-            state,
-            client_id,
-            subcommand.as_deref(),
-            "pty",
-            true,
-            |defaults| &mut defaults.pty,
-        ),
+        ResolvedCommand::Pty { subcommand } => {
+            handle_session_bool_default(
+                state,
+                client_id,
+                db,
+                subcommand.as_deref(),
+                "pty",
+                true,
+                |defaults| &mut defaults.pty,
+            )
+            .await
+        }
 
         ResolvedCommand::Cd { path } => {
             let snapshot = match get_session_snapshot(sys, state, client_id).await {
@@ -4560,8 +5804,10 @@ async fn handle_command_with_scope(
             };
             match derive_scope(sys, base, delta).await {
                 Ok(hash) => {
-                    if let Some(session) = state.session_for_client_mut(client_id) {
-                        session.scope = hash;
+                    if let Err(error) =
+                        update_client_session_scope(state, client_id, hash, db).await
+                    {
+                        return ResponsePayload::err(error_code::INTERNAL, error.to_string());
                     }
                     match get_scope_snapshot_by_hash(sys, hash).await {
                         Ok(updated) => ResponsePayload::Ok(OkPayload::ScopeCreated {
@@ -4620,6 +5866,7 @@ async fn handle_command_with_scope(
                 if sys
                     .process_mgr
                     .send(ProcessMgrMsg::SendJobInput {
+                        client_id,
                         job_id,
                         data: data.into_bytes(),
                         reply: tx,
@@ -4663,6 +5910,7 @@ async fn handle_command_with_scope(
                     format!("job {job_id} has no recorded start scope"),
                 );
             };
+            let retry_session_id = entry.session_id.clone();
             let chain = match parse_chain_text(&entry.pipeline_text) {
                 Ok(chain) => chain,
                 Err(error) => {
@@ -4682,6 +5930,9 @@ async fn handle_command_with_scope(
                     options: ChainExecutionOptions::retry_default(config),
                     warnings: Vec::new(),
                     retain_completed_chain: false,
+                    // A retry is a new execution of the original job, not a
+                    // transfer to whichever session happens to issue it.
+                    session_id: retry_session_id,
                 },
                 state,
                 SchedulerIo::new(db, sys),
@@ -4695,7 +5946,7 @@ async fn handle_command_with_scope(
         ),
 
         ResolvedCommand::Log { id } => {
-            let text = format_log_text(state, id.as_deref());
+            let text = format_log_text(state, id.as_deref(), requester_session_id.as_deref());
             ResponsePayload::Ok(OkPayload::EvalText { text })
         }
 
@@ -4707,7 +5958,7 @@ async fn handle_command_with_scope(
             if let Some(response) = invalid_tail_bytes_response("tail_bytes", tail_bytes) {
                 return response;
             }
-            let text = format_log_text(state, id.as_deref());
+            let text = format_log_text(state, id.as_deref(), requester_session_id.as_deref());
             let (text, truncated) = limit_text(text, limit, tail_bytes);
             text_output_response(text, truncated)
         }
@@ -4859,37 +6110,41 @@ async fn ensure_test_session(state: &mut SchedulerState, _sys: &ActorSystem, cli
             defaults: LaunchDefaults::default(),
             connected_clients: 1,
             disconnected_at: None,
+            named: None,
         },
     );
 }
 
-fn handle_session_bool_default(
+async fn handle_session_bool_default(
     state: &mut SchedulerState,
     client_id: u64,
+    db: &storage::SharedConnection,
     subcommand: Option<&str>,
     name: &str,
     config_default: bool,
     field: impl FnOnce(&mut LaunchDefaults) -> &mut Option<bool>,
 ) -> ResponsePayload {
-    let Some(session) = state.session_for_client_mut(client_id) else {
+    let Some(key) = state.client_sessions.get(&client_id).cloned() else {
         return ResponsePayload::err(
             error_code::INVALID_REQUEST,
             "client session handshake required",
         );
     };
-    let default = field(&mut session.defaults);
-    match subcommand.unwrap_or("status") {
+    let Some(session) = state.sessions.get(&key) else {
+        return ResponsePayload::err(error_code::INVALID_STATE, "client session unavailable");
+    };
+    let mut defaults = session.defaults.clone();
+    let scope = session.scope;
+    let mut meta = session.named.clone();
+    let default = field(&mut defaults);
+    let response_text = match subcommand.unwrap_or("status") {
         "on" => {
             *default = Some(true);
-            ResponsePayload::Ok(OkPayload::EvalText {
-                text: format!("{name} enabled for this session"),
-            })
+            format!("{name} enabled for this session")
         }
         "off" => {
             *default = Some(false);
-            ResponsePayload::Ok(OkPayload::EvalText {
-                text: format!("{name} disabled for this session"),
-            })
+            format!("{name} disabled for this session")
         }
         "" | "status" => {
             let effective = default.unwrap_or(config_default);
@@ -4898,18 +6153,44 @@ fn handle_session_bool_default(
                 Some(false) => "session override: off",
                 None => "config",
             };
-            ResponsePayload::Ok(OkPayload::EvalText {
+            return ResponsePayload::Ok(OkPayload::EvalText {
                 text: format!(
                     "{name} status: {}\n  source: {source}",
                     if effective { "enabled" } else { "disabled" }
                 ),
-            })
+            });
         }
-        other => ResponsePayload::err(
-            error_code::INVALID_SYNTAX,
-            format!(":{name} {other} — expected 'on', 'off', or 'status'"),
-        ),
+        other => {
+            return ResponsePayload::err(
+                error_code::INVALID_SYNTAX,
+                format!(":{name} {other} — expected 'on', 'off', or 'status'"),
+            );
+        }
+    };
+
+    if let Some(mut named) = meta.take() {
+        named.updated_at_ms = unix_time_ms();
+        match persist_named_session(db, &named, scope, &defaults).await {
+            Ok(durable) => {
+                named.scope_durable = durable;
+                meta = Some(named);
+            }
+            Err(error) => {
+                return ResponsePayload::err(error_code::INTERNAL, error.to_string());
+            }
+        }
     }
+    let Some(session) = state.sessions.get_mut(&key) else {
+        return ResponsePayload::err(
+            error_code::INTERNAL,
+            "session disappeared while updating defaults",
+        );
+    };
+    session.defaults = defaults;
+    session.named = meta;
+    ResponsePayload::Ok(OkPayload::EvalText {
+        text: response_text,
+    })
 }
 
 /// Parse a string like `"J5"` into a `JobId`.
@@ -5249,6 +6530,20 @@ fn sorted_job_list(state: &SchedulerState) -> Vec<JobInfo> {
     entries.into_iter().map(job_info_from_entry).collect()
 }
 
+fn sorted_job_list_for_client(state: &SchedulerState, client_id: u64) -> Vec<JobInfo> {
+    let Some(session_id) = state.named_session_id_for_client(client_id) else {
+        // Anonymous v2 clients retain the daemon-global compatibility view.
+        return sorted_job_list(state);
+    };
+    let mut entries = state
+        .jobs
+        .values()
+        .filter(|entry| entry.session_id.as_deref() == Some(session_id))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.job_id.0);
+    entries.into_iter().map(job_info_from_entry).collect()
+}
+
 fn sorted_cron_list(state: &SchedulerState) -> Vec<CronInfo> {
     let mut entries: Vec<&CronEntry> = state.crons.values().collect();
     entries.sort_by_key(|entry| entry.cron_id.0);
@@ -5256,6 +6551,29 @@ fn sorted_cron_list(state: &SchedulerState) -> Vec<CronInfo> {
         .into_iter()
         .map(|cron| CronInfo {
             id: cron.cron_id.to_string(),
+            session_id: cron.session_id.clone(),
+            schedule: cron.schedule.display(),
+            command: cron.chain.to_string(),
+            status: cron.status,
+        })
+        .collect()
+}
+
+fn sorted_cron_list_for_client(state: &SchedulerState, client_id: u64) -> Vec<CronInfo> {
+    let Some(session_id) = state.named_session_id_for_client(client_id) else {
+        return sorted_cron_list(state);
+    };
+    let mut entries = state
+        .crons
+        .values()
+        .filter(|entry| entry.session_id.as_deref() == Some(session_id))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.cron_id.0);
+    entries
+        .into_iter()
+        .map(|cron| CronInfo {
+            id: cron.cron_id.to_string(),
+            session_id: cron.session_id.clone(),
             schedule: cron.schedule.display(),
             command: cron.chain.to_string(),
             status: cron.status,
@@ -5364,7 +6682,11 @@ fn tail_utf8(text: &str, max_bytes: usize) -> (String, bool) {
 /// Build a human-readable log of jobs and crons.
 ///
 /// If `id` is given, only log for that specific job or cron is shown.
-fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
+fn format_log_text(
+    state: &SchedulerState,
+    id: Option<&str>,
+    requester_session_id: Option<&str>,
+) -> String {
     if let Some(id) = id {
         if let Some(job_id) = parse_job_id(id) {
             return state
@@ -5401,7 +6723,13 @@ fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
 
     let mut lines = Vec::new();
 
-    let mut jobs: Vec<&JobEntry> = state.jobs.values().collect();
+    let mut jobs: Vec<&JobEntry> = state
+        .jobs
+        .values()
+        .filter(|entry| {
+            requester_session_id.is_none() || entry.session_id.as_deref() == requester_session_id
+        })
+        .collect();
     jobs.sort_by_key(|j| j.job_id.0);
     if jobs.is_empty() {
         lines.push("jobs: none".into());
@@ -5415,7 +6743,13 @@ fn format_log_text(state: &SchedulerState, id: Option<&str>) -> String {
         }
     }
 
-    let mut crons: Vec<&CronEntry> = state.crons.values().collect();
+    let mut crons: Vec<&CronEntry> = state
+        .crons
+        .values()
+        .filter(|entry| {
+            requester_session_id.is_none() || entry.session_id.as_deref() == requester_session_id
+        })
+        .collect();
     crons.sort_by_key(|c| c.cron_id.0);
     if crons.is_empty() {
         lines.push("crons: none".into());
@@ -5847,6 +7181,81 @@ mod tests {
         ))
     }
 
+    fn insert_anonymous_test_client(state: &mut SchedulerState, client_id: u64, scope: ScopeHash) {
+        let key = ephemeral_session_key(&format!("test-{client_id}"));
+        state.sessions.insert(
+            key.clone(),
+            SessionState {
+                scope,
+                incarnation: client_id,
+                defaults: LaunchDefaults::default(),
+                connected_clients: 1,
+                disconnected_at: None,
+                named: None,
+            },
+        );
+        state.client_sessions.insert(client_id, key);
+    }
+
+    fn insert_ready_named_test_session(
+        conn: &Arc<Mutex<Connection>>,
+        state: &mut SchedulerState,
+        id: &str,
+        name: &str,
+        scope: ScopeHash,
+        connected_clients: usize,
+    ) {
+        storage::upsert_session(
+            &conn.lock().unwrap(),
+            &storage::StoredSession {
+                id: id.into(),
+                name: name.into(),
+                scope_hash: Some(scope),
+                pty_default: None,
+                wrapper_enabled: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                archived_at_ms: None,
+            },
+        )
+        .expect("persist named session fixture");
+        state.sessions.insert(
+            named_session_key(id),
+            SessionState {
+                scope,
+                incarnation: 1,
+                defaults: LaunchDefaults::default(),
+                connected_clients,
+                disconnected_at: None,
+                named: Some(NamedSessionMeta {
+                    id: id.into(),
+                    name: name.into(),
+                    scope_durable: true,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    archived_at_ms: None,
+                }),
+            },
+        );
+    }
+
+    async fn archive_test_session(
+        state: &mut SchedulerState,
+        conn: &storage::SharedConnection,
+        client_id: u64,
+        selector: &str,
+    ) -> SessionCommandResult {
+        handle_session_command(
+            client_id,
+            SessionCommand::Archive {
+                selector: selector.into(),
+            },
+            state,
+            conn,
+        )
+        .await
+    }
+
     fn insert_test_scope(conn: &Arc<Mutex<Connection>>, name: &str) -> ScopeHash {
         let scope = Scope::root(EnvSnapshot {
             env: std::collections::BTreeMap::from([("PATH".into(), "/usr/bin".into())]),
@@ -5912,6 +7321,7 @@ mod tests {
             options,
             warnings: Vec::new(),
             retain_completed_chain: false,
+            session_id: None,
         }
     }
 
@@ -6101,6 +7511,7 @@ mod tests {
                 defaults: LaunchDefaults::default(),
                 connected_clients: 1,
                 disconnected_at: None,
+                named: None,
             },
         );
         state.chains.insert(
@@ -6119,12 +7530,14 @@ mod tests {
                     direct_output_client: None,
                 },
                 scope_enabled: false,
+                session_id: None,
             },
         );
         state.jobs.insert(
             JobId(1),
             JobEntry {
                 job_id: JobId(1),
+                session_id: None,
                 pipeline_text: "echo retained".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -6149,6 +7562,7 @@ mod tests {
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
+                session_id: None,
             },
         );
         state.pending_scripts.insert(
@@ -6164,6 +7578,7 @@ mod tests {
                 created_items: Vec::new(),
                 last_exit_code: 0,
                 waiting_index: None,
+                session_id: None,
             },
         );
         state.completed_chains.insert(
@@ -6187,6 +7602,7 @@ mod tests {
                     wrapper_enabled: false,
                     pty_enabled: false,
                     direct_output_client: None,
+                    session_id: None,
                 },
                 needs: Need::new(),
             },
@@ -6206,6 +7622,7 @@ mod tests {
                 defaults: LaunchDefaults::default(),
                 connected_clients: 0,
                 disconnected_at: Instant::now().checked_sub(SESSION_GC_TTL),
+                named: None,
             },
         );
         state.sessions.insert(
@@ -6216,6 +7633,7 @@ mod tests {
                 defaults: LaunchDefaults::default(),
                 connected_clients: 1,
                 disconnected_at: None,
+                named: None,
             },
         );
 
@@ -6280,11 +7698,18 @@ mod tests {
         assert!(error.to_string().contains("scope_store unreachable"));
         assert_eq!(
             state.client_sessions.get(&7).map(String::as_str),
-            Some("old-session")
+            Some(ephemeral_session_key("old-session").as_str())
         );
         assert_eq!(state.client_scope(7), Some(old_scope));
-        assert_eq!(state.sessions["old-session"].connected_clients, 1);
-        assert!(state.sessions["old-session"].disconnected_at.is_none());
+        assert_eq!(
+            state.sessions[&ephemeral_session_key("old-session")].connected_clients,
+            1
+        );
+        assert!(
+            state.sessions[&ephemeral_session_key("old-session")]
+                .disconnected_at
+                .is_none()
+        );
         assert!(!state.sessions.contains_key("new-session"));
     }
 
@@ -6323,7 +7748,10 @@ mod tests {
             snapshot.env.get("NODE_VERSION").map(String::as_str),
             Some("24")
         );
-        assert_eq!(state.sessions["sticky-session"].connected_clients, 1);
+        assert_eq!(
+            state.sessions[&ephemeral_session_key("sticky-session")].connected_clients,
+            1
+        );
     }
 
     #[tokio::test]
@@ -6344,7 +7772,7 @@ mod tests {
         disconnect_session(7, &mut state);
         state
             .sessions
-            .get_mut("reused-session")
+            .get_mut(&ephemeral_session_key("reused-session"))
             .unwrap()
             .disconnected_at = Instant::now().checked_sub(SESSION_GC_TTL);
         assert_eq!(sweep_disconnected_sessions(&mut state), 1);
@@ -6411,7 +7839,10 @@ mod tests {
 
         assert_ne!(refreshed, initial);
         assert_eq!(state.client_scope(7), Some(refreshed.scope));
-        assert_eq!(state.sessions["refreshable-session"].connected_clients, 1);
+        assert_eq!(
+            state.sessions[&ephemeral_session_key("refreshable-session")].connected_clients,
+            1
+        );
         let snapshot = get_scope_snapshot_by_hash(&sys, refreshed.scope)
             .await
             .expect("refreshed scope snapshot");
@@ -6498,6 +7929,7 @@ mod tests {
             job_id,
             JobEntry {
                 job_id,
+                session_id: None,
                 pipeline_text: "sleep 60".into(),
                 status: JobStatus::Running,
                 exit_code: None,
@@ -6559,6 +7991,7 @@ mod tests {
                     cwd_override: None,
                     scope_enabled: false,
                     wrapper_enabled: false,
+                    session_id: None,
                 },
             );
         }
@@ -6645,6 +8078,29 @@ mod tests {
                             failed_item_index,
                         },
                     channel,
+                    excluded_client_id: _,
+                }
+                | EventBusMsg::PublishSession {
+                    payload:
+                        EventPayload::ScriptFinished {
+                            script_id,
+                            status,
+                            exit_code,
+                            failed_item_index,
+                        },
+                    channel,
+                    session_id: _,
+                }
+                | EventBusMsg::PublishSessionExcept {
+                    payload:
+                        EventPayload::ScriptFinished {
+                            script_id,
+                            status,
+                            exit_code,
+                            failed_item_index,
+                        },
+                    channel,
+                    session_id: _,
                     excluded_client_id: _,
                 } => {
                     assert_eq!(channel, EventChannel::Jobs);
@@ -7500,6 +8956,7 @@ mod tests {
         match recv_gateway_msg(&mut gw_rx).await {
             GatewayMsg::SendEvent {
                 client_id,
+                session_id: None,
                 payload:
                     EventPayload::ScriptFinished {
                         script_id,
@@ -7521,8 +8978,9 @@ mod tests {
             .expect("script finished publish timeout")
             .expect("event bus channel closed");
         match publish {
-            EventBusMsg::PublishExcept {
+            EventBusMsg::PublishSessionExcept {
                 channel,
+                session_id,
                 excluded_client_id,
                 payload:
                     EventPayload::ScriptFinished {
@@ -7533,6 +8991,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(channel, EventChannel::Jobs);
+                assert_eq!(session_id, None);
                 assert_eq!(excluded_client_id, 42);
                 assert_eq!(script_id, "R1");
                 assert_eq!(status, ScriptRunStatus::Done);
@@ -7846,6 +9305,7 @@ mod tests {
         match recv_gateway_msg(&mut gw_rx).await {
             GatewayMsg::SendEvent {
                 client_id,
+                session_id: None,
                 payload: EventPayload::ScriptItemCreated { script_id, item },
             } => {
                 assert_eq!(client_id, 42);
@@ -7871,6 +9331,7 @@ mod tests {
         match recv_gateway_msg(&mut gw_rx).await {
             GatewayMsg::SendEvent {
                 client_id,
+                session_id: None,
                 payload:
                     EventPayload::ScriptFinished {
                         script_id,
@@ -8253,6 +9714,7 @@ mod tests {
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
+                session_id: None,
             },
         );
 
@@ -8284,6 +9746,7 @@ mod tests {
                 cwd_override: None,
                 scope_enabled: false,
                 wrapper_enabled: false,
+                session_id: None,
             },
         );
 
@@ -8611,11 +10074,13 @@ mod tests {
             .expect("cron removed event timeout")
             .expect("event bus channel closed");
         match event {
-            EventBusMsg::Publish {
+            EventBusMsg::PublishSession {
                 channel,
+                session_id,
                 payload: EventPayload::CronRemoved { cron_id },
             } => {
                 assert_eq!(channel, EventChannel::Crons);
+                assert_eq!(session_id, None);
                 assert_eq!(cron_id, "C1");
             }
             _ => panic!("expected CronRemoved event"),
@@ -8821,6 +10286,7 @@ mod tests {
             &guard,
             &storage::StoredJob {
                 id: "J7".into(),
+                session_id: None,
                 pipeline: "cargo test".into(),
                 status: JobStatus::Done,
                 exit_code: Some(0),
@@ -8840,6 +10306,38 @@ mod tests {
         assert_eq!(state.next_job, 8);
         assert_eq!(state.jobs[&JobId(7)].pipeline_text, "cargo test");
         assert_eq!(state.jobs[&JobId(7)].status, JobStatus::Done);
+    }
+
+    #[test]
+    fn restore_jobs_fails_closed_for_nonterminal_history_without_process_ownership() {
+        let conn = test_db();
+        let scope_hash = insert_test_scope(&conn, "interrupted-job");
+        for (id, status) in [("J3", JobStatus::Running), ("J4", JobStatus::Pending)] {
+            storage::upsert_job_history(
+                &conn.lock().unwrap(),
+                &storage::StoredJob {
+                    id: id.into(),
+                    session_id: None,
+                    pipeline: "sleep 30".into(),
+                    status,
+                    exit_code: None,
+                    start_scope: Some(scope_hash),
+                    end_scope: None,
+                    chain_id: None,
+                    stderr: String::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let mut state = SchedulerState::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(restore_jobs(&conn, &mut state)).unwrap();
+
+        assert_eq!(state.jobs[&JobId(3)].status, JobStatus::Killed);
+        assert_eq!(state.jobs[&JobId(4)].status, JobStatus::Killed);
+        let persisted = storage::load_job_history(&conn.lock().unwrap()).unwrap();
+        assert!(persisted.iter().all(|job| job.status == JobStatus::Killed));
     }
 
     #[test]
@@ -8896,6 +10394,7 @@ mod tests {
             &guard,
             &storage::StoredCron {
                 id: "C4".into(),
+                session_id: None,
                 schedule: "every 5m".into(),
                 command: "echo hello".into(),
                 status: CronStatus::Scheduled,
@@ -8933,6 +10432,7 @@ mod tests {
             &guard,
             &storage::StoredCron {
                 id: "C1".into(),
+                session_id: None,
                 schedule: "in 1s".into(),
                 command: "echo late".into(),
                 status: CronStatus::Scheduled,
@@ -8974,6 +10474,7 @@ mod tests {
             &guard,
             &storage::StoredCron {
                 id: "C1".into(),
+                session_id: None,
                 schedule: "in 500ms".into(),
                 command: "echo soon".into(),
                 status: CronStatus::Scheduled,
@@ -9007,6 +10508,7 @@ mod tests {
             &guard,
             &storage::StoredCron {
                 id: "C1".into(),
+                session_id: None,
                 schedule: "in 1500ms".into(),
                 command: "echo late".into(),
                 status: CronStatus::Scheduled,
@@ -9042,6 +10544,7 @@ mod tests {
             &conn.lock().unwrap(),
             &storage::StoredCron {
                 id: "C1".into(),
+                session_id: None,
                 schedule: "every 5m".into(),
                 command: "echo secret".into(),
                 status: CronStatus::Paused,
@@ -9610,6 +11113,1098 @@ mod tests {
             state.jobs[&jid].exit_code,
             Some(EXIT_CODE_UNAVAILABLE),
             "Killed exit code must not be overwritten by JobFinished"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_session_archive_is_reversible_and_preserves_terminal_history() {
+        let conn = test_db();
+        let scope = insert_test_scope(&conn, "archive-lifecycle");
+        let owner = "SS-archive";
+        let mut state = SchedulerState::new();
+        insert_anonymous_test_client(&mut state, 9, scope);
+        insert_ready_named_test_session(&conn, &mut state, owner, "archive-me", scope, 0);
+        state.jobs.insert(
+            JobId(1),
+            JobEntry {
+                job_id: JobId(1),
+                session_id: Some(owner.into()),
+                pipeline_text: "echo retained".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(scope),
+                end_scope: Some(scope),
+                open_hint: JobOpenHint::Stream,
+                chain_id: None,
+                chain_index: None,
+                chain_total: None,
+                pending_reason: None,
+            },
+        );
+        storage::upsert_job_history(
+            &conn.lock().unwrap(),
+            &storage::StoredJob {
+                id: "J1".into(),
+                session_id: Some(owner.into()),
+                pipeline: "echo retained".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(scope),
+                end_scope: Some(scope),
+                chain_id: None,
+                stderr: String::new(),
+            },
+        )
+        .expect("persist terminal history");
+
+        let archived = handle_session_command(
+            9,
+            SessionCommand::Archive {
+                selector: "archive-me".into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        let archived_info = match archived.payload {
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) => *info,
+            other => panic!("unexpected archive response: {other:?}"),
+        };
+        assert!(archived_info.archived_at_ms.is_some());
+        assert_eq!(state.jobs[&JobId(1)].status, JobStatus::Done);
+
+        let repeated = handle_session_command(
+            9,
+            SessionCommand::Archive {
+                selector: owner.into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            repeated.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info))
+                if info.archived_at_ms == archived_info.archived_at_ms
+        ));
+
+        for (command, expected_len) in [
+            (SessionCommand::List, 0),
+            (SessionCommand::ListArchived, 1),
+            (SessionCommand::ListAll, 1),
+        ] {
+            let listed = handle_session_command(9, command, &mut state, &conn).await;
+            assert!(matches!(
+                listed.payload,
+                ResponsePayload::Ok(OkPayload::SessionList(sessions))
+                    if sessions.len() == expected_len
+            ));
+        }
+        let info = handle_session_command(
+            9,
+            SessionCommand::Info {
+                selector: Some(owner.into()),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            info.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) if info.archived_at_ms.is_some()
+        ));
+        let attach = handle_session_command(
+            9,
+            SessionCommand::Attach {
+                selector: owner.into(),
+                refresh: false,
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            attach.payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+
+        let mut restored = SchedulerState::new();
+        restore_named_sessions(&conn, &mut restored)
+            .await
+            .expect("restore archived session");
+        restore_jobs(&conn, &mut restored)
+            .await
+            .expect("restore terminal history");
+        assert_eq!(restored.jobs[&JobId(1)].session_id.as_deref(), Some(owner));
+        insert_anonymous_test_client(&mut restored, 10, scope);
+        let still_archived = handle_session_command(
+            10,
+            SessionCommand::Attach {
+                selector: owner.into(),
+                refresh: false,
+            },
+            &mut restored,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            still_archived.payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+
+        let restored_response = handle_session_command(
+            10,
+            SessionCommand::Restore {
+                selector: "archive-me".into(),
+            },
+            &mut restored,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            restored_response.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) if info.archived_at_ms.is_none()
+        ));
+        let attached = handle_session_command(
+            10,
+            SessionCommand::Attach {
+                selector: owner.into(),
+                refresh: false,
+            },
+            &mut restored,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            attached.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) if info.current
+        ));
+        assert_eq!(
+            storage::load_sessions(&conn.lock().unwrap()).expect("load restored lifecycle")[0]
+                .archived_at_ms,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn named_session_archive_rejects_every_live_work_category() {
+        let conn = test_db();
+        let scope = insert_test_scope(&conn, "archive-blockers");
+        let owner = "SS-blocked";
+        let key = named_session_key(owner);
+        let mut state = SchedulerState::new();
+        insert_anonymous_test_client(&mut state, 9, scope);
+        insert_ready_named_test_session(&conn, &mut state, owner, "blocked", scope, 1);
+
+        assert!(matches!(
+            archive_test_session(&mut state, &conn, 9, owner)
+                .await
+                .payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        state.sessions.get_mut(&key).unwrap().connected_clients = 0;
+
+        state.jobs.insert(
+            JobId(1),
+            JobEntry {
+                job_id: JobId(1),
+                session_id: Some(owner.into()),
+                pipeline_text: "sleep 1".into(),
+                status: JobStatus::Pending,
+                exit_code: None,
+                start_scope: Some(scope),
+                end_scope: None,
+                open_hint: JobOpenHint::Stream,
+                chain_id: None,
+                chain_index: None,
+                chain_total: None,
+                pending_reason: Some("fixture".into()),
+            },
+        );
+        assert!(matches!(
+            archive_test_session(&mut state, &conn, 9, owner)
+                .await
+                .payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        state.jobs.get_mut(&JobId(1)).unwrap().status = JobStatus::Running;
+        assert!(matches!(
+            archive_test_session(&mut state, &conn, 9, owner)
+                .await
+                .payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        state.jobs.get_mut(&JobId(1)).unwrap().status = JobStatus::Done;
+
+        state.chains.insert(
+            ChainId(1),
+            ChainState {
+                node: leaf("echo chain"),
+                leaf_jobs: HashMap::new(),
+                leaf_status: HashMap::new(),
+                scope_hash: scope,
+                pipeline_text: "echo chain".into(),
+                process: ProcessJobContext {
+                    cwd_override: None,
+                    launch: LaunchOptions::default(),
+                    wrapper_enabled: false,
+                    pty_default: false,
+                    direct_output_client: None,
+                },
+                scope_enabled: false,
+                session_id: Some(owner.into()),
+            },
+        );
+        assert!(matches!(
+            archive_test_session(&mut state, &conn, 9, owner)
+                .await
+                .payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        state.chains.clear();
+
+        state.pending_scripts.insert(
+            ScriptId(1),
+            PendingScriptRun {
+                client_id: 9,
+                script_id: ScriptId(1),
+                mode: Mode::Job,
+                source: ScriptSource::Inline,
+                items: VecDeque::new(),
+                next_index: 0,
+                item_scope: scope,
+                created_items: Vec::new(),
+                last_exit_code: 0,
+                waiting_index: None,
+                session_id: Some(owner.into()),
+            },
+        );
+        assert!(matches!(
+            archive_test_session(&mut state, &conn, 9, owner)
+                .await
+                .payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        state.pending_scripts.clear();
+
+        state.crons.insert(
+            CronId(1),
+            CronEntry {
+                cron_id: CronId(1),
+                schedule: parse_schedule_text("every 1m").expect("valid schedule"),
+                chain: leaf("echo cron"),
+                scope_hash: scope,
+                status: CronStatus::Paused,
+                next_trigger: Instant::now(),
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+                session_id: Some(owner.into()),
+            },
+        );
+        assert!(matches!(
+            archive_test_session(&mut state, &conn, 9, owner)
+                .await
+                .payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        assert!(
+            state.sessions[&key]
+                .named
+                .as_ref()
+                .unwrap()
+                .archived_at_ms
+                .is_none()
+        );
+        state.crons.clear();
+
+        assert!(matches!(
+            archive_test_session(&mut state, &conn, 9, owner)
+                .await
+                .payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) if info.archived_at_ms.is_some()
+        ));
+    }
+
+    #[tokio::test]
+    async fn needs_refresh_session_archive_is_safe_and_restore_does_not_refresh_scope() {
+        let conn = test_db();
+        let scope = insert_test_scope(&conn, "archive-needs-refresh");
+        let owner = "SS-needs-refresh";
+        storage::upsert_session(
+            &conn.lock().unwrap(),
+            &storage::StoredSession {
+                id: owner.into(),
+                name: "needs-refresh-archive".into(),
+                scope_hash: None,
+                pty_default: None,
+                wrapper_enabled: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                archived_at_ms: None,
+            },
+        )
+        .expect("persist unavailable session");
+        let mut state = SchedulerState::new();
+        restore_named_sessions(&conn, &mut state)
+            .await
+            .expect("restore unavailable session");
+        insert_anonymous_test_client(&mut state, 9, scope);
+        state.crons.insert(
+            CronId(1),
+            CronEntry {
+                cron_id: CronId(1),
+                schedule: parse_schedule_text("every 1m").expect("valid schedule"),
+                chain: leaf("echo cron"),
+                scope_hash: scope,
+                status: CronStatus::Paused,
+                next_trigger: Instant::now(),
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+                session_id: Some(owner.into()),
+            },
+        );
+        let blocked = handle_session_command(
+            9,
+            SessionCommand::Archive {
+                selector: owner.into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            blocked.payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        state.crons.clear();
+
+        let archived = handle_session_command(
+            9,
+            SessionCommand::Archive {
+                selector: owner.into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            archived.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info))
+                if info.archived_at_ms.is_some()
+                    && info.scope_state == SessionScopeState::NeedsRefresh
+        ));
+        let archived_attach = handle_session_command(
+            9,
+            SessionCommand::Attach {
+                selector: owner.into(),
+                refresh: true,
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            archived_attach.payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+
+        let restored = handle_session_command(
+            9,
+            SessionCommand::Restore {
+                selector: owner.into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            restored.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info))
+                if info.archived_at_ms.is_none()
+                    && info.scope_state == SessionScopeState::NeedsRefresh
+        ));
+        let no_refresh = handle_session_command(
+            9,
+            SessionCommand::Attach {
+                selector: owner.into(),
+                refresh: false,
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            no_refresh.payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+        let refreshed = handle_session_command(
+            9,
+            SessionCommand::Attach {
+                selector: owner.into(),
+                refresh: true,
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            refreshed.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info))
+                if info.scope_state == SessionScopeState::ReadyDurable && info.current
+        ));
+    }
+
+    #[tokio::test]
+    async fn archive_storage_failure_leaves_scheduler_state_active() {
+        let conn = test_db();
+        let scope = insert_test_scope(&conn, "archive-storage-failure");
+        let owner = "SS-storage-failure";
+        let key = named_session_key(owner);
+        let mut state = SchedulerState::new();
+        insert_anonymous_test_client(&mut state, 9, scope);
+        insert_ready_named_test_session(&conn, &mut state, owner, "storage-failure", scope, 0);
+        conn.lock()
+            .unwrap()
+            .execute_batch("DROP TABLE sessions;")
+            .expect("break session storage");
+
+        let response = handle_session_command(
+            9,
+            SessionCommand::Archive {
+                selector: owner.into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+
+        assert!(matches!(
+            response.payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INTERNAL
+        ));
+        let meta = state.sessions[&key].named.as_ref().unwrap();
+        assert!(meta.archived_at_ms.is_none());
+        assert_eq!(meta.updated_at_ms, 1);
+    }
+
+    #[tokio::test]
+    async fn named_session_is_shared_and_survives_disconnect_gc() {
+        let conn = test_db();
+        let scope = insert_test_scope(&conn, "named-shared");
+        let mut state = SchedulerState::new();
+        for (client_id, key) in [(1, "ephemeral-1"), (2, "ephemeral-2")] {
+            state.client_sessions.insert(client_id, key.into());
+            state.sessions.insert(
+                key.into(),
+                SessionState {
+                    scope,
+                    incarnation: client_id,
+                    defaults: LaunchDefaults::default(),
+                    connected_clients: 1,
+                    disconnected_at: None,
+                    named: None,
+                },
+            );
+        }
+
+        let created = handle_session_command(
+            1,
+            SessionCommand::Create {
+                name: "shared-dev".into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        let created_info = match created.payload {
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) => *info,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+        assert_eq!(created_info.scope_state, SessionScopeState::ReadyDurable);
+        assert!(created_info.current);
+
+        let attached = handle_session_command(
+            2,
+            SessionCommand::Attach {
+                selector: "shared-dev".into(),
+                refresh: false,
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        let attached_info = match attached.payload {
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) => *info,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        assert_eq!(attached_info.id, created_info.id);
+        assert_eq!(attached_info.connected_clients, 2);
+        assert_eq!(attached_info.scope_hash, Some(scope.to_string()));
+
+        disconnect_session(1, &mut state);
+        disconnect_session(2, &mut state);
+        for session in state.sessions.values_mut() {
+            if session.connected_clients == 0 {
+                session.disconnected_at = Instant::now().checked_sub(SESSION_GC_TTL);
+            }
+        }
+        assert_eq!(sweep_disconnected_sessions(&mut state), 2);
+        let key = named_session_key(&created_info.id);
+        assert!(state.sessions.contains_key(&key));
+        assert_eq!(state.sessions[&key].connected_clients, 0);
+
+        let stored = storage::load_sessions(&conn.lock().unwrap()).expect("load named session");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, created_info.id);
+    }
+
+    #[tokio::test]
+    async fn volatile_named_session_requires_explicit_refresh_after_restore() {
+        let conn = test_db();
+        let volatile_scope = ScopeHash([91; 32]);
+        let mut state = SchedulerState::new();
+        state.client_sessions.insert(1, "ephemeral".into());
+        state.sessions.insert(
+            "ephemeral".into(),
+            SessionState {
+                scope: volatile_scope,
+                incarnation: 1,
+                defaults: LaunchDefaults::default(),
+                connected_clients: 1,
+                disconnected_at: None,
+                named: None,
+            },
+        );
+        let created = handle_session_command(
+            1,
+            SessionCommand::Create {
+                name: "volatile-agent".into(),
+            },
+            &mut state,
+            &conn,
+        )
+        .await;
+        let id = match created.payload {
+            ResponsePayload::Ok(OkPayload::SessionInfo(info)) => {
+                let info = *info;
+                assert_eq!(info.scope_state, SessionScopeState::ReadyVolatile);
+                info.id
+            }
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let mut restored = SchedulerState::new();
+        restore_named_sessions(&conn, &mut restored)
+            .await
+            .expect("restore session metadata");
+        assert!(restored.unavailable_named_sessions.contains_key(&id));
+        restored.client_sessions.insert(9, "fresh-client".into());
+        restored.sessions.insert(
+            "fresh-client".into(),
+            SessionState {
+                scope: ScopeHash([92; 32]),
+                incarnation: 9,
+                defaults: LaunchDefaults::default(),
+                connected_clients: 1,
+                disconnected_at: None,
+                named: None,
+            },
+        );
+
+        let refused = handle_session_command(
+            9,
+            SessionCommand::Attach {
+                selector: id.clone(),
+                refresh: false,
+            },
+            &mut restored,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            refused.payload,
+            ResponsePayload::Err { ref code, .. } if code == error_code::INVALID_STATE
+        ));
+
+        let refreshed = handle_session_command(
+            9,
+            SessionCommand::Attach {
+                selector: id,
+                refresh: true,
+            },
+            &mut restored,
+            &conn,
+        )
+        .await;
+        assert!(matches!(
+            refreshed.payload,
+            ResponsePayload::Ok(OkPayload::SessionInfo(info))
+                if matches!(
+                    *info,
+                    SessionInfo {
+                        scope_state: SessionScopeState::ReadyVolatile,
+                        current: true,
+                        ..
+                    }
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn spawned_job_persists_named_session_owner() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let conn = test_db();
+        let scope = insert_test_scope(&conn, "owned-job");
+        let owner = "SS-owned".to_string();
+        storage::upsert_session(
+            &conn.lock().unwrap(),
+            &storage::StoredSession {
+                id: owner.clone(),
+                name: "owned".into(),
+                scope_hash: Some(scope),
+                pty_default: None,
+                wrapper_enabled: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                archived_at_ms: None,
+            },
+        )
+        .expect("persist owner session");
+
+        let mut request = test_chain_spawn(leaf("echo owned"), scope);
+        request.session_id = Some(owner.clone());
+        let mut state = SchedulerState::new();
+        let response = spawn_chain(request, &mut state, SchedulerIo::new(&conn, &sys)).await;
+        assert!(matches!(
+            response,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+        let job_id = drain_spawn_jobs(&mut pm_rx).await[0];
+        assert_eq!(
+            state.jobs[&job_id].session_id.as_deref(),
+            Some(owner.as_str())
+        );
+
+        handle_job_finished(job_id, 0, &mut state, &conn, &sys).await;
+        let stored = storage::load_job_history(&conn.lock().unwrap()).expect("load job history");
+        assert_eq!(stored[0].session_id.as_deref(), Some(owner.as_str()));
+        assert_eq!(
+            job_info_from_entry(&state.jobs[&job_id]).session_id,
+            Some(owner)
+        );
+    }
+
+    #[test]
+    fn every_id_targeted_command_maps_to_a_session_owned_target() {
+        let commands = vec![
+            (
+                ResolvedCommand::Kill { id: "J1".into() },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Kill { id: "C1".into() },
+                SessionOwnedTarget::Cron(CronId(1)),
+            ),
+            (
+                ResolvedCommand::KillJob { id: "J1".into() },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::CancelExecution { id: "J1".into() },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::CancelExecution { id: "CH1".into() },
+                SessionOwnedTarget::Chain(ChainId(1)),
+            ),
+            (
+                ResolvedCommand::CancelExecution { id: "R1".into() },
+                SessionOwnedTarget::Script(ScriptId(1)),
+            ),
+            (
+                ResolvedCommand::RemoveCron { id: "C1".into() },
+                SessionOwnedTarget::Cron(CronId(1)),
+            ),
+            (
+                ResolvedCommand::Retry { id: "J1".into() },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Out {
+                    id: "J1".into(),
+                    tail_bytes: None,
+                },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Err { id: "J1".into() },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::JobOutput {
+                    id: "J1".into(),
+                    stdout_bytes: None,
+                    stderr_bytes: None,
+                },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Fg {
+                    id: "J1".into(),
+                    role: ForegroundRole::Controller,
+                },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Fg {
+                    id: "J1".into(),
+                    role: ForegroundRole::Observer,
+                },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Wait { id: "J1".into() },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Send {
+                    id: "J1".into(),
+                    data: "input".into(),
+                },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Cancel { id: "J1".into() },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::Pause { id: "C1".into() },
+                SessionOwnedTarget::Cron(CronId(1)),
+            ),
+            (
+                ResolvedCommand::Resume { id: "C1".into() },
+                SessionOwnedTarget::Cron(CronId(1)),
+            ),
+            (
+                ResolvedCommand::Log {
+                    id: Some("J1".into()),
+                },
+                SessionOwnedTarget::Job(JobId(1)),
+            ),
+            (
+                ResolvedCommand::ShowLog {
+                    id: Some("C1".into()),
+                    limit: None,
+                    tail_bytes: None,
+                },
+                SessionOwnedTarget::Cron(CronId(1)),
+            ),
+        ];
+
+        for (command, expected) in commands {
+            assert_eq!(session_owned_target_for_command(&command), Some(expected));
+        }
+    }
+
+    #[test]
+    fn named_session_target_access_is_owner_scoped_but_anonymous_stays_compatible() {
+        let scope = ScopeHash([77; 32]);
+        let owner = "SS-owner";
+        let other = "SS-other";
+        let mut state = SchedulerState::new();
+        state.jobs.insert(
+            JobId(1),
+            JobEntry {
+                job_id: JobId(1),
+                session_id: Some(owner.into()),
+                pipeline_text: "echo owned".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(scope),
+                end_scope: Some(scope),
+                open_hint: JobOpenHint::Stream,
+                chain_id: None,
+                chain_index: None,
+                chain_total: None,
+                pending_reason: None,
+            },
+        );
+        state.chains.insert(
+            ChainId(1),
+            ChainState {
+                node: leaf("echo owned"),
+                leaf_jobs: HashMap::new(),
+                leaf_status: HashMap::new(),
+                scope_hash: scope,
+                pipeline_text: "echo owned".into(),
+                process: ProcessJobContext {
+                    cwd_override: None,
+                    launch: LaunchOptions::default(),
+                    wrapper_enabled: false,
+                    pty_default: true,
+                    direct_output_client: None,
+                },
+                scope_enabled: false,
+                session_id: Some(owner.into()),
+            },
+        );
+        state.pending_scripts.insert(
+            ScriptId(1),
+            PendingScriptRun {
+                client_id: 1,
+                script_id: ScriptId(1),
+                mode: Mode::Job,
+                source: ScriptSource::Inline,
+                items: VecDeque::new(),
+                next_index: 0,
+                item_scope: scope,
+                created_items: Vec::new(),
+                last_exit_code: 0,
+                waiting_index: None,
+                session_id: Some(owner.into()),
+            },
+        );
+        state.completed_script_snapshots.insert(
+            ScriptId(2),
+            CompletedScriptSnapshot {
+                info: None,
+                session_id: Some(owner.into()),
+                completed_at: Instant::now(),
+                response_bytes: 0,
+            },
+        );
+        state.crons.insert(
+            CronId(1),
+            CronEntry {
+                cron_id: CronId(1),
+                schedule: parse_schedule_text("every 1m").expect("valid schedule"),
+                chain: leaf("echo owned"),
+                scope_hash: scope,
+                status: CronStatus::Paused,
+                next_trigger: Instant::now(),
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+                session_id: Some(owner.into()),
+            },
+        );
+
+        let targets = [
+            SessionOwnedTarget::Job(JobId(1)),
+            SessionOwnedTarget::Chain(ChainId(1)),
+            SessionOwnedTarget::Script(ScriptId(1)),
+            SessionOwnedTarget::Script(ScriptId(2)),
+            SessionOwnedTarget::Cron(CronId(1)),
+        ];
+        for target in targets {
+            assert!(authorize_session_owned_target(&state, Some(owner), target).is_ok());
+            let denied = authorize_session_owned_target(&state, Some(other), target)
+                .expect_err("foreign named session must be denied");
+            assert!(matches!(
+                denied.into_response(),
+                ResponsePayload::Err { ref code, .. } if code == error_code::NOT_FOUND
+            ));
+            assert!(authorize_session_owned_target(&state, None, target).is_ok());
+        }
+
+        // Anonymous clients retain the legacy idempotent/missing-ID behavior;
+        // named sessions fail closed when an owner can no longer be proven.
+        let missing = SessionOwnedTarget::Job(JobId(999));
+        assert!(authorize_session_owned_target(&state, None, missing).is_ok());
+        let denied = authorize_session_owned_target(&state, Some(owner), missing)
+            .expect_err("missing owned target must fail closed");
+        assert!(matches!(
+            denied.into_response(),
+            ResponsePayload::Err { ref code, .. } if code == error_code::NOT_FOUND
+        ));
+    }
+
+    #[tokio::test]
+    async fn cross_named_session_commands_and_recovery_reads_fail_closed() {
+        let (sys, _gw_rx, _sched_rx, _pm_rx, _ss_rx, _eb_rx) = test_actor_system();
+        let conn = test_db();
+        let config = Config::default();
+        let scope = ScopeHash([78; 32]);
+        let owner = "SS-owner";
+        let other = "SS-other";
+        let other_key = named_session_key(other);
+        let mut state = SchedulerState::new();
+        state.client_sessions.insert(2, other_key.clone());
+        state.sessions.insert(
+            other_key,
+            SessionState {
+                scope,
+                incarnation: 2,
+                defaults: LaunchDefaults::default(),
+                connected_clients: 1,
+                disconnected_at: None,
+                named: Some(NamedSessionMeta {
+                    id: other.into(),
+                    name: "other".into(),
+                    scope_durable: true,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    archived_at_ms: None,
+                }),
+            },
+        );
+        state.jobs.insert(
+            JobId(1),
+            JobEntry {
+                job_id: JobId(1),
+                session_id: Some(owner.into()),
+                pipeline_text: "echo secret".into(),
+                status: JobStatus::Done,
+                exit_code: Some(0),
+                start_scope: Some(scope),
+                end_scope: Some(scope),
+                open_hint: JobOpenHint::Stream,
+                chain_id: None,
+                chain_index: None,
+                chain_total: None,
+                pending_reason: None,
+            },
+        );
+        state.crons.insert(
+            CronId(1),
+            CronEntry {
+                cron_id: CronId(1),
+                schedule: parse_schedule_text("every 1m").expect("valid schedule"),
+                chain: leaf("echo secret"),
+                scope_hash: scope,
+                status: CronStatus::Scheduled,
+                next_trigger: Instant::now(),
+                cwd_override: None,
+                scope_enabled: false,
+                wrapper_enabled: false,
+                session_id: Some(owner.into()),
+            },
+        );
+        state.pending_scripts.insert(
+            ScriptId(1),
+            PendingScriptRun {
+                client_id: 1,
+                script_id: ScriptId(1),
+                mode: Mode::Job,
+                source: ScriptSource::Inline,
+                items: VecDeque::new(),
+                next_index: 0,
+                item_scope: scope,
+                created_items: Vec::new(),
+                last_exit_code: 0,
+                waiting_index: None,
+                session_id: Some(owner.into()),
+            },
+        );
+
+        for command in [
+            ResolvedCommand::Log {
+                id: Some("J1".into()),
+            },
+            ResolvedCommand::Pause { id: "C1".into() },
+            ResolvedCommand::CancelExecution { id: "R1".into() },
+        ] {
+            let response = handle_command(command, 2, &mut state, &conn, &config, &sys).await;
+            assert!(matches!(
+                response,
+                ResponsePayload::Err { ref code, .. } if code == error_code::NOT_FOUND
+            ));
+        }
+        assert!(matches!(
+            handle_wait_command("J1".into(), 2, 9, &mut state).await,
+            Some(ResponsePayload::Err { ref code, .. }) if code == error_code::NOT_FOUND
+        ));
+        assert!(matches!(
+            script_info_response("R1", 2, &mut state),
+            ResponsePayload::Err { ref code, .. } if code == error_code::NOT_FOUND
+        ));
+
+        let global_log = handle_command(
+            ResolvedCommand::Log { id: None },
+            2,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            global_log,
+            ResponsePayload::Ok(OkPayload::EvalText { ref text })
+                if text.contains("jobs: none") && text.contains("crons: none")
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_by_anonymous_client_preserves_original_named_session_owner() {
+        let (sys, _gw_rx, _sched_rx, mut pm_rx, ss_rx, _eb_rx) = test_actor_system();
+        spawn_fake_scope_store(ss_rx);
+        let conn = test_db();
+        let config = Config::default();
+        let scope = insert_test_scope(&conn, "retry-owner");
+        let owner = "SS-retry-owner".to_string();
+        storage::upsert_session(
+            &conn.lock().unwrap(),
+            &storage::StoredSession {
+                id: owner.clone(),
+                name: "retry-owner".into(),
+                scope_hash: Some(scope),
+                pty_default: None,
+                wrapper_enabled: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                archived_at_ms: None,
+            },
+        )
+        .expect("persist owner session");
+
+        let mut initial = test_chain_spawn(leaf("echo retry-owner"), scope);
+        initial.session_id = Some(owner.clone());
+        let mut state = SchedulerState::new();
+        let response = spawn_chain(initial, &mut state, SchedulerIo::new(&conn, &sys)).await;
+        let job_id = match response {
+            ResponsePayload::Ok(OkPayload::JobCreated { job_id, .. }) => job_id,
+            other => panic!("expected JobCreated, got {other:?}"),
+        };
+        let original_job = match pm_rx.recv().await.expect("original spawn") {
+            ProcessMgrMsg::SpawnJob {
+                job_id, options, ..
+            } => {
+                assert_eq!(options.session_id.as_deref(), Some(owner.as_str()));
+                job_id
+            }
+            _ => panic!("expected original SpawnJob"),
+        };
+        handle_job_finished(original_job, 1, &mut state, &conn, &sys).await;
+
+        let retry = handle_command(
+            ResolvedCommand::Retry { id: job_id },
+            99,
+            &mut state,
+            &conn,
+            &config,
+            &sys,
+        )
+        .await;
+        assert!(matches!(
+            retry,
+            ResponsePayload::Ok(OkPayload::JobCreated { .. })
+        ));
+        let retried_job = match pm_rx.recv().await.expect("retry spawn") {
+            ProcessMgrMsg::SpawnJob {
+                job_id, options, ..
+            } => {
+                assert_eq!(options.session_id.as_deref(), Some(owner.as_str()));
+                job_id
+            }
+            _ => panic!("expected retry SpawnJob"),
+        };
+        assert_eq!(
+            state.jobs[&retried_job].session_id.as_deref(),
+            Some(owner.as_str())
         );
     }
 }

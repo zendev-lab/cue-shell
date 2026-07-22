@@ -12,8 +12,9 @@ use crossterm::event::{KeyEvent, MouseEvent};
 
 use cue_core::cron::CronStatus;
 use cue_core::ipc::{
-    CronInfo, EventPayload, JobInfo, JobOpenHint, OkPayload, RequestPayload, ResponsePayload,
-    ScriptItemInfo, ScriptItemResult, ScriptRunStatus, Stream,
+    CronInfo, EventPayload, ForegroundAttachmentInfo, ForegroundRole, JobInfo, JobOpenHint,
+    OkPayload, RequestPayload, ResponsePayload, ScriptItemInfo, ScriptItemResult, ScriptRunStatus,
+    Stream,
 };
 use cue_core::job::JobStatus;
 use cue_core::{EventChannel, Mode};
@@ -30,7 +31,7 @@ use crate::component::main_view::{CardStatus, MainView, MainViewMsg, chain_step_
 use crate::component::sidebar::{
     CronSidebarRecord, JobSidebarRecord, OverviewCounts, Sidebar, SidebarMsg, overview_counts,
 };
-use crate::component::status_bar::{StatusBar, StatusBarMsg};
+use crate::component::status_bar::{StatusBar, StatusBarMsg, compact_session_badge};
 use crate::display::{
     DisplayPane, DisplayPreview, DisplayStream, DisplayTabHit, display_stream_from_ipc,
     output_channel_for_job_id, plan_display_subscriptions,
@@ -47,6 +48,7 @@ use crate::message::AppMsg;
 use crate::mouse_mode::MouseMode;
 use crate::record_format::{self, JobRecord};
 use crate::script_summary;
+use crate::session_binding::connector_with_named_session;
 use crate::sidebar_action;
 use crate::status_view;
 use crate::submission::{self, LocalCommand, PendingSubmission};
@@ -89,7 +91,34 @@ enum FgSessionKind {
 
 struct FgSession {
     id: String,
+    attachment_id: u64,
+    role: ForegroundRole,
+    control_available: bool,
+    snapshot_truncated: bool,
+    role_error: Option<String>,
     kind: FgSessionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FgRoleRequestKind {
+    Claim,
+    Release,
+}
+
+impl FgRoleRequestKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Claim => "claim control",
+            Self::Release => "release control",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingFgRoleRequest {
+    job_id: String,
+    attachment_id: u64,
+    kind: FgRoleRequestKind,
 }
 
 // ── App state ──
@@ -130,7 +159,10 @@ pub(crate) struct AppState {
     target_settings: Option<TargetSettingsState>,
     target_settings_error: Option<String>,
     pending_submissions: BTreeMap<u32, PendingSubmission>,
+    pending_fg_role_requests: BTreeMap<u32, PendingFgRoleRequest>,
     session_profile_name: Option<String>,
+    named_session_selector: Option<String>,
+    named_session_refresh: bool,
 
     // UI state
     pub(crate) mode: Mode,
@@ -169,7 +201,10 @@ impl AppState {
             target_settings: None,
             target_settings_error: None,
             pending_submissions: BTreeMap::new(),
+            pending_fg_role_requests: BTreeMap::new(),
             session_profile_name: None,
+            named_session_selector: None,
+            named_session_refresh: false,
             mode: Mode::default(),
             show_sidebar: None,
             focus: FocusArea::Input,
@@ -189,6 +224,15 @@ impl AppState {
 
     pub(crate) fn set_session_profile_name(&mut self, session_profile_name: Option<String>) {
         self.session_profile_name = session_profile_name;
+    }
+
+    pub(crate) fn set_named_session_selector(&mut self, selector: Option<String>) {
+        self.named_session_selector = selector.clone();
+        self.status_bar.update(StatusBarMsg::NamedSession(selector));
+    }
+
+    pub(crate) fn set_named_session_refresh(&mut self, refresh: bool) {
+        self.named_session_refresh = refresh;
     }
 
     /// Store the connection manager controller so the TUI can trigger live
@@ -223,6 +267,62 @@ impl AppState {
 
     pub(crate) fn fg_id(&self) -> Option<&str> {
         self.fg_session.as_ref().map(|session| session.id.as_str())
+    }
+
+    fn fg_is_controller(&self) -> bool {
+        self.fg_session
+            .as_ref()
+            .is_some_and(|session| session.role == ForegroundRole::Controller)
+    }
+
+    pub(crate) fn fg_title(&self) -> String {
+        let Some(session) = self.fg_session.as_ref() else {
+            return " FG ".to_string();
+        };
+        let status = match session.role {
+            ForegroundRole::Controller => "CONTROL",
+            ForegroundRole::Observer if session.control_available => "WATCH · control available",
+            ForegroundRole::Observer => "WATCH · control busy",
+        };
+        let truncated = if session.snapshot_truncated {
+            " · partial history"
+        } else {
+            ""
+        };
+        let named_session = self
+            .named_session_selector
+            .as_deref()
+            .map(|selector| format!("{} · ", compact_session_badge(selector)))
+            .unwrap_or_default();
+        format!(" FG {named_session}{} · {status}{truncated} ", session.id)
+    }
+
+    pub(crate) fn fg_footer_text(&self) -> String {
+        let Some(session) = self.fg_session.as_ref() else {
+            return String::new();
+        };
+        let role_hint = match self.pending_fg_role_kind(&session.id, session.attachment_id) {
+            Some(FgRoleRequestKind::Claim) => "[watch · claiming control…]",
+            Some(FgRoleRequestKind::Release) => "[control · releasing control…]",
+            None => match session.role {
+                ForegroundRole::Controller => "[control] Ctrl+] release control",
+                ForegroundRole::Observer if session.control_available => {
+                    "[watch · control available] Ctrl+] take control"
+                }
+                ForegroundRole::Observer => "[watch · control busy]",
+            },
+        };
+        let truncated = if session.snapshot_truncated {
+            "  ·  history truncated"
+        } else {
+            ""
+        };
+        let error = session
+            .role_error
+            .as_deref()
+            .map(|error| format!("  ·  {error}"))
+            .unwrap_or_default();
+        format!(" {role_hint}  ·  Ctrl+Y copy  ·  Ctrl+Z detach{truncated}{error} ")
     }
 
     pub(crate) fn fg_screen(&self) -> Option<&vt100::Screen> {
@@ -377,6 +477,13 @@ impl AppState {
         {
             parser.screen_mut().set_size(rows, cols);
         }
+    }
+
+    fn pending_fg_role_kind(&self, job_id: &str, attachment_id: u64) -> Option<FgRoleRequestKind> {
+        self.pending_fg_role_requests
+            .values()
+            .find(|request| request.job_id == job_id && request.attachment_id == attachment_id)
+            .map(|request| request.kind)
     }
 
     fn sync_mode_views(&mut self) {
@@ -911,6 +1018,11 @@ impl AppState {
                 return;
             }
         };
+        let connector = connector_with_named_session(
+            connector,
+            self.named_session_selector.clone(),
+            self.named_session_refresh,
+        );
 
         if let Some(ref controller) = self.connection_controller {
             if controller.switch_target(connector).is_err() {
@@ -1054,40 +1166,111 @@ impl AppState {
         self.pending_submissions.remove(&request_id)
     }
 
-    fn start_fg_session(&mut self, id: String, card_index: Option<usize>) {
-        if id.starts_with('A') {
+    fn start_fg_session(
+        &mut self,
+        attachment: ForegroundAttachmentInfo,
+        card_index: Option<usize>,
+    ) {
+        if attachment.id.starts_with('A') {
             return;
         }
 
         let (cols, rows) = self.fg_terminal_size();
+        let mut parser = Box::new(vt100::Parser::new(rows, cols, 0));
+        parser.process(&attachment.snapshot);
+        self.pending_fg_role_requests.clear();
         self.fg_session = Some(FgSession {
-            id,
-            kind: FgSessionKind::Job {
-                card_index,
-                parser: Box::new(vt100::Parser::new(rows, cols, 0)),
-            },
+            id: attachment.id,
+            attachment_id: attachment.attachment_id,
+            role: attachment.role,
+            control_available: attachment.control_available,
+            snapshot_truncated: attachment.snapshot_truncated,
+            role_error: None,
+            kind: FgSessionKind::Job { card_index, parser },
         });
     }
 
-    fn append_fg_output(&mut self, data: &[u8]) {
+    fn append_fg_output(&mut self, id: &str, attachment_id: u64, data: &[u8]) {
         let Some(FgSession {
+            id: attached_id,
+            attachment_id: active_attachment_id,
             kind: FgSessionKind::Job { parser, .. },
             ..
         }) = self.fg_session.as_mut()
         else {
             return;
         };
+        if !foreground_event_matches(attached_id, *active_attachment_id, id, attachment_id) {
+            tracing::debug!(event_job_id = %id, event_attachment_id = attachment_id, %attached_id, active_attachment_id = *active_attachment_id, "ignoring foreign foreground output");
+            return;
+        }
         parser.process(data);
     }
 
-    fn finish_fg_session(&mut self, id: &str, reason: &str) {
+    fn update_fg_control_available(
+        &mut self,
+        id: &str,
+        attachment_id: u64,
+        control_available: bool,
+    ) {
+        let Some(session) = self.fg_session.as_mut() else {
+            return;
+        };
+        if !foreground_event_matches(&session.id, session.attachment_id, id, attachment_id) {
+            return;
+        }
+        session.control_available = control_available;
+    }
+
+    fn apply_fg_role_changed(
+        &mut self,
+        id: &str,
+        attachment_id: u64,
+        role: ForegroundRole,
+        control_available: bool,
+    ) {
+        let Some(session) = self.fg_session.as_mut() else {
+            return;
+        };
+        if !foreground_event_matches(&session.id, session.attachment_id, id, attachment_id) {
+            tracing::debug!(response_job_id = %id, response_attachment_id = attachment_id, attached_job_id = %session.id, active_attachment_id = session.attachment_id, "ignoring stale foreground role response");
+            return;
+        }
+        session.role = role;
+        session.control_available = control_available;
+        session.role_error = None;
+
+        if role == ForegroundRole::Controller {
+            let (cols, rows) = self.fg_terminal_size();
+            self.send_fg_resize(cols, rows);
+        }
+    }
+
+    fn note_fg_role_failure(&mut self, request: &PendingFgRoleRequest, code: &str, message: &str) {
+        let Some(session) = self.fg_session.as_mut() else {
+            return;
+        };
+        if session.id != request.job_id || session.attachment_id != request.attachment_id {
+            return;
+        }
+        session.role_error = Some(format!(
+            "{} failed [{code}]: {message}",
+            request.kind.description()
+        ));
+    }
+
+    fn finish_fg_session(&mut self, id: &str, attachment_id: u64, reason: &str) {
         let Some(session) = self.fg_session.take() else {
             return;
         };
-        if session.id != id {
+        if !foreground_event_matches(&session.id, session.attachment_id, id, attachment_id) {
             self.fg_session = Some(session);
             return;
         }
+
+        self.pending_fg_role_requests.retain(|_, request| {
+            request.job_id != session.id || request.attachment_id != session.attachment_id
+        });
 
         let FgSessionKind::Job { card_index, parser } = session.kind;
         if let Some(card_index) = card_index {
@@ -1123,11 +1306,72 @@ impl AppState {
     }
 
     fn send_fg_input(&self, data: Vec<u8>) {
+        if !self.fg_is_controller() {
+            return;
+        }
         self.send_foreground_request(RequestPayload::FgInput { data }, "foreground input");
     }
 
     fn send_fg_resize(&self, cols: u16, rows: u16) {
+        if !self.fg_is_controller() {
+            return;
+        }
         self.send_foreground_request(RequestPayload::FgResize { cols, rows }, "foreground resize");
+    }
+
+    fn toggle_fg_control(&mut self) {
+        let Some(session) = self.fg_session.as_ref() else {
+            return;
+        };
+        if self
+            .pending_fg_role_kind(&session.id, session.attachment_id)
+            .is_some()
+        {
+            return;
+        }
+        let job_id = session.id.clone();
+        let attachment_id = session.attachment_id;
+        let kind = match session.role {
+            ForegroundRole::Controller => FgRoleRequestKind::Release,
+            ForegroundRole::Observer if session.control_available => FgRoleRequestKind::Claim,
+            ForegroundRole::Observer => {
+                if let Some(session) = self.fg_session.as_mut() {
+                    session.role_error = Some("control is currently busy".to_string());
+                }
+                return;
+            }
+        };
+        let payload = match kind {
+            FgRoleRequestKind::Claim => RequestPayload::FgClaimControl {},
+            FgRoleRequestKind::Release => RequestPayload::FgReleaseControl {},
+        };
+        let Some(writer) = &self.writer else {
+            if let Some(session) = self.fg_session.as_mut() {
+                session.role_error =
+                    Some(format!("{} failed: cued is offline", kind.description()));
+            }
+            return;
+        };
+        match writer.try_send(payload) {
+            Ok(request_id) => {
+                if let Some(session) = self.fg_session.as_mut() {
+                    session.role_error = None;
+                }
+                self.pending_fg_role_requests.insert(
+                    request_id,
+                    PendingFgRoleRequest {
+                        job_id,
+                        attachment_id,
+                        kind,
+                    },
+                );
+            }
+            Err(error) => {
+                if let Some(session) = self.fg_session.as_mut() {
+                    session.role_error = Some(format!("{} failed: {error}", kind.description()));
+                }
+            }
+        }
     }
 
     fn send_foreground_request(&self, payload: RequestPayload, description: &str) {
@@ -1616,6 +1860,7 @@ impl AppState {
             AppMsg::Disconnected => {
                 self.fail_pending_submissions("Error [transport]: cued disconnected");
                 self.fg_session = None;
+                self.pending_fg_role_requests.clear();
                 self.connected = false;
                 self.writer = None;
                 self.display_subscriptions.clear();
@@ -1660,6 +1905,25 @@ impl AppState {
             }
 
             AppMsg::Response { id, payload } => {
+                let pending_fg_role = self.pending_fg_role_requests.remove(&id);
+                if let Some(request) = pending_fg_role.as_ref() {
+                    match &payload {
+                        ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                            id: response_job_id,
+                            attachment_id: response_attachment_id,
+                            ..
+                        }) if response_job_id == &request.job_id
+                            && response_attachment_id == &request.attachment_id => {}
+                        ResponsePayload::Err { code, message } => {
+                            self.note_fg_role_failure(request, code, message);
+                        }
+                        _ => self.note_fg_role_failure(
+                            request,
+                            "PROTOCOL",
+                            "daemon returned an unexpected role response",
+                        ),
+                    }
+                }
                 let pending = self.take_pending_submission(id);
                 self.refresh_clear_action();
 
@@ -1829,7 +2093,9 @@ impl AppState {
                                 }
                             }
                         }
-                        OkPayload::FgAttached { id } => {
+                        OkPayload::FgAttached(attachment) => {
+                            let attachment = *attachment;
+                            let id = attachment.id.clone();
                             let card_index = if let Some(pending) = pending.as_ref()
                                 && pending.is_user_visible()
                             {
@@ -1842,9 +2108,17 @@ impl AppState {
                             } else {
                                 None
                             };
-                            self.start_fg_session(id.clone(), card_index);
+                            self.start_fg_session(attachment, card_index);
                             let (cols, rows) = self.fg_terminal_size();
                             self.send_fg_resize(cols, rows);
+                        }
+                        OkPayload::FgRoleChanged {
+                            id,
+                            attachment_id,
+                            role,
+                            control_available,
+                        } => {
+                            self.apply_fg_role_changed(&id, attachment_id, role, control_available);
                         }
                         OkPayload::CronAdded { cron_id } => {
                             let label = pending
@@ -2090,11 +2364,26 @@ impl AppState {
                 } => {
                     self.record_script_finished(script_id, status, exit_code, failed_item_index);
                 }
-                EventPayload::FgOutput { data } => {
-                    self.append_fg_output(&data);
+                EventPayload::FgOutput {
+                    id,
+                    attachment_id,
+                    data,
+                } => {
+                    self.append_fg_output(&id, attachment_id, &data);
                 }
-                EventPayload::FgExited { id, reason } => {
-                    self.finish_fg_session(&id, &reason);
+                EventPayload::FgControlChanged {
+                    id,
+                    attachment_id,
+                    control_available,
+                } => {
+                    self.update_fg_control_available(&id, attachment_id, control_available);
+                }
+                EventPayload::FgExited {
+                    id,
+                    attachment_id,
+                    reason,
+                } => {
+                    self.finish_fg_session(&id, attachment_id, &reason);
                 }
                 EventPayload::CronTriggered { cron_id, job_id } => {
                     self.ensure_cron_trigger_card(&cron_id, &job_id);
@@ -2130,7 +2419,16 @@ impl AppState {
                         self.copy_focus();
                         return;
                     }
-                    if let Some(bytes) = foreground::key_bytes(key, self.fg_application_cursor()) {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char(']'))
+                    {
+                        self.toggle_fg_control();
+                        return;
+                    }
+                    if self.fg_is_controller()
+                        && let Some(bytes) =
+                            foreground::key_bytes(key, self.fg_application_cursor())
+                    {
                         self.send_fg_input(bytes);
                     }
                     return;
@@ -2455,6 +2753,19 @@ fn job_picker_record(job: &JobRow) -> JobPickerRecord<'_> {
     }
 }
 
+fn foreground_event_matches(
+    active_job_id: &str,
+    active_attachment_id: u64,
+    event_job_id: &str,
+    event_attachment_id: u64,
+) -> bool {
+    if active_attachment_id != event_attachment_id {
+        return false;
+    }
+    event_job_id == active_job_id
+        || (active_attachment_id == 0 && event_attachment_id == 0 && event_job_id.is_empty())
+}
+
 fn cron_picker_record(cron: &CronRow) -> CronPickerRecord<'_> {
     CronPickerRecord {
         id: &cron.id,
@@ -2468,19 +2779,63 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use cue_core::ipc::Message;
+    use tokio::io::AsyncReadExt;
+    use tokio::time::timeout;
 
     fn queue_pending(state: &mut AppState, id: u32, pending: PendingSubmission) {
         state.track_pending_submission(id, pending);
     }
 
+    fn fg_attachment(
+        id: &str,
+        role: ForegroundRole,
+        control_available: bool,
+        snapshot: impl Into<Vec<u8>>,
+        snapshot_truncated: bool,
+    ) -> OkPayload {
+        OkPayload::FgAttached(Box::new(ForegroundAttachmentInfo {
+            id: id.into(),
+            attachment_id: 1,
+            role,
+            control_available,
+            snapshot: snapshot.into(),
+            snapshot_truncated,
+        }))
+    }
+
     fn attach_test_writer(state: &mut AppState) -> tokio::io::DuplexStream {
+        attach_test_writer_with_capabilities(state, std::iter::empty::<&str>())
+    }
+
+    fn attach_shared_foreground_test_writer(state: &mut AppState) -> tokio::io::DuplexStream {
+        attach_test_writer_with_capabilities(
+            state,
+            [cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS],
+        )
+    }
+
+    fn attach_test_writer_with_capabilities<'a>(
+        state: &mut AppState,
+        capabilities: impl IntoIterator<Item = &'a str>,
+    ) -> tokio::io::DuplexStream {
         let (client_stream, server_stream) = tokio::io::duplex(4096);
-        let client = crate::client::CuedClient::from_stream(client_stream);
+        let client =
+            crate::client::CuedClient::from_stream_with_capabilities(client_stream, capabilities);
         let (_reader, writer) = client.into_reader_and_writer_handle();
         state.writer = Some(writer);
         state.connected = true;
         server_stream
+    }
+
+    async fn read_test_message(stream: &mut tokio::io::DuplexStream) -> Message {
+        let mut len = [0_u8; 4];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut body = vec![0_u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     fn pending_display_subscribe_id(state: &AppState, expected_job_id: &str) -> u32 {
@@ -4074,7 +4429,13 @@ destination = "devbox"
 
         state.update(AppMsg::Response {
             id: 1,
-            payload: ResponsePayload::Ok(OkPayload::FgAttached { id: "J1".into() }),
+            payload: ResponsePayload::Ok(fg_attachment(
+                "J1",
+                ForegroundRole::Controller,
+                false,
+                Vec::new(),
+                false,
+            )),
         });
 
         assert!(state.fg_active());
@@ -4083,6 +4444,393 @@ destination = "devbox"
         assert_eq!(card.input, ":fg J1");
         assert_eq!(card.label.as_deref(), Some("J1"));
         assert_eq!(card.status, CardStatus::Streaming);
+    }
+
+    #[test]
+    fn named_session_selector_updates_header_and_foreground_identity() {
+        let mut state = AppState::new();
+        state.set_named_session_selector(Some("shared".into()));
+
+        assert_eq!(state.status_bar.named_session.as_deref(), Some("shared"));
+
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 1,
+                role: ForegroundRole::Observer,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+        assert!(state.fg_title().contains("session:shared"));
+
+        state.set_named_session_selector(None);
+        assert_eq!(state.status_bar.named_session, None);
+        assert!(!state.fg_title().contains("session:"));
+    }
+
+    #[test]
+    fn fg_watch_starts_from_snapshot_and_filters_output_by_job_id() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 11,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: b"snapshot\r\n".to_vec(),
+                snapshot_truncated: true,
+            },
+            None,
+        );
+
+        assert!(state.fg_screen().unwrap().contents().contains("snapshot"));
+        assert!(state.fg_title().contains("WATCH · control available"));
+        assert!(state.fg_title().contains("partial history"));
+        assert!(state.fg_footer_text().contains("history truncated"));
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J2".into(),
+            attachment_id: 11,
+            data: b"foreign\r\n".to_vec(),
+        }));
+        assert!(!state.fg_screen().unwrap().contents().contains("foreign"));
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: String::new(),
+            attachment_id: 0,
+            data: b"legacy\r\n".to_vec(),
+        }));
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J1".into(),
+            attachment_id: 11,
+            data: b"live\r\n".to_vec(),
+        }));
+        let contents = state.fg_screen().unwrap().contents();
+        assert!(!contents.contains("legacy"));
+        assert!(contents.contains("live"));
+    }
+
+    #[test]
+    fn delayed_foreground_control_and_exit_events_cannot_mutate_a_new_attachment() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J2".into(),
+                attachment_id: 22,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgControlChanged {
+            id: "J2".into(),
+            attachment_id: 21,
+            control_available: false,
+        }));
+        state.update(AppMsg::ServerEvent(EventPayload::FgExited {
+            id: "J2".into(),
+            attachment_id: 21,
+            reason: "done".into(),
+        }));
+
+        assert_eq!(state.fg_id(), Some("J2"));
+        assert!(state.fg_footer_text().contains("control available"));
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgControlChanged {
+            id: "J2".into(),
+            attachment_id: 22,
+            control_available: false,
+        }));
+        assert!(state.fg_footer_text().contains("control busy"));
+    }
+
+    #[test]
+    fn legacy_foreground_attachment_accepts_only_legacy_epoch_events() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J1".into(),
+                attachment_id: 0,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: String::new(),
+            attachment_id: 0,
+            data: b"legacy\r\n".to_vec(),
+        }));
+        state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J1".into(),
+            attachment_id: 1,
+            data: b"wrong generation\r\n".to_vec(),
+        }));
+
+        let contents = state.fg_screen().unwrap().contents();
+        assert!(contents.contains("legacy"));
+        assert!(!contents.contains("wrong generation"));
+    }
+
+    #[test]
+    fn delayed_role_response_for_same_job_cannot_mutate_new_attachment() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J5".into(),
+                attachment_id: 52,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+
+        state.update(AppMsg::Response {
+            id: 99,
+            payload: ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                id: "J5".into(),
+                attachment_id: 51,
+                role: ForegroundRole::Controller,
+                control_available: false,
+            }),
+        });
+
+        assert!(state.fg_title().contains("WATCH · control available"));
+        assert!(!state.fg_title().contains("CONTROL"));
+    }
+
+    #[tokio::test]
+    async fn watch_command_without_daemon_capability_is_visible_and_not_written() {
+        let mut state = AppState::new();
+        let mut server_stream = attach_test_writer(&mut state);
+
+        state.update(AppMsg::Submit(":watch J1".into()));
+
+        let card = state.main_view.cards.last().expect("visible watch failure");
+        assert!(
+            card.output
+                .contains(cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS)
+        );
+        assert!(card.output.contains("upgrade/restart cued"));
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                read_test_message(&mut server_stream)
+            )
+            .await
+            .is_err(),
+            "unsupported :watch must not reach an old daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_bracket_without_daemon_capability_stays_visible_and_is_not_written() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J6".into(),
+                attachment_id: 6,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+        let mut server_stream = attach_test_writer(&mut state);
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL,
+        )));
+
+        assert!(state.fg_title().contains("WATCH"));
+        assert!(
+            state
+                .fg_footer_text()
+                .contains(cue_core::ipc::IPC_CAPABILITY_FOREGROUND_OBSERVERS)
+        );
+        assert!(state.fg_footer_text().contains("upgrade/restart cued"));
+        assert!(state.pending_fg_role_requests.is_empty());
+        assert!(
+            timeout(
+                Duration::from_millis(20),
+                read_test_message(&mut server_stream)
+            )
+            .await
+            .is_err(),
+            "unsupported Ctrl+] claim must not reach an old daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn fg_observer_claim_is_confirmed_before_input_and_resize_are_forwarded() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J7".into(),
+                attachment_id: 7,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+        let mut server_stream = attach_shared_foreground_test_writer(&mut state);
+
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        state.update(AppMsg::Paste("pasted".into()));
+        state.update(AppMsg::Resize(100, 30));
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL,
+        )));
+
+        let claim_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::FgClaimControl {},
+                ..
+            } => id,
+            other => panic!("observer forwarded a request before claim: {other:?}"),
+        };
+        assert!(state.fg_title().contains("WATCH"));
+        assert!(state.fg_footer_text().contains("claiming control"));
+
+        state.update(AppMsg::Response {
+            id: claim_id,
+            payload: ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                id: "J7".into(),
+                attachment_id: 7,
+                role: ForegroundRole::Controller,
+                control_available: false,
+            }),
+        });
+        assert!(state.fg_title().contains("CONTROL"));
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgResize { cols, rows },
+                ..
+            } => {
+                assert_eq!(cols, 98);
+                assert_eq!(rows, 27);
+            }
+            other => panic!("controller claim did not synchronize PTY size: {other:?}"),
+        }
+
+        state.update(AppMsg::Paste("owned".into()));
+        match read_test_message(&mut server_stream).await {
+            Message::Request {
+                payload: RequestPayload::FgInput { data },
+                ..
+            } => assert_eq!(data, b"owned"),
+            other => panic!("controller paste was not forwarded: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fg_role_failure_stays_observer_and_is_visible() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J3".into(),
+                attachment_id: 3,
+                role: ForegroundRole::Observer,
+                control_available: true,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+        let mut server_stream = attach_shared_foreground_test_writer(&mut state);
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL,
+        )));
+        let request_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::FgClaimControl {},
+                ..
+            } => id,
+            other => panic!("unexpected request: {other:?}"),
+        };
+
+        state.update(AppMsg::Response {
+            id: request_id,
+            payload: ResponsePayload::Err {
+                code: "CONFLICT".into(),
+                message: "another observer claimed control".into(),
+            },
+        });
+
+        assert!(state.fg_title().contains("WATCH"));
+        assert!(!state.fg_title().contains("CONTROL"));
+        assert!(
+            state
+                .fg_footer_text()
+                .contains("claim control failed [CONFLICT]")
+        );
+        assert!(state.pending_fg_role_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fg_controller_ctrl_bracket_releases_without_detaching() {
+        let mut state = AppState::new();
+        state.start_fg_session(
+            ForegroundAttachmentInfo {
+                id: "J4".into(),
+                attachment_id: 4,
+                role: ForegroundRole::Controller,
+                control_available: false,
+                snapshot: Vec::new(),
+                snapshot_truncated: false,
+            },
+            None,
+        );
+        let mut server_stream = attach_shared_foreground_test_writer(&mut state);
+        state.update(AppMsg::KeyEvent(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL,
+        )));
+        let request_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::FgReleaseControl {},
+                ..
+            } => id,
+            other => panic!("unexpected request: {other:?}"),
+        };
+        assert!(state.fg_active());
+        assert!(state.fg_title().contains("CONTROL"));
+
+        state.update(AppMsg::Response {
+            id: request_id,
+            payload: ResponsePayload::Ok(OkPayload::FgRoleChanged {
+                id: "J4".into(),
+                attachment_id: 4,
+                role: ForegroundRole::Observer,
+                control_available: true,
+            }),
+        });
+
+        assert!(state.fg_active());
+        assert!(state.fg_title().contains("WATCH · control available"));
     }
 
     #[test]
@@ -4366,6 +5114,7 @@ destination = "devbox"
             id: 1,
             payload: ResponsePayload::Ok(OkPayload::JobList(vec![JobInfo {
                 id: "J1".into(),
+                session_id: None,
                 status: JobStatus::Running,
                 pipeline: "sleep 4".into(),
                 exit_code: None,
@@ -4393,9 +5142,17 @@ destination = "devbox"
         );
         state.update(AppMsg::Response {
             id: 1,
-            payload: ResponsePayload::Ok(OkPayload::FgAttached { id: "J1".into() }),
+            payload: ResponsePayload::Ok(fg_attachment(
+                "J1",
+                ForegroundRole::Controller,
+                false,
+                Vec::new(),
+                false,
+            )),
         });
         state.update(AppMsg::ServerEvent(EventPayload::FgOutput {
+            id: "J1".into(),
+            attachment_id: 1,
             data: b"\x1b[?1049h\x1b[?1h\x1b[?2004h\x1b[31mhello\x1b[0m".to_vec(),
         }));
 
@@ -4407,6 +5164,7 @@ destination = "devbox"
 
         state.update(AppMsg::ServerEvent(EventPayload::FgExited {
             id: "J1".into(),
+            attachment_id: 1,
             reason: "detached".into(),
         }));
 

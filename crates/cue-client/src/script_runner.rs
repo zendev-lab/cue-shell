@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -11,7 +12,7 @@ use crate::daemon_lifecycle::{
     warn_on_remote_version_mismatch,
 };
 
-pub fn run(path: PathBuf) -> Result<i32> {
+pub fn run(path: PathBuf, session_refresh_flag: bool) -> Result<i32> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -25,15 +26,78 @@ pub fn run(path: PathBuf) -> Result<i32> {
         .build()
         .context("build tokio runtime")?;
 
-    rt.block_on(async_run(path))
+    rt.block_on(async_run(path, session_refresh_flag))
 }
 
-async fn async_run(path: PathBuf) -> Result<i32> {
+async fn async_run(path: PathBuf, session_refresh_flag: bool) -> Result<i32> {
     let input = std::fs::read_to_string(&path)
         .with_context(|| format!("read .cue script `{}`", path.display()))?;
     let display_path = path.display().to_string();
+    let selector = cue_session_selector(std::env::var_os("CUE_SESSION"))?;
+    let refresh_if_needed =
+        session_refresh_flag || cue_session_refresh(std::env::var_os("CUE_SESSION_REFRESH"))?;
+    if refresh_if_needed && selector.is_none() {
+        bail!("session refresh requires CUE_SESSION to select a named session");
+    }
     let mut client = connect_for_script().await?;
-    run_with_client(&mut client, &display_path, &input).await
+    run_in_session_with_client(
+        &mut client,
+        &display_path,
+        &input,
+        selector,
+        refresh_if_needed,
+    )
+    .await
+}
+
+async fn run_in_session_with_client(
+    client: &mut CuedClient,
+    path: &str,
+    input: &str,
+    selector: Option<String>,
+    refresh_if_needed: bool,
+) -> Result<i32> {
+    if let Some(selector) = selector {
+        let attach = client
+            .attach_session_with_refresh_if_needed(&selector, refresh_if_needed)
+            .await;
+        if refresh_if_needed {
+            attach.with_context(|| {
+                format!("attach cue script to session `{selector}` with explicit restart recovery")
+            })?;
+        } else {
+            attach.with_context(|| {
+                format!(
+                    "attach cue script to session `{selector}`; if it reports needs_refresh after a daemon restart, rerun with `--session-refresh` or `CUE_SESSION_REFRESH=1` to explicitly replace its scope from this process environment"
+                )
+            })?;
+        }
+    }
+    run_with_client(client, path, input).await
+}
+
+fn cue_session_selector(value: Option<OsString>) -> Result<Option<String>> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .into_string()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("CUE_SESSION must be valid UTF-8"))
+}
+
+fn cue_session_refresh(value: Option<OsString>) -> Result<bool> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("CUE_SESSION_REFRESH must be valid UTF-8"))?;
+    match value.as_str() {
+        "1" | "true" => Ok(true),
+        "0" | "false" => Ok(false),
+        _ => bail!("CUE_SESSION_REFRESH must be one of: 1, true, 0, false"),
+    }
 }
 
 async fn connect_for_script() -> Result<CuedClient> {
@@ -139,7 +203,8 @@ fn decode_binary_output_chunk(base64: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use cue_core::ipc::{
-        MAX_MESSAGE_SIZE, RequestPayload, ScriptRunStatus, ScriptSource, encode_message,
+        MAX_MESSAGE_SIZE, RequestPayload, ScriptRunStatus, ScriptSource, SessionInfo,
+        SessionScopeState, encode_message,
     };
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -180,6 +245,179 @@ mod tests {
         let decoded = decode_binary_output_chunk(&encoded).expect("decode binary chunk");
 
         assert_eq!(decoded, vec![0, 159, 146, 150, b'\n']);
+    }
+
+    #[test]
+    fn cue_session_selector_ignores_missing_and_empty_values() {
+        assert_eq!(cue_session_selector(None).unwrap(), None);
+        assert_eq!(cue_session_selector(Some(OsString::new())).unwrap(), None);
+    }
+
+    #[test]
+    fn cue_session_selector_accepts_name_or_id() {
+        assert_eq!(
+            cue_session_selector(Some(OsString::from("shared-bench"))).unwrap(),
+            Some("shared-bench".into())
+        );
+        assert_eq!(
+            cue_session_selector(Some(OsString::from("S42"))).unwrap(),
+            Some("S42".into())
+        );
+    }
+
+    #[test]
+    fn cue_session_refresh_requires_an_explicit_boolean() {
+        assert!(!cue_session_refresh(None).unwrap());
+        assert!(!cue_session_refresh(Some(OsString::from("0"))).unwrap());
+        assert!(!cue_session_refresh(Some(OsString::from("false"))).unwrap());
+        assert!(cue_session_refresh(Some(OsString::from("1"))).unwrap());
+        assert!(cue_session_refresh(Some(OsString::from("true"))).unwrap());
+
+        let error = cue_session_refresh(Some(OsString::new()))
+            .expect_err("an empty opt-in must not silently enable refresh");
+        assert!(
+            format!("{error:#}").contains("CUE_SESSION_REFRESH must be one of"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_session_attaches_before_script_submission() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let mut client = CuedClient::from_stream(client_stream);
+        let runner = tokio::spawn(async move {
+            run_in_session_with_client(
+                &mut client,
+                "shared.cue",
+                ":help\n",
+                Some("shared-bench".into()),
+                false,
+            )
+            .await
+        });
+
+        let attach_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::AttachSession { selector, refresh },
+                ..
+            } => {
+                assert_eq!(selector, "shared-bench");
+                assert!(!refresh);
+                id
+            }
+            other => panic!("expected AttachSession before RunScript, got {other:?}"),
+        };
+        write_test_message(
+            &mut server_stream,
+            Message::Response {
+                id: attach_id,
+                payload: ResponsePayload::Ok(OkPayload::SessionInfo(Box::new(SessionInfo {
+                    id: "S42".into(),
+                    name: "shared-bench".into(),
+                    scope_state: SessionScopeState::ReadyDurable,
+                    scope_hash: Some("abc123".into()),
+                    connected_clients: 2,
+                    restart_safe: true,
+                    current: true,
+                    created_at_ms: 10,
+                    updated_at_ms: 20,
+                    archived_at_ms: None,
+                }))),
+            },
+        )
+        .await;
+
+        let run_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::RunScript { path, input },
+                ..
+            } => {
+                assert_eq!(path, "shared.cue");
+                assert_eq!(input, ":help\n");
+                id
+            }
+            other => panic!("expected RunScript after attach confirmation, got {other:?}"),
+        };
+        write_test_message(
+            &mut server_stream,
+            Message::Response {
+                id: run_id,
+                payload: ResponsePayload::Ok(OkPayload::ScriptCreated {
+                    script_id: "R1".into(),
+                    source: ScriptSource::File {
+                        path: "shared.cue".into(),
+                    },
+                    items: vec![],
+                    submit_error: None,
+                }),
+            },
+        )
+        .await;
+        write_test_message(
+            &mut server_stream,
+            Message::Event {
+                payload: EventPayload::ScriptFinished {
+                    script_id: "R1".into(),
+                    status: ScriptRunStatus::Done,
+                    exit_code: 0,
+                    failed_item_index: None,
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(runner.await.unwrap().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn session_attach_failure_explains_explicit_restart_recovery() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let mut client = CuedClient::from_stream(client_stream);
+        let runner = tokio::spawn(async move {
+            run_in_session_with_client(
+                &mut client,
+                "shared.cue",
+                ":help\n",
+                Some("shared-bench".into()),
+                false,
+            )
+            .await
+        });
+
+        let attach_id = match read_test_message(&mut server_stream).await {
+            Message::Request {
+                id,
+                payload: RequestPayload::AttachSession { selector, refresh },
+                ..
+            } => {
+                assert_eq!(selector, "shared-bench");
+                assert!(!refresh);
+                id
+            }
+            other => panic!("expected AttachSession, got {other:?}"),
+        };
+        write_test_message(
+            &mut server_stream,
+            Message::Response {
+                id: attach_id,
+                payload: ResponsePayload::Err {
+                    code: "INVALID_STATE".into(),
+                    message: "named session needs_refresh after daemon restart".into(),
+                },
+            },
+        )
+        .await;
+
+        let error = runner
+            .await
+            .expect("join script runner")
+            .expect_err("non-refreshing run must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("--session-refresh"), "{message}");
+        assert!(message.contains("CUE_SESSION_REFRESH=1"), "{message}");
+        assert!(message.contains("needs_refresh"), "{message}");
     }
 
     #[tokio::test]

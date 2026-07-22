@@ -25,13 +25,39 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionBinding {
+    /// Scheduler-internal logical session key. Named sessions use their durable
+    /// id so every attachment shares one idempotency namespace.
+    pub session_id: String,
+    /// Durable named-session owner used to isolate realtime resource events.
+    /// Anonymous handshake sessions leave this unset for compatibility.
+    pub named_session_id: Option<String>,
     pub scope: ScopeHash,
     pub incarnation: u64,
 }
 
-use cue_core::ipc::{EventPayload, ResponsePayload, ScopeInfo};
+#[derive(Debug)]
+pub(crate) enum SessionCommand {
+    Create { name: String },
+    List,
+    ListArchived,
+    ListAll,
+    Archive { selector: String },
+    Restore { selector: String },
+    Attach { selector: String, refresh: bool },
+    Info { selector: Option<String> },
+}
+
+pub(crate) struct SessionCommandResult {
+    pub payload: ResponsePayload,
+    /// Present when the command changed the calling client's binding.
+    pub binding: Option<SessionBinding>,
+}
+
+use cue_core::ipc::{
+    EventPayload, ForegroundAttachmentInfo, ForegroundRole, ResponsePayload, ScopeInfo,
+};
 use cue_core::scope::{EnvDelta, EnvSnapshot, Scope};
 use cue_core::{EventChannel, ScopeHash};
 
@@ -43,6 +69,40 @@ pub(crate) const ACTOR_CHANNEL_CAP: usize = 256;
 
 /// Per-client event channel capacity.
 pub(crate) const CLIENT_EVENT_CAP: usize = 64;
+
+/// One outbound event plus the audience that authorized its delivery.
+///
+/// Keeping the audience beside the payload lets the gateway revalidate events
+/// that were queued before a transport switched named sessions. `Global`
+/// events are not resource-owned; `Session(None)` is an anonymous resource and
+/// `Session(Some(id))` belongs to one durable named session.
+#[derive(Clone, Debug)]
+pub(crate) enum ClientEventAudience {
+    Global,
+    Session(Option<String>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClientEvent {
+    pub payload: EventPayload,
+    pub audience: ClientEventAudience,
+}
+
+impl ClientEvent {
+    pub(crate) fn global(payload: EventPayload) -> Self {
+        Self {
+            payload,
+            audience: ClientEventAudience::Global,
+        }
+    }
+
+    pub(crate) fn session(payload: EventPayload, session_id: Option<String>) -> Self {
+        Self {
+            payload,
+            audience: ClientEventAudience::Session(session_id),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessJobOptions {
@@ -57,6 +117,8 @@ pub(crate) struct ProcessJobOptions {
     /// Client that should receive this job's output directly, independent of
     /// output-channel subscriptions.
     pub direct_output_client: Option<u64>,
+    /// Durable named-session owner for state and output event isolation.
+    pub session_id: Option<String>,
 }
 
 // ── Per-actor message types ──
@@ -73,6 +135,9 @@ pub(crate) enum GatewayMsg {
     SendEvent {
         client_id: u64,
         payload: EventPayload,
+        /// Owning named session. `None` denotes an anonymous resource; the
+        /// gateway still treats the event as resource-scoped, not global.
+        session_id: Option<String>,
     },
     /// Graceful shutdown.
     Shutdown,
@@ -80,6 +145,16 @@ pub(crate) enum GatewayMsg {
 
 /// Messages handled by the Scheduler actor.
 pub(crate) enum SchedulerMsg {
+    /// Arm execution activation while leaving jobs and crons paused. The
+    /// scheduler observes the lifecycle's durable-completion signal before it
+    /// opens execution and publishes readiness.
+    Activate {
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    /// Close scheduler admission and acknowledge after the gate is visible.
+    BeginDrain {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     /// Bind a transport client id to a stable logical session.
     Connect {
         client_id: u64,
@@ -88,6 +163,12 @@ pub(crate) enum SchedulerMsg {
         /// Explicitly refresh an existing session cursor from the handshake snapshot.
         refresh: bool,
         reply: tokio::sync::oneshot::Sender<Result<SessionBinding>>,
+    },
+    /// Create, list, attach, or inspect durable named sessions.
+    Session {
+        client_id: u64,
+        command: SessionCommand,
+        reply: tokio::sync::oneshot::Sender<SessionCommandResult>,
     },
     /// Mark a transport client as disconnected and start session TTL handling.
     Disconnect { client_id: u64 },
@@ -143,6 +224,7 @@ pub(crate) enum ProcessMgrMsg {
     },
     /// Send raw input bytes to a specific running job.
     SendJobInput {
+        client_id: u64,
         job_id: cue_core::JobId,
         data: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
@@ -151,10 +233,27 @@ pub(crate) enum ProcessMgrMsg {
     AttachFg {
         client_id: u64,
         job_id: cue_core::JobId,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        role: ForegroundRole,
+        reply: tokio::sync::oneshot::Sender<Result<ForegroundAttachmentInfo, String>>,
+    },
+    /// Acquire the free controller lease for the client's observed PTY job.
+    ClaimFgControl {
+        client_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<ForegroundRoleUpdate, String>>,
+    },
+    /// Release the controller lease while keeping the client's observer attachment.
+    ReleaseFgControl {
+        client_id: u64,
+        reply: tokio::sync::oneshot::Sender<Result<ForegroundRoleUpdate, String>>,
     },
     /// Detach a client from any foreground-attached job.
-    DetachFg { client_id: u64, reason: String },
+    DetachFg {
+        client_id: u64,
+        reason: String,
+        /// Present when the caller must not acknowledge until the foreground
+        /// lease has actually been cleared.
+        reply: Option<tokio::sync::oneshot::Sender<()>>,
+    },
     /// Send raw input bytes to the currently foreground-attached job.
     FgInput {
         client_id: u64,
@@ -170,6 +269,15 @@ pub(crate) enum ProcessMgrMsg {
     },
     /// Graceful shutdown.
     Shutdown,
+}
+
+/// Internal controller-lease transition result used to build typed IPC replies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForegroundRoleUpdate {
+    pub id: String,
+    pub attachment_id: u64,
+    pub role: ForegroundRole,
+    pub control_available: bool,
 }
 
 /// Snapshot of a job output stream, as returned by `ProcessMgrMsg::GetOutput`.
@@ -232,11 +340,17 @@ pub(crate) struct ScopeGcReport {
 
 /// Messages handled by the EventBus actor.
 pub(crate) enum EventBusMsg {
+    /// Update the named-session audience for every subscription owned by a
+    /// client. `None` preserves the legacy anonymous/global view.
+    SetClientSession {
+        client_id: u64,
+        named_session_id: Option<String>,
+    },
     /// Register a client for a channel.
     Subscribe {
         client_id: u64,
         channel: EventChannel,
-        sender: mpsc::Sender<EventPayload>,
+        sender: mpsc::Sender<ClientEvent>,
         /// Signals the gateway to close the whole client connection when event
         /// delivery can no longer be lossless.
         disconnect: tokio::sync::watch::Sender<bool>,
@@ -254,9 +368,24 @@ pub(crate) enum EventBusMsg {
         channel: EventChannel,
     },
     /// Broadcast an event to all subscribers of a channel except one client.
+    #[allow(dead_code)]
     PublishExcept {
         payload: EventPayload,
         channel: EventChannel,
+        excluded_client_id: u64,
+    },
+    /// Publish a resource event only to legacy anonymous clients and clients
+    /// attached to the owning named session.
+    PublishSession {
+        payload: EventPayload,
+        channel: EventChannel,
+        session_id: Option<String>,
+    },
+    /// Session-scoped publish with one directly-notified client excluded.
+    PublishSessionExcept {
+        payload: EventPayload,
+        channel: EventChannel,
+        session_id: Option<String>,
         excluded_client_id: u64,
     },
     /// Graceful shutdown.
@@ -280,6 +409,7 @@ pub(crate) async fn publish_event(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) async fn publish_event_except(
     actor: &'static str,
     event_bus: &mpsc::Sender<EventBusMsg>,
@@ -299,15 +429,60 @@ pub(crate) async fn publish_event_except(
     }
 }
 
+pub(crate) async fn publish_session_event(
+    actor: &'static str,
+    event_bus: &mpsc::Sender<EventBusMsg>,
+    channel: EventChannel,
+    payload: EventPayload,
+    session_id: Option<String>,
+) {
+    if let Err(error) = event_bus
+        .send(EventBusMsg::PublishSession {
+            payload,
+            channel: channel.clone(),
+            session_id,
+        })
+        .await
+    {
+        warn!(%actor, %channel, "actor: failed to publish session event: {error}");
+    }
+}
+
+pub(crate) async fn publish_session_event_except(
+    actor: &'static str,
+    event_bus: &mpsc::Sender<EventBusMsg>,
+    channel: EventChannel,
+    payload: EventPayload,
+    session_id: Option<String>,
+    excluded_client_id: u64,
+) {
+    if let Err(error) = event_bus
+        .send(EventBusMsg::PublishSessionExcept {
+            payload,
+            channel: channel.clone(),
+            session_id,
+            excluded_client_id,
+        })
+        .await
+    {
+        warn!(%actor, %channel, %excluded_client_id, "actor: failed to publish session event: {error}");
+    }
+}
+
 pub(crate) async fn send_gateway_event(
     actor: &'static str,
     sys: &ActorSystem,
     client_id: u64,
     payload: EventPayload,
+    session_id: Option<String>,
 ) {
     if let Err(error) = sys
         .gateway
-        .send(GatewayMsg::SendEvent { client_id, payload })
+        .send(GatewayMsg::SendEvent {
+            client_id,
+            payload,
+            session_id,
+        })
         .await
     {
         warn!(%actor, %client_id, "actor: failed to send gateway event: {error}");
@@ -333,6 +508,19 @@ pub(crate) struct ActorSystem {
 }
 
 impl ActorSystem {
+    /// Prove the scheduler can activate, but keep execution paused until the
+    /// lifecycle publishes durable restart completion.
+    pub(crate) async fn activate_restart_successor(&self) -> Result<()> {
+        let (reply, activated) = tokio::sync::oneshot::channel();
+        self.scheduler
+            .send(SchedulerMsg::Activate { reply })
+            .await
+            .map_err(|_| anyhow::anyhow!("scheduler stopped before successor activation"))?;
+        activated.await.map_err(|_| {
+            anyhow::anyhow!("scheduler dropped successor activation acknowledgement")
+        })?
+    }
+
     /// Send `Shutdown` to every actor.
     pub(crate) async fn shutdown(&self) {
         self.shutdown_with_reason("shutdown requested").await;
@@ -369,6 +557,7 @@ pub(crate) async fn spawn_all(
     scope_db: rusqlite::Connection,
     scheduler_db: rusqlite::Connection,
     config: crate::config::Config,
+    lifecycle: std::sync::Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> Result<ActorSystem> {
     // Create channels.
     let (gw_tx, gw_rx) = mpsc::channel::<GatewayMsg>(ACTOR_CHANNEL_CAP);
@@ -393,13 +582,15 @@ pub(crate) async fn spawn_all(
     scope_store::spawn(ss_rx, scope_db, sys.clone()).await?;
     event_bus::spawn(eb_rx);
     process_mgr::spawn(pm_rx, sys.clone());
-    if let Err(error) = scheduler::spawn(sched_rx, scheduler_db, sys.clone()).await {
+    if let Err(error) =
+        scheduler::spawn(sched_rx, scheduler_db, sys.clone(), lifecycle.clone()).await
+    {
         send_shutdown("scope_store", &sys.scope_store, ScopeStoreMsg::Shutdown).await;
         send_shutdown("process_mgr", &sys.process_mgr, ProcessMgrMsg::Shutdown).await;
         send_shutdown("event_bus", &sys.event_bus, EventBusMsg::Shutdown).await;
         return Err(anyhow::anyhow!("initialize scheduler: {error}"));
     }
-    if let Err(error) = gateway::spawn(gw_rx, socket_path, sys.clone()).await {
+    if let Err(error) = gateway::spawn(gw_rx, socket_path, sys.clone(), lifecycle).await {
         sys.shutdown().await;
         return Err(error);
     }
@@ -467,6 +658,10 @@ mod tests {
             in_memory_db(),
             in_memory_db(),
             crate::config::Config::default(),
+            std::sync::Arc::new(crate::lifecycle::DaemonLifecycle::new(
+                socket_path.clone(),
+                crate::lifecycle::RestartOwnership::Standalone,
+            )),
         )
         .await;
         let Err(error) = result else {
@@ -493,6 +688,10 @@ mod tests {
             scope_db,
             scheduler_db,
             crate::config::Config::default(),
+            std::sync::Arc::new(crate::lifecycle::DaemonLifecycle::new(
+                PathBuf::from("/tmp/cue-spawn-all-scheduler-init-fails.sock"),
+                crate::lifecycle::RestartOwnership::Standalone,
+            )),
         )
         .await;
         let Err(error) = result else {
@@ -502,5 +701,109 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("initialize scheduler"));
         assert!(message.contains("load persisted crons"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn starting_scheduler_rejects_direct_execution_message() {
+        let dir = PathBuf::from(format!("/tmp/csg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create scheduler gate test dir");
+        let socket = dir.join("cued.sock");
+        let marker = dir.join("scheduler-bypass-ran");
+        let startup = crate::lifecycle::RestartRecord {
+            restart_id: "scheduler-gate".into(),
+            daemon_instance_id: "predecessor".into(),
+            protocol_version: cue_core::ipc::IPC_PROTOCOL_VERSION,
+            target_generation: "target".into(),
+            phase: crate::lifecycle::RestartPhase::Armed,
+            supervisor_restart: false,
+        };
+        let lifecycle = std::sync::Arc::new(crate::lifecycle::DaemonLifecycle::new_with_startup(
+            socket.clone(),
+            crate::lifecycle::RestartOwnership::Standalone,
+            Some(startup),
+        ));
+        let sys = spawn_all(
+            socket,
+            in_memory_db(),
+            in_memory_db(),
+            crate::config::Config::default(),
+            lifecycle.clone(),
+        )
+        .await
+        .expect("spawn starting actor system");
+
+        let (reply, connected) = tokio::sync::oneshot::channel();
+        sys.scheduler
+            .send(SchedulerMsg::Connect {
+                client_id: 4242,
+                session_id: "scheduler-gate".into(),
+                snapshot: cue_core::scope::EnvSnapshot {
+                    env: std::collections::BTreeMap::from([(
+                        "PATH".into(),
+                        "/usr/bin:/bin".into(),
+                    )]),
+                    cwd: dir.clone(),
+                },
+                refresh: false,
+                reply,
+            })
+            .await
+            .expect("send direct scheduler connect");
+        connected
+            .await
+            .expect("receive scheduler connect response")
+            .expect("connect direct scheduler client");
+        let command = crate::parser::parse_command(
+            &format!("/usr/bin/touch {}", marker.display()),
+            cue_core::mode::Mode::Job,
+        )
+        .expect("parse scheduler bypass command");
+        sys.scheduler
+            .send(SchedulerMsg::Eval {
+                client_id: 4242,
+                request_id: 1,
+                command: Box::new(command),
+            })
+            .await
+            .expect("send direct scheduler Eval");
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !marker.exists(),
+            "scheduler startup gate must reject execution even when gateway is bypassed"
+        );
+
+        sys.activate_restart_successor()
+            .await
+            .expect("arm successor activation");
+        let flood_tx = sys.scheduler.clone();
+        let flood = tokio::spawn(async move {
+            let mut client_id = 10_000;
+            loop {
+                if flood_tx
+                    .send(SchedulerMsg::Disconnect { client_id })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                client_id += 1;
+            }
+        });
+        lifecycle.mark_startup_restart_completed();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            lifecycle.wait_for_execution_ready(),
+        )
+        .await
+        .expect("startup activation must outrank a continuously ready control queue");
+        flood.abort();
+        let _ = flood.await;
+
+        sys.shutdown_with_reason("scheduler startup gate test complete")
+            .await;
+        drop(sys);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::fs::remove_dir_all(dir).expect("remove scheduler gate test dir");
     }
 }

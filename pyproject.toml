@@ -29,6 +29,11 @@ Homepage = "https://github.com/zrr1999/cue-shell"
 Releases = "https://github.com/zrr1999/cue-shell/releases"
 Repository = "https://github.com/zrr1999/cue-shell"
 
+[project.scripts]
+cue-client = "cue_shell_tools:cue_client"
+cue-daemon = "cue_shell_tools:cue_daemon"
+cue-tui = "cue_shell_tools:cue_tui"
+
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"

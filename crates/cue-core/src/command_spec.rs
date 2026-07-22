@@ -227,7 +227,15 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         category: CommandCategory::Job,
         arg_kind: CommandArgKind::Id(CommandIdKind::Job),
         usage: ":fg J<n>",
-        detail: "Attach a running PTY job in the foreground",
+        detail: "Attach to a running PTY job and claim control",
+        documented: true,
+    },
+    CommandSpec {
+        name: "watch",
+        category: CommandCategory::Job,
+        arg_kind: CommandArgKind::Id(CommandIdKind::Job),
+        usage: ":watch J<n>",
+        detail: "Observe a running PTY job without taking control",
         documented: true,
     },
     CommandSpec {
@@ -500,6 +508,10 @@ mod tests {
     fn id_command_boundaries_are_explicit() {
         assert_eq!(
             command_spec("fg").map(|spec| spec.arg_kind),
+            Some(CommandArgKind::Id(CommandIdKind::Job))
+        );
+        assert_eq!(
+            command_spec("watch").map(|spec| spec.arg_kind),
             Some(CommandArgKind::Id(CommandIdKind::Job))
         );
         assert_eq!(

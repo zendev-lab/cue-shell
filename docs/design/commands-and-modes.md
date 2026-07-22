@@ -89,6 +89,31 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 
 ## 三、基础命令完整列表
 
+### 3.0 命名 session 生命周期（CLI）
+
+命名 session 的创建、查询与清理属于结构化 CLI / IPC 面，不是 `Eval`
+内建命令：
+
+```text
+cue session create dev
+cue session list                     # 只列 active
+cue session list --archived          # 只列 archived
+cue session list --all --json        # active + archived
+cue session archive old-dev
+cue session restore old-dev
+cue tui --session dev
+```
+
+archive 是可逆的隐藏状态，不会删除 session 身份、scope cursor、job 历史或
+终端历史；restore 后才能重新 attach 或提交工作。为避免把仍在使用的现场伪装
+成“已清理”，daemon 会拒绝归档仍有连接、非终态 job、pending script/chain
+或自有 cron 的 session。调用方必须先 detach、等待/取消工作或显式移除 cron；
+没有 force archive，也没有 hard delete。
+
+这四个 archive/list 请求由 `session-archive` capability 保护。客户端必须在
+写入 socket 前检查 capability，包括 reader/writer split 与 multiplexed 路径，
+避免旧 daemon 因未知请求断开连接。
+
 ### 3.1 Job 管理
 
 | 命令 | 语法 | 语义 | 定位 |
@@ -99,10 +124,20 @@ fn dispatch(input: &str, mode: Mode) -> Result<Action> {
 | `:out` | `:out J1` | 查看 job stdout snapshot | 核心 |
 | `:tail` | `:tail J1 [bytes]` | 打开并持续 follow job stdout | 核心 |
 | `:err` | `:err J1` | 查看 job stderr snapshot | 核心 |
-| `:send` | `:send J1 <input>` | 向 running job 写 stdin | 核心 |
+| `:send` | `:send J1 <input>` | 向 running job 写 stdin；PTY 需要当前 controller | 核心 |
 | `:kill` | `:kill J<n>` / `:kill C<n>` | 终止 running job 或移除 cron | 核心 |
 | `:cancel` | `:cancel J3` | 取消 queued job | 核心 |
-| `:fg` | `:fg J2` | Job 进入前台 pty | 核心 |
+| `:fg` | `:fg J2` | attach PTY 并取得唯一 controller 租约 | 核心 |
+| `:watch` | `:watch J2` | 只读 attach 同一 PTY，不取得输入权 | 核心 |
+
+前台 PTY 可以有多个 observer，但同一时刻只有一个 controller。controller
+可发送按键、粘贴、resize 与 `:send`；observer 只接收 snapshot、实时输出和
+控制权状态。TUI 全屏视图用 `Ctrl+]` 释放或领取空闲控制权，用 `Ctrl+Z`
+完全 detach。
+
+`:fg` / `:watch` 是当前 IPC 连接的本地 attach 操作，只允许交互式 `Eval`
+调用；不能放进 `.cue` file script，也不能携带 `operation_id` 做跨连接重放。
+需要恢复现场时应重新 attach 命名 session，再显式执行 `:fg` 或 `:watch`。
 
 `:run` / JOB bare input 在发射前会基于当前 scope snapshot 做**显式 word expansion**：支持前导 `~`、`$VAR`、`${VAR}`；仍保持 direct exec，不隐式走 shell，也不做 glob / command substitution / field splitting。
 
@@ -371,6 +406,7 @@ Pipeline 内退出码 = 最后一个进程的退出码
 │ :kill <id>     终止 job / 移除 cron        │
 │ :cancel <id>   取消排队 job                │
 │ :fg <id>       前台（pty）                 │
+│ :watch <id>    只读观察前台（pty）          │
 │ :retry <id>    重试 failed job             │
 │ :log [id]      查看 job / cron 历史日志    │
 ├── Scope ──────────────────────────────────┤

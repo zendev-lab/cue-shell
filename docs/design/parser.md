@@ -307,6 +307,7 @@ Which argument type each command expects:
 | `:tail` | Job IdRef (`J<n>`) + optional bytes | ✗ |
 | `:err` | Job IdRef (`J<n>`) | ✗ |
 | `:fg` | Job IdRef (`J<n>`) | ✗ |
+| `:watch` | Job IdRef (`J<n>`) | ✗ |
 | `:wait` | Job IdRef (`J<n>`) | ✗ |
 | `:send` | Job target + raw text (`J<n> <input>`) | ✗ |
 | `:cancel` | Job IdRef (`J<n>`) | ✗ |

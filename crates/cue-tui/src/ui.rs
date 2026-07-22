@@ -34,23 +34,17 @@ pub(crate) fn draw(frame: &mut Frame, state: &AppState) {
         let vertical = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
         let body_area = vertical[0];
         let status_area = vertical[1];
-        let fg_id = state.fg_id().unwrap_or("?");
         let block = Block::new()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title(format!(" FG {fg_id} "));
+            .title(state.fg_title());
         let inner = block.inner(body_area);
         frame.render_widget(block, body_area);
         if let Some(screen) = state.fg_screen() {
             frame.render_widget(PseudoTerminal::new(screen), inner);
         }
-        let status = Paragraph::new(Line::from(vec![
-            " [fg] ".into(),
-            "Ctrl+Y copy".into(),
-            "  ".into(),
-            "Ctrl+Z detach".into(),
-        ]))
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        let status = Paragraph::new(Line::from(state.fg_footer_text()))
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
         frame.render_widget(status, status_area);
         return;
     }

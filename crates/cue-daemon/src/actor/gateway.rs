@@ -13,8 +13,10 @@ use tracing::{debug, error, info, warn};
 
 use cue_core::EventChannel;
 use cue_core::command_spec::{command_names, command_spec, mode_param_specs_for_command};
+#[cfg(test)]
+use cue_core::ipc::EventPayload;
 use cue_core::ipc::{
-    CompletionItem, CompletionKind, EventPayload, HighlightKind, HighlightSpan,
+    CompletionItem, CompletionKind, ForegroundRole, HighlightKind, HighlightSpan,
     IPC_PROTOCOL_VERSION, MAX_MESSAGE_SIZE, Message, OkPayload, RequestPayload, ResponsePayload,
     current_protocol_capabilities, encode_message, error_code,
 };
@@ -23,7 +25,10 @@ use cue_core::scope::EnvSnapshot;
 use crate::parser::{ResolvedCommand, Token, Tokenizer, parse_command, parse_file_script_command};
 
 use super::operation_ledger::{BeginOutcome, OperationLedger, OperationWaiter};
-use super::{ActorSystem, CLIENT_EVENT_CAP, EventBusMsg, GatewayMsg, SchedulerMsg};
+use super::{
+    ActorSystem, CLIENT_EVENT_CAP, ClientEvent, ClientEventAudience, EventBusMsg,
+    ForegroundRoleUpdate, GatewayMsg, SchedulerMsg, SessionBinding, SessionCommand,
+};
 
 /// Next client id counter (global, atomic).
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -72,13 +77,50 @@ const CLIENT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 #[derive(Clone)]
 struct ClientQueues {
     responses: mpsc::Sender<(u32, ResponsePayload)>,
-    events: mpsc::Sender<EventPayload>,
+    events: mpsc::Sender<ClientEvent>,
     disconnect: watch::Sender<bool>,
+    event_state: SharedClientEventState,
 }
+
+/// Gateway-owned transport audience and the response fence for one binding
+/// transition. The outer `Option` distinguishes an unhandshaken transport from
+/// the legacy anonymous binding represented by `Some(None)`.
+#[derive(Default)]
+struct ClientEventState {
+    binding: Option<Option<String>>,
+    fence: Option<ClientEventFence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClientEventFence {
+    request_id: u32,
+    policy: ClientEventFencePolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientEventFencePolicy {
+    /// A named-session switch invalidates every resource event queued before
+    /// the binding response becomes visible.
+    DropQueued,
+    /// Foreground attach establishes an atomic snapshot/live boundary. Events
+    /// produced after registration wait behind the response and are then kept.
+    HoldQueued,
+}
+
+type SharedClientEventState = Arc<Mutex<ClientEventState>>;
 
 /// Shared registry for each client's bounded outbound queues.
 type ClientMap = Arc<Mutex<HashMap<u64, ClientQueues>>>;
 type SharedOperationLedger = Arc<Mutex<OperationLedger>>;
+
+/// Outbound event plumbing owned by one client transport.
+///
+/// Keeping these two channels together avoids growing the request router's
+/// argument list every time transport event handling gains another concern.
+struct ClientEventSink<'a> {
+    sender: &'a mpsc::Sender<ClientEvent>,
+    disconnect: &'a watch::Sender<bool>,
+}
 
 fn client_registry(clients: &ClientMap) -> MutexGuard<'_, HashMap<u64, ClientQueues>> {
     clients
@@ -90,6 +132,101 @@ fn operation_ledger(operations: &SharedOperationLedger) -> MutexGuard<'_, Operat
     operations
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn client_event_state(state: &SharedClientEventState) -> MutexGuard<'_, ClientEventState> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn client_event_fenced(state: &SharedClientEventState) -> bool {
+    client_event_state(state).fence.is_some()
+}
+
+fn event_audience_matches(
+    binding: &Option<Option<String>>,
+    audience: &ClientEventAudience,
+) -> bool {
+    match audience {
+        ClientEventAudience::Global => true,
+        ClientEventAudience::Session(owner) => match binding {
+            // Resource events are never delivered before the handshake has
+            // established the transport's compatibility mode.
+            None => false,
+            // Anonymous transports intentionally retain the legacy global
+            // resource view.
+            Some(None) => true,
+            Some(Some(attached)) => owner.as_deref() == Some(attached.as_str()),
+        },
+    }
+}
+
+fn client_event_is_deliverable(state: &SharedClientEventState, event: &ClientEvent) -> bool {
+    let state = client_event_state(state);
+    state.fence.is_none() && event_audience_matches(&state.binding, &event.audience)
+}
+
+fn client_event_can_enqueue(state: &SharedClientEventState, event: &ClientEvent) -> bool {
+    let state = client_event_state(state);
+    event_audience_matches(&state.binding, &event.audience)
+        && !matches!(
+            state.fence,
+            Some(ClientEventFence {
+                policy: ClientEventFencePolicy::DropQueued,
+                ..
+            })
+        )
+}
+
+/// Start the outbound half of a binding transition before any await can let a
+/// direct event overtake it. Returns whether the binding itself changed.
+fn begin_client_event_fence(
+    state: &SharedClientEventState,
+    request_id: u32,
+    named_session_id: Option<String>,
+) -> bool {
+    let mut state = client_event_state(state);
+    let changed = state.binding.as_ref() != Some(&named_session_id);
+    state.binding = Some(named_session_id);
+    state.fence = Some(ClientEventFence {
+        request_id,
+        policy: ClientEventFencePolicy::DropQueued,
+    });
+    changed
+}
+
+/// Hold matching events until a foreground response has been written. Unlike
+/// a binding switch, these events happened after the attachment's atomic
+/// snapshot cut and must be delivered rather than drained.
+fn begin_client_event_hold_fence(state: &SharedClientEventState, request_id: u32) {
+    let mut state = client_event_state(state);
+    debug_assert!(state.fence.is_none(), "client already has an event fence");
+    state.fence = Some(ClientEventFence {
+        request_id,
+        policy: ClientEventFencePolicy::HoldQueued,
+    });
+}
+
+/// A binding response is the visibility barrier. Discard everything that was
+/// queued while the transition was in flight, then reopen delivery. Audience
+/// metadata on later events protects the small enqueue race around this drain.
+fn complete_client_event_fence(
+    state: &SharedClientEventState,
+    request_id: u32,
+    events: &mut mpsc::Receiver<ClientEvent>,
+) {
+    let mut state = client_event_state(state);
+    let Some(fence) = state.fence else {
+        return;
+    };
+    if fence.request_id != request_id {
+        return;
+    }
+    if fence.policy == ClientEventFencePolicy::DropQueued {
+        while events.try_recv().is_ok() {}
+    }
+    state.fence = None;
 }
 
 fn reserve_request_id(inflight: &Arc<Mutex<HashSet<u32>>>, request_id: u32) -> bool {
@@ -117,6 +254,7 @@ pub(super) async fn spawn(
     mut rx: mpsc::Receiver<GatewayMsg>,
     socket_path: PathBuf,
     sys: ActorSystem,
+    lifecycle: Arc<crate::lifecycle::DaemonLifecycle>,
 ) -> Result<()> {
     // Startup owns stale-socket cleanup while holding the socket-specific
     // instance lock. The gateway must never unlink a path that may belong to a
@@ -136,6 +274,7 @@ pub(super) async fn spawn(
     // Accept loop — runs in its own task.
     let sys_accept = sys.clone();
     let operations_for_accept = Arc::clone(&operations);
+    let lifecycle_for_accept = Arc::clone(&lifecycle);
     let accept_handle = tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -145,12 +284,14 @@ pub(super) async fn spawn(
                     let sys_clone = sys_accept.clone();
                     let clients_clone = Arc::clone(&clients_for_dispatch);
                     let operations_clone = Arc::clone(&operations_for_accept);
+                    let lifecycle_clone = Arc::clone(&lifecycle_for_accept);
                     tokio::spawn(handle_client(
                         client_id,
                         stream,
                         sys_clone,
                         clients_clone,
                         operations_clone,
+                        lifecycle_clone,
                     ));
                 }
                 Err(e) => {
@@ -190,8 +331,16 @@ pub(super) async fn spawn(
                     }
                 }
 
-                GatewayMsg::SendEvent { client_id, payload } => {
-                    queue_event_for_client(&clients, client_id, payload);
+                GatewayMsg::SendEvent {
+                    client_id,
+                    payload,
+                    session_id,
+                } => {
+                    queue_event_for_client(
+                        &clients,
+                        client_id,
+                        ClientEvent::session(payload, session_id),
+                    );
                 }
 
                 GatewayMsg::Shutdown => {
@@ -234,13 +383,15 @@ async fn handle_client(
     sys: ActorSystem,
     clients: ClientMap,
     operations: SharedOperationLedger,
+    lifecycle: Arc<crate::lifecycle::DaemonLifecycle>,
 ) {
     // Per-client response channel.
     let (resp_tx, mut resp_rx) = mpsc::channel::<(u32, ResponsePayload)>(CLIENT_RESPONSE_CAP);
     // Per-client event channel.
-    let (evt_tx, mut evt_rx) = mpsc::channel::<EventPayload>(CLIENT_EVENT_CAP);
+    let (evt_tx, mut evt_rx) = mpsc::channel::<ClientEvent>(CLIENT_EVENT_CAP);
     let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
     let inflight_request_ids = Arc::new(Mutex::new(HashSet::new()));
+    let event_state = Arc::new(Mutex::new(ClientEventState::default()));
 
     // Register.
     client_registry(&clients).insert(
@@ -249,6 +400,7 @@ async fn handle_client(
             responses: resp_tx,
             events: evt_tx.clone(),
             disconnect: disconnect_tx.clone(),
+            event_state: Arc::clone(&event_state),
         },
     );
     let mut session_namespace = None;
@@ -273,7 +425,7 @@ async fn handle_client(
     loop {
         tokio::select! {
             // Receive complete frames from the non-cancellable reader loop.
-            msg_result = incoming_rx.recv() => {
+            msg_result = incoming_rx.recv(), if !client_event_fenced(&event_state) => {
                 let Some(msg_result) = msg_result else {
                     break;
                 };
@@ -300,6 +452,7 @@ async fn handle_client(
                             session_namespace,
                             operation_id.as_deref(),
                             &payload,
+                            &sys.config.aliases,
                             waiter,
                         );
                         let should_route = match outcome {
@@ -309,7 +462,7 @@ async fn handle_client(
                                 if sys.gateway.send(GatewayMsg::SendResponse {
                                     client_id,
                                     request_id: id,
-                                    payload,
+                                    payload: *payload,
                                 }).await.is_err() {
                                     break;
                                 }
@@ -335,8 +488,12 @@ async fn handle_client(
                                 id,
                                 payload,
                                 &sys,
-                                &evt_tx,
-                                &disconnect_tx,
+                                ClientEventSink {
+                                    sender: &evt_tx,
+                                    disconnect: &disconnect_tx,
+                                },
+                                &lifecycle,
+                                &event_state,
                             ).await {
                                 Ok(Some(established_namespace)) => {
                                     session_namespace = Some(established_namespace);
@@ -371,17 +528,35 @@ async fn handle_client(
 
             // Deliver response back to client.
             Some((request_id, payload)) = resp_rx.recv() => {
+                let is_restart_response = matches!(
+                    &payload,
+                    ResponsePayload::Ok(OkPayload::RestartAccepted { .. })
+                );
                 let msg = Message::Response { id: request_id, payload };
-                if write_client_message(&mut writer, &msg).await.is_err() {
+                let write_result = write_client_message(&mut writer, &msg).await;
+                if is_restart_response {
+                    // Successful flush satisfies ACK-before-teardown. A failed
+                    // flush resolves the response gate too: the restart remains
+                    // accepted, but the caller must treat the result as ambiguous.
+                    lifecycle.mark_restart_response_complete(client_id, request_id);
+                }
+                if write_result.is_err() {
                     break;
                 }
+                complete_client_event_fence(&event_state, request_id, &mut evt_rx);
                 // Keep the fence until bytes are written, not merely queued.
                 release_request_id(&inflight_request_ids, request_id);
             }
 
             // Deliver pushed event to client.
-            Some(event) = evt_rx.recv() => {
-                let msg = Message::Event { payload: event };
+            Some(event) = evt_rx.recv(), if !client_event_fenced(&event_state) => {
+                if !client_event_is_deliverable(&event_state, &event) {
+                    debug!(%client_id, "gateway: dropping event outside current binding or response fence");
+                    continue;
+                }
+                let msg = Message::Event {
+                    payload: event.payload,
+                };
                 if write_client_message(&mut writer, &msg).await.is_err() {
                     break;
                 }
@@ -397,6 +572,7 @@ async fn handle_client(
     }
 
     // Cleanup.
+    lifecycle.resolve_restart_response_disconnect(client_id);
     reader_handle.abort();
     let _ = reader_handle.await;
     info!(%client_id, "gateway: client disconnected");
@@ -410,16 +586,8 @@ async fn handle_client(
     {
         debug!(%client_id, "gateway: event bus unavailable during client cleanup");
     }
-    if sys
-        .process_mgr
-        .send(super::ProcessMgrMsg::DetachFg {
-            client_id,
-            reason: "client disconnected".into(),
-        })
-        .await
-        .is_err()
-    {
-        debug!(%client_id, "gateway: process manager unavailable during client cleanup");
+    if let Err(error) = detach_client_foreground(&sys, client_id, "client disconnected").await {
+        debug!(%client_id, "gateway: foreground cleanup failed: {error}");
     }
     if sys
         .scheduler
@@ -436,25 +604,54 @@ fn idempotency_outcome(
     session_namespace: Option<[u8; 32]>,
     operation_id: Option<&str>,
     payload: &RequestPayload,
+    aliases: &crate::config::AliasConfig,
     waiter: OperationWaiter,
 ) -> Result<BeginOutcome> {
     let Some(operation_id) = operation_id else {
         return Ok(BeginOutcome::Route);
     };
+    if eval_resolves_to_connection_local_foreground(payload, aliases) {
+        return Ok(BeginOutcome::respond(ResponsePayload::err(
+            error_code::INVALID_REQUEST,
+            "operation_id is not supported for connection-local :fg or :watch requests",
+        )));
+    }
     if !is_side_effecting_request(payload) {
-        return Ok(BeginOutcome::Respond(ResponsePayload::err(
+        return Ok(BeginOutcome::respond(ResponsePayload::err(
             error_code::INVALID_REQUEST,
             "operation_id is supported only for daemon-global side-effecting requests",
         )));
     }
     let Some(session_namespace) = session_namespace else {
-        return Ok(BeginOutcome::Respond(ResponsePayload::err(
+        return Ok(BeginOutcome::respond(ResponsePayload::err(
             error_code::INVALID_REQUEST,
             "operation_id requires a successful session handshake",
         )));
     };
     let fingerprint = OperationLedger::fingerprint(payload).context("fingerprint IPC request")?;
     Ok(operation_ledger(operations).begin(session_namespace, operation_id, fingerprint, waiter))
+}
+
+fn eval_resolves_to_connection_local_foreground(
+    payload: &RequestPayload,
+    aliases: &crate::config::AliasConfig,
+) -> bool {
+    let RequestPayload::Eval { input, mode } = payload else {
+        return false;
+    };
+    let input = aliases.apply(input);
+    parse_command(&input, *mode)
+        .is_ok_and(|command| command_contains_connection_local_foreground(&command))
+}
+
+fn command_contains_connection_local_foreground(command: &ResolvedCommand) -> bool {
+    match command {
+        ResolvedCommand::Fg { .. } => true,
+        ResolvedCommand::Script { items, .. } => items
+            .iter()
+            .any(|item| command_contains_connection_local_foreground(&item.command)),
+        _ => false,
+    }
 }
 
 fn is_side_effecting_request(payload: &RequestPayload) -> bool {
@@ -465,8 +662,48 @@ fn is_side_effecting_request(payload: &RequestPayload) -> bool {
             | RequestPayload::KillJob { .. }
             | RequestPayload::CancelExecution { .. }
             | RequestPayload::RemoveCron { .. }
+            | RequestPayload::ArchiveSession { .. }
+            | RequestPayload::RestoreSession { .. }
+            | RequestPayload::Restart {}
             | RequestPayload::Shutdown {}
     )
+}
+
+fn command_starts_execution(command: &ResolvedCommand) -> bool {
+    matches!(
+        command,
+        ResolvedCommand::Script { .. }
+            | ResolvedCommand::Run { .. }
+            | ResolvedCommand::Cron { .. }
+            | ResolvedCommand::Retry { .. }
+            | ResolvedCommand::Resume { .. }
+    )
+}
+
+fn draining_response() -> ResponsePayload {
+    ResponsePayload::err(
+        error_code::DAEMON_DRAINING,
+        "daemon startup/restart handoff is in progress; new execution admission is closed",
+    )
+}
+
+fn foreground_role_response(
+    result: Result<Result<ForegroundRoleUpdate, String>, tokio::sync::oneshot::error::RecvError>,
+    operation: &str,
+) -> ResponsePayload {
+    match result {
+        Ok(Ok(update)) => ResponsePayload::Ok(OkPayload::FgRoleChanged {
+            id: update.id,
+            attachment_id: update.attachment_id,
+            role: update.role,
+            control_available: update.control_available,
+        }),
+        Ok(Err(message)) => ResponsePayload::err(error_code::INVALID_STATE, message),
+        Err(error) => ResponsePayload::err(
+            error_code::INTERNAL,
+            format!("process manager dropped {operation} reply: {error}"),
+        ),
+    }
 }
 
 /// Route an incoming request to the appropriate actor.
@@ -475,8 +712,9 @@ async fn route_request(
     request_id: u32,
     payload: RequestPayload,
     sys: &ActorSystem,
-    evt_tx: &mpsc::Sender<EventPayload>,
-    disconnect_tx: &watch::Sender<bool>,
+    event_sink: ClientEventSink<'_>,
+    lifecycle: &crate::lifecycle::DaemonLifecycle,
+    event_state: &SharedClientEventState,
 ) -> Result<Option<[u8; 32]>> {
     match payload {
         RequestPayload::Handshake {
@@ -485,7 +723,6 @@ async fn route_request(
             env,
             refresh,
         } => {
-            let namespace_session_id = session_id.clone();
             let snapshot = EnvSnapshot {
                 env,
                 cwd: PathBuf::from(cwd),
@@ -503,6 +740,8 @@ async fn route_request(
                 .context("send session handshake to scheduler")?;
             match result.await {
                 Ok(Ok(binding)) => {
+                    prepare_client_binding(sys, event_state, client_id, request_id, &binding)
+                        .await?;
                     sys.gateway
                         .send(GatewayMsg::SendResponse {
                             client_id,
@@ -512,7 +751,7 @@ async fn route_request(
                         .await
                         .context("send handshake ack")?;
                     return Ok(Some(OperationLedger::session_incarnation_namespace(
-                        &namespace_session_id,
+                        &binding.session_id,
                         binding.incarnation,
                     )));
                 }
@@ -542,10 +781,110 @@ async fn route_request(
             }
         }
 
+        RequestPayload::CreateSession { name } => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::Create { name },
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
+        RequestPayload::ListSessions {} => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::List,
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
+        RequestPayload::ListArchivedSessions {} => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::ListArchived,
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
+        RequestPayload::ListAllSessions {} => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::ListAll,
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
+        RequestPayload::ArchiveSession { selector } => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::Archive { selector },
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
+        RequestPayload::RestoreSession { selector } => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::Restore { selector },
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
+        RequestPayload::AttachSession { selector, refresh } => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::Attach { selector, refresh },
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
+        RequestPayload::SessionInfo { selector } => {
+            return route_session_command(
+                client_id,
+                request_id,
+                SessionCommand::Info { selector },
+                sys,
+                event_state,
+            )
+            .await;
+        }
+
         RequestPayload::Eval { input, mode } => {
             let input = sys.config.aliases.apply(&input);
             match parse_command(&input, mode) {
                 Ok(command) => {
+                    if lifecycle.execution_admission_closed() && command_starts_execution(&command)
+                    {
+                        sys.gateway
+                            .send(GatewayMsg::SendResponse {
+                                client_id,
+                                request_id,
+                                payload: draining_response(),
+                            })
+                            .await
+                            .context("send draining rejection")?;
+                        return Ok(None);
+                    }
                     if matches!(
                         command,
                         ResolvedCommand::Script {
@@ -562,6 +901,9 @@ async fn route_request(
                             .await
                             .context("send inline script rejection")?;
                         return Ok(None);
+                    }
+                    if matches!(command, ResolvedCommand::Fg { .. }) {
+                        begin_client_event_hold_fence(event_state, request_id);
                     }
                     send_scheduler_eval(sys, client_id, request_id, command, "send to scheduler")
                         .await?;
@@ -582,34 +924,61 @@ async fn route_request(
             }
         }
 
-        RequestPayload::RunScript { path, input } => match parse_file_script_command(&input) {
-            Ok(mut command) => {
-                if let ResolvedCommand::Script { source, .. } = &mut command {
-                    *source = cue_core::ipc::ScriptSource::File { path };
-                }
-                send_scheduler_eval(
-                    sys,
-                    client_id,
-                    request_id,
-                    command,
-                    "send script to scheduler",
-                )
-                .await?;
-            }
-            Err(e) => {
+        RequestPayload::RunScript { path, input } => {
+            if lifecycle.execution_admission_closed() {
                 sys.gateway
                     .send(GatewayMsg::SendResponse {
                         client_id,
                         request_id,
-                        payload: ResponsePayload::err(
-                            error_code::INVALID_SYNTAX,
-                            syntax_error_message(&input, &e.to_string()),
-                        ),
+                        payload: draining_response(),
                     })
                     .await
-                    .context("send error response")?;
+                    .context("send draining script rejection")?;
+                return Ok(None);
             }
-        },
+            match parse_file_script_command(&input) {
+                Ok(mut command) => {
+                    if command_contains_connection_local_foreground(&command) {
+                        sys.gateway
+                            .send(GatewayMsg::SendResponse {
+                                client_id,
+                                request_id,
+                                payload: ResponsePayload::err(
+                                    error_code::NOT_SUPPORTED,
+                                    "file scripts cannot use connection-local :fg or :watch commands; attach to the job interactively instead",
+                                ),
+                            })
+                            .await
+                            .context("send file script foreground rejection")?;
+                        return Ok(None);
+                    }
+                    if let ResolvedCommand::Script { source, .. } = &mut command {
+                        *source = cue_core::ipc::ScriptSource::File { path };
+                    }
+                    send_scheduler_eval(
+                        sys,
+                        client_id,
+                        request_id,
+                        command,
+                        "send script to scheduler",
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: ResponsePayload::err(
+                                error_code::INVALID_SYNTAX,
+                                syntax_error_message(&input, &e.to_string()),
+                            ),
+                        })
+                        .await
+                        .context("send error response")?;
+                }
+            }
+        }
 
         RequestPayload::ListJobs { limit } => {
             send_scheduler_eval(
@@ -768,8 +1137,8 @@ async fn route_request(
                     .send(EventBusMsg::Subscribe {
                         client_id,
                         channel,
-                        sender: evt_tx.clone(),
-                        disconnect: disconnect_tx.clone(),
+                        sender: event_sink.sender.clone(),
+                        disconnect: event_sink.disconnect.clone(),
                     })
                     .await?;
             }
@@ -812,24 +1181,77 @@ async fn route_request(
         }
 
         RequestPayload::FgAttach { id } => {
+            begin_client_event_hold_fence(event_state, request_id);
             send_scheduler_eval(
                 sys,
                 client_id,
                 request_id,
-                ResolvedCommand::Fg { id },
+                ResolvedCommand::Fg {
+                    id,
+                    role: ForegroundRole::Controller,
+                },
                 "send fg attach to scheduler",
             )
             .await?;
         }
 
-        RequestPayload::FgDetach {} => {
+        RequestPayload::FgWatch { id } => {
+            begin_client_event_hold_fence(event_state, request_id);
+            send_scheduler_eval(
+                sys,
+                client_id,
+                request_id,
+                ResolvedCommand::Fg {
+                    id,
+                    role: ForegroundRole::Observer,
+                },
+                "send fg watch to scheduler",
+            )
+            .await?;
+        }
+
+        RequestPayload::FgClaimControl {} => {
+            begin_client_event_hold_fence(event_state, request_id);
+            let (tx, rx) = tokio::sync::oneshot::channel();
             sys.process_mgr
-                .send(super::ProcessMgrMsg::DetachFg {
+                .send(super::ProcessMgrMsg::ClaimFgControl {
                     client_id,
-                    reason: "detached".into(),
+                    reply: tx,
                 })
                 .await
-                .context("send fg detach to process_mgr")?;
+                .context("claim foreground control")?;
+            let payload = foreground_role_response(rx.await, "claim foreground control");
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload,
+                })
+                .await?;
+        }
+
+        RequestPayload::FgReleaseControl {} => {
+            begin_client_event_hold_fence(event_state, request_id);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sys.process_mgr
+                .send(super::ProcessMgrMsg::ReleaseFgControl {
+                    client_id,
+                    reply: tx,
+                })
+                .await
+                .context("release foreground control")?;
+            let payload = foreground_role_response(rx.await, "release foreground control");
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload,
+                })
+                .await?;
+        }
+
+        RequestPayload::FgDetach {} => {
+            detach_client_foreground(sys, client_id, "detached").await?;
             sys.gateway
                 .send(GatewayMsg::SendResponse {
                     client_id,
@@ -920,6 +1342,8 @@ async fn route_request(
                     payload: ResponsePayload::Ok(OkPayload::Pong {
                         version: crate::version().to_string(),
                         instance_id: crate::daemon_instance_id().to_string(),
+                        generation_id: crate::daemon_generation_id().to_string(),
+                        ready: lifecycle.is_execution_ready(),
                         protocol_version: IPC_PROTOCOL_VERSION,
                         capabilities: current_protocol_capabilities(),
                     }),
@@ -927,8 +1351,62 @@ async fn route_request(
                 .await?;
         }
 
+        RequestPayload::Restart {} => {
+            if !lifecycle.is_execution_ready() {
+                sys.gateway
+                    .send(GatewayMsg::SendResponse {
+                        client_id,
+                        request_id,
+                        payload: draining_response(),
+                    })
+                    .await
+                    .context("send starting restart rejection")?;
+                return Ok(None);
+            }
+            let ticket = lifecycle.request_restart(client_id, request_id)?;
+            if ticket.first_request {
+                let (reply, accepted) = tokio::sync::oneshot::channel();
+                if sys
+                    .scheduler
+                    .send(SchedulerMsg::BeginDrain { reply })
+                    .await
+                    .is_err()
+                    || accepted.await.is_err()
+                {
+                    // The scheduler may already have closed admission before
+                    // dropping its acknowledgement. Never reopen only one side
+                    // of that boundary: cancel the durable successor fence and
+                    // fail-stop the daemon through the coordinated signal path.
+                    lifecycle.fail_stop_restart()?;
+                    sys.gateway
+                        .send(GatewayMsg::SendResponse {
+                            client_id,
+                            request_id,
+                            payload: ResponsePayload::err(
+                                error_code::INTERNAL,
+                                "scheduler could not begin daemon drain",
+                            ),
+                        })
+                        .await?;
+                    return Ok(None);
+                }
+            }
+            sys.gateway
+                .send(GatewayMsg::SendResponse {
+                    client_id,
+                    request_id,
+                    payload: ResponsePayload::Ok(OkPayload::RestartAccepted {
+                        restart_id: ticket.restart_id,
+                        daemon_instance_id: ticket.daemon_instance_id,
+                        target_generation: ticket.target_generation,
+                    }),
+                })
+                .await?;
+        }
+
         RequestPayload::Shutdown {} => {
             info!("gateway: shutdown request from client {client_id}");
+            lifecycle.cancel_restart_for_shutdown()?;
             sys.gateway
                 .send(GatewayMsg::SendResponse {
                     client_id,
@@ -944,6 +1422,89 @@ async fn route_request(
     }
 
     Ok(None)
+}
+
+async fn route_session_command(
+    client_id: u64,
+    request_id: u32,
+    command: SessionCommand,
+    sys: &ActorSystem,
+    event_state: &SharedClientEventState,
+) -> Result<Option<[u8; 32]>> {
+    let (reply, result) = tokio::sync::oneshot::channel();
+    sys.scheduler
+        .send(SchedulerMsg::Session {
+            client_id,
+            command,
+            reply,
+        })
+        .await
+        .context("send named-session request to scheduler")?;
+    let result = result
+        .await
+        .context("scheduler named-session reply dropped")?;
+    let namespace = result.binding.as_ref().map(|binding| {
+        OperationLedger::session_incarnation_namespace(&binding.session_id, binding.incarnation)
+    });
+    if let Some(binding) = result.binding.as_ref() {
+        prepare_client_binding(sys, event_state, client_id, request_id, binding).await?;
+    }
+    sys.gateway
+        .send(GatewayMsg::SendResponse {
+            client_id,
+            request_id,
+            payload: result.payload,
+        })
+        .await
+        .context("send named-session response")?;
+    Ok(namespace)
+}
+
+async fn prepare_client_binding(
+    sys: &ActorSystem,
+    event_state: &SharedClientEventState,
+    client_id: u64,
+    request_id: u32,
+    binding: &SessionBinding,
+) -> Result<()> {
+    // This update must happen before the first await after the scheduler has
+    // accepted the binding, otherwise a direct event can overtake the fence.
+    let binding_changed =
+        begin_client_event_fence(event_state, request_id, binding.named_session_id.clone());
+    bind_client_event_session(sys, client_id, binding.named_session_id.clone()).await?;
+    if binding_changed {
+        detach_client_foreground(sys, client_id, "session binding changed").await?;
+    }
+    Ok(())
+}
+
+async fn detach_client_foreground(sys: &ActorSystem, client_id: u64, reason: &str) -> Result<()> {
+    let (reply, detached) = tokio::sync::oneshot::channel();
+    sys.process_mgr
+        .send(super::ProcessMgrMsg::DetachFg {
+            client_id,
+            reason: reason.to_string(),
+            reply: Some(reply),
+        })
+        .await
+        .context("send foreground detach to process manager")?;
+    detached
+        .await
+        .context("process manager dropped foreground detach acknowledgement")
+}
+
+async fn bind_client_event_session(
+    sys: &ActorSystem,
+    client_id: u64,
+    named_session_id: Option<String>,
+) -> Result<()> {
+    sys.event_bus
+        .send(EventBusMsg::SetClientSession {
+            client_id,
+            named_session_id,
+        })
+        .await
+        .context("bind client event session")
 }
 
 async fn send_scheduler_eval(
@@ -988,11 +1549,15 @@ fn queue_response_for_client(
     }
 }
 
-fn queue_event_for_client(clients: &ClientMap, client_id: u64, payload: EventPayload) {
+fn queue_event_for_client(clients: &ClientMap, client_id: u64, event: ClientEvent) {
     let client = client_registry(clients).get(&client_id).cloned();
 
     if let Some(client) = client {
-        match client.events.try_send(payload) {
+        if !client_event_can_enqueue(&client.event_state, &event) {
+            debug!(%client_id, "gateway: filtered direct event outside current binding or response fence");
+            return;
+        }
+        match client.events.try_send(event) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(%client_id, "gateway: evicting lagging client with full direct-event queue");
@@ -1270,6 +1835,10 @@ mod tests {
             sys,
             Arc::clone(&clients),
             operations,
+            Arc::new(crate::lifecycle::DaemonLifecycle::new(
+                PathBuf::from("/tmp/cued-gateway-partial-frame.sock"),
+                crate::lifecycle::RestartOwnership::Standalone,
+            )),
         ));
         while !client_registry(&clients).contains_key(&77) {
             tokio::task::yield_now().await;
@@ -1291,9 +1860,9 @@ mod tests {
         queue_event_for_client(
             &clients,
             77,
-            EventPayload::ShuttingDown {
+            ClientEvent::global(EventPayload::ShuttingDown {
                 reason: "concurrent event".into(),
-            },
+            }),
         );
         assert!(matches!(
             read_message(&mut client).await.expect("read event"),
@@ -1335,6 +1904,8 @@ mod tests {
             payload: ResponsePayload::Ok(OkPayload::Pong {
                 version: "0.1.0".into(),
                 instance_id: "00000000-0000-4000-8000-000000000000".into(),
+                generation_id: "generation-1".into(),
+                ready: true,
                 protocol_version: IPC_PROTOCOL_VERSION,
                 capabilities: current_protocol_capabilities(),
             }),
@@ -1353,7 +1924,7 @@ mod tests {
     struct TestClientQueues {
         queues: ClientQueues,
         responses: mpsc::Receiver<(u32, ResponsePayload)>,
-        events: mpsc::Receiver<EventPayload>,
+        events: mpsc::Receiver<ClientEvent>,
         disconnect: watch::Receiver<bool>,
     }
 
@@ -1361,11 +1932,16 @@ mod tests {
         let (response_tx, responses) = mpsc::channel(capacity);
         let (event_tx, events) = mpsc::channel(capacity);
         let (disconnect_tx, disconnect) = watch::channel(false);
+        let event_state = Arc::new(Mutex::new(ClientEventState {
+            binding: Some(None),
+            fence: None,
+        }));
         TestClientQueues {
             queues: ClientQueues {
                 responses: response_tx,
                 events: event_tx,
                 disconnect: disconnect_tx,
+                event_state,
             },
             responses,
             events,
@@ -1381,6 +1957,123 @@ mod tests {
         assert!(!reserve_request_id(&inflight, 7));
         release_request_id(&inflight, 7);
         assert!(reserve_request_id(&inflight, 7));
+    }
+
+    #[test]
+    fn binding_response_fence_discards_queued_events_and_revalidates_owner() {
+        let state = Arc::new(Mutex::new(ClientEventState {
+            binding: Some(Some("SS-alpha".into())),
+            fence: None,
+        }));
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send(ClientEvent::session(
+            EventPayload::ShuttingDown {
+                reason: "queued alpha".into(),
+            },
+            Some("SS-alpha".into()),
+        ))
+        .unwrap();
+
+        assert!(begin_client_event_fence(&state, 41, Some("SS-beta".into())));
+        // EventBus can enqueue directly while the socket writer is fenced.
+        tx.try_send(ClientEvent::session(
+            EventPayload::ShuttingDown {
+                reason: "early beta".into(),
+            },
+            Some("SS-beta".into()),
+        ))
+        .unwrap();
+        complete_client_event_fence(&state, 41, &mut rx);
+
+        assert!(rx.try_recv().is_err());
+        assert!(client_event_is_deliverable(
+            &state,
+            &ClientEvent::session(
+                EventPayload::ShuttingDown {
+                    reason: "current beta".into(),
+                },
+                Some("SS-beta".into()),
+            )
+        ));
+        assert!(!client_event_is_deliverable(
+            &state,
+            &ClientEvent::session(
+                EventPayload::ShuttingDown {
+                    reason: "stale alpha".into(),
+                },
+                Some("SS-alpha".into()),
+            )
+        ));
+    }
+
+    #[test]
+    fn foreground_response_fence_holds_matching_events_until_response_is_written() {
+        let state = Arc::new(Mutex::new(ClientEventState {
+            binding: Some(Some("SS-alpha".into())),
+            fence: None,
+        }));
+        let (tx, mut rx) = mpsc::channel(2);
+
+        begin_client_event_hold_fence(&state, 42);
+        let event = ClientEvent::session(
+            EventPayload::FgOutput {
+                id: "J1".into(),
+                attachment_id: 1,
+                data: b"after-cut".to_vec(),
+            },
+            Some("SS-alpha".into()),
+        );
+        assert!(client_event_can_enqueue(&state, &event));
+        assert!(!client_event_is_deliverable(&state, &event));
+        tx.try_send(event).unwrap();
+        complete_client_event_fence(&state, 42, &mut rx);
+
+        let retained = rx.try_recv().expect("retained foreground event");
+        assert!(client_event_is_deliverable(&state, &retained));
+    }
+
+    #[test]
+    fn direct_event_dispatch_filters_named_owner_and_preserves_anonymous_compatibility() {
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let mut named = test_client_queues(2);
+        client_event_state(&named.queues.event_state).binding = Some(Some("SS-alpha".into()));
+        client_registry(&clients).insert(7, named.queues.clone());
+
+        queue_event_for_client(
+            &clients,
+            7,
+            ClientEvent::session(
+                EventPayload::ShuttingDown {
+                    reason: "foreign".into(),
+                },
+                Some("SS-beta".into()),
+            ),
+        );
+        assert!(named.events.try_recv().is_err());
+        queue_event_for_client(
+            &clients,
+            7,
+            ClientEvent::session(
+                EventPayload::ShuttingDown {
+                    reason: "matching".into(),
+                },
+                Some("SS-alpha".into()),
+            ),
+        );
+        assert!(named.events.try_recv().is_ok());
+
+        client_event_state(&named.queues.event_state).binding = Some(None);
+        queue_event_for_client(
+            &clients,
+            7,
+            ClientEvent::session(
+                EventPayload::ShuttingDown {
+                    reason: "legacy global".into(),
+                },
+                Some("SS-beta".into()),
+            ),
+        );
+        assert!(named.events.try_recv().is_ok());
     }
 
     #[test]
@@ -1411,9 +2104,9 @@ mod tests {
         let mut healthy = test_client_queues(1);
         slow.queues
             .events
-            .try_send(EventPayload::ShuttingDown {
+            .try_send(ClientEvent::global(EventPayload::ShuttingDown {
                 reason: "first".into(),
-            })
+            }))
             .unwrap();
         client_registry(&clients).insert(7, slow.queues.clone());
         client_registry(&clients).insert(8, healthy.queues.clone());
@@ -1421,22 +2114,22 @@ mod tests {
         queue_event_for_client(
             &clients,
             7,
-            EventPayload::ShuttingDown {
+            ClientEvent::global(EventPayload::ShuttingDown {
                 reason: "second".into(),
-            },
+            }),
         );
         queue_event_for_client(
             &clients,
             8,
-            EventPayload::ShuttingDown {
+            ClientEvent::global(EventPayload::ShuttingDown {
                 reason: "healthy".into(),
-            },
+            }),
         );
 
         assert!(*slow.disconnect.borrow_and_update());
         assert!(!client_registry(&clients).contains_key(&7));
         assert!(matches!(
-            healthy.events.try_recv().unwrap(),
+            healthy.events.try_recv().unwrap().payload,
             EventPayload::ShuttingDown { reason } if reason == "healthy"
         ));
         assert!(client_registry(&clients).contains_key(&8));
@@ -1467,14 +2160,23 @@ mod tests {
         let sys = test_actor_system(event_bus_tx, gateway_tx);
         let (evt_tx, mut evt_rx) = mpsc::channel(1);
         let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        let event_state = Arc::new(Mutex::new(ClientEventState::default()));
+        let lifecycle = crate::lifecycle::DaemonLifecycle::new(
+            PathBuf::from("/tmp/cued-gateway-subscribe.sock"),
+            crate::lifecycle::RestartOwnership::Standalone,
+        );
 
         route_request(
             7,
             42,
             RequestPayload::subscribe(&[EventChannel::System]),
             &sys,
-            &evt_tx,
-            &disconnect_tx,
+            ClientEventSink {
+                sender: &evt_tx,
+                disconnect: &disconnect_tx,
+            },
+            &lifecycle,
+            &event_state,
         )
         .await
         .unwrap();
@@ -1489,12 +2191,12 @@ mod tests {
                 assert_eq!(client_id, 7);
                 assert_eq!(channel, EventChannel::System);
                 sender
-                    .try_send(EventPayload::ShuttingDown {
+                    .try_send(ClientEvent::global(EventPayload::ShuttingDown {
                         reason: "test".into(),
-                    })
+                    }))
                     .unwrap();
                 assert!(matches!(
-                    evt_rx.try_recv().unwrap(),
+                    evt_rx.try_recv().unwrap().payload,
                     EventPayload::ShuttingDown { .. }
                 ));
             }
@@ -1523,6 +2225,11 @@ mod tests {
         let sys = test_actor_system(event_bus_tx, gateway_tx);
         let (evt_tx, _evt_rx) = mpsc::channel(1);
         let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        let event_state = Arc::new(Mutex::new(ClientEventState::default()));
+        let lifecycle = crate::lifecycle::DaemonLifecycle::new(
+            PathBuf::from("/tmp/cued-gateway-invalid-subscribe.sock"),
+            crate::lifecycle::RestartOwnership::Standalone,
+        );
 
         route_request(
             7,
@@ -1531,8 +2238,12 @@ mod tests {
                 channels: vec!["output:C1".into()],
             },
             &sys,
-            &evt_tx,
-            &disconnect_tx,
+            ClientEventSink {
+                sender: &evt_tx,
+                disconnect: &disconnect_tx,
+            },
+            &lifecycle,
+            &event_state,
         )
         .await
         .unwrap();
@@ -1600,6 +2311,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn foreground_eval_operation_id_is_rejected_before_ledger_after_alias_resolution() {
+        let operations: SharedOperationLedger = Arc::new(Mutex::new(OperationLedger::default()));
+        let aliases = crate::config::AliasConfig {
+            entries: vec![crate::config::AliasEntry {
+                from: "observe".into(),
+                to: ":watch".into(),
+            }],
+        };
+        let namespace = Some(OperationLedger::session_namespace("session-foreground"));
+
+        for (index, input) in [":fg J1", ":watch J1", "observe J1"]
+            .into_iter()
+            .enumerate()
+        {
+            let operation_id = format!("foreground-{index}");
+            let outcome = idempotency_outcome(
+                &operations,
+                namespace,
+                Some(&operation_id),
+                &RequestPayload::Eval {
+                    input: input.into(),
+                    mode: cue_core::Mode::Job,
+                },
+                &aliases,
+                OperationWaiter {
+                    client_id: 7,
+                    request_id: index as u32,
+                },
+            )
+            .unwrap();
+
+            let BeginOutcome::Respond(response) = outcome else {
+                panic!("foreground Eval with operation_id must not route: {input}");
+            };
+            assert!(matches!(
+                response.as_ref(),
+                ResponsePayload::Err { code, message }
+                    if code == error_code::INVALID_REQUEST
+                        && message.contains("connection-local :fg or :watch")
+            ));
+
+            // Reusing the same operation id for a genuine side effect must be
+            // admitted, proving the rejected foreground request never entered
+            // the operation ledger.
+            let ordinary = idempotency_outcome(
+                &operations,
+                namespace,
+                Some(&operation_id),
+                &RequestPayload::Eval {
+                    input: format!("echo admitted-{index}"),
+                    mode: cue_core::Mode::Job,
+                },
+                &aliases,
+                OperationWaiter {
+                    client_id: 7,
+                    request_id: 100 + index as u32,
+                },
+            )
+            .unwrap();
+            assert!(matches!(ordinary, BeginOutcome::Route));
+        }
+    }
+
     #[tokio::test]
     async fn run_script_requests_are_resolved_with_job_mode() {
         let (event_bus_tx, _event_bus_rx) = mpsc::channel(1);
@@ -1618,6 +2393,11 @@ mod tests {
         };
         let (evt_tx, _evt_rx) = mpsc::channel(1);
         let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        let event_state = Arc::new(Mutex::new(ClientEventState::default()));
+        let lifecycle = crate::lifecycle::DaemonLifecycle::new(
+            PathBuf::from("/tmp/cued-gateway-run-script.sock"),
+            crate::lifecycle::RestartOwnership::Standalone,
+        );
 
         route_request(
             7,
@@ -1627,8 +2407,12 @@ mod tests {
                 input: "every 5m echo hi".into(),
             },
             &sys,
-            &evt_tx,
-            &disconnect_tx,
+            ClientEventSink {
+                sender: &evt_tx,
+                disconnect: &disconnect_tx,
+            },
+            &lifecycle,
+            &event_state,
         )
         .await
         .unwrap();
@@ -1661,6 +2445,75 @@ mod tests {
             }
             _ => panic!("expected scheduler eval"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_script_rejects_connection_local_foreground_commands() {
+        let (event_bus_tx, _event_bus_rx) = mpsc::channel(1);
+        let (gateway_tx, mut gateway_rx) = mpsc::channel(2);
+        let (scheduler_tx, mut scheduler_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (process_mgr, _process_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let (scope_store, _scope_rx) = mpsc::channel(super::super::ACTOR_CHANNEL_CAP);
+        let sys = ActorSystem {
+            gateway: gateway_tx,
+            scheduler: scheduler_tx,
+            process_mgr,
+            scope_store,
+            event_bus: event_bus_tx,
+            config: crate::config::Config::default(),
+            resources: std::sync::Arc::new(crate::resource::ProviderRegistry::empty()),
+        };
+        let (evt_tx, _evt_rx) = mpsc::channel(1);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        let event_state = Arc::new(Mutex::new(ClientEventState::default()));
+        let lifecycle = crate::lifecycle::DaemonLifecycle::new(
+            PathBuf::from("/tmp/cued-gateway-run-script-foreground.sock"),
+            crate::lifecycle::RestartOwnership::Standalone,
+        );
+
+        for (request_id, input) in [":run echo before\n:fg J1", ":watch J1"]
+            .into_iter()
+            .enumerate()
+        {
+            route_request(
+                7,
+                request_id as u32,
+                RequestPayload::RunScript {
+                    path: "foreground.cue".into(),
+                    input: input.into(),
+                },
+                &sys,
+                ClientEventSink {
+                    sender: &evt_tx,
+                    disconnect: &disconnect_tx,
+                },
+                &lifecycle,
+                &event_state,
+            )
+            .await
+            .unwrap();
+
+            match gateway_rx.recv().await.unwrap() {
+                GatewayMsg::SendResponse {
+                    client_id,
+                    request_id: actual_request_id,
+                    payload: ResponsePayload::Err { code, message },
+                } => {
+                    assert_eq!(client_id, 7);
+                    assert_eq!(actual_request_id, request_id as u32);
+                    assert_eq!(code, error_code::NOT_SUPPORTED);
+                    assert!(message.contains("file scripts"));
+                    assert!(message.contains(":fg or :watch"));
+                    assert!(message.contains("interactively"));
+                }
+                _ => panic!("expected foreground script rejection"),
+            }
+        }
+
+        assert!(
+            scheduler_rx.try_recv().is_err(),
+            "foreground file scripts must not reach the scheduler"
+        );
     }
 
     #[test]
